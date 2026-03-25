@@ -35,10 +35,6 @@ div[data-testid="stMetric"] {
 .badge-green{background:#ecfdf3; color:#067647; border-color:#86efac;}
 .badge-blue{background:#eff6ff; color:#1d4ed8; border-color:#93c5fd;}
 .badge-gray{background:#f4f4f5; color:#52525b; border-color:#d4d4d8;}
-.section-card{
-    border:1px solid #ececec; border-radius:18px; padding:16px 18px;
-    background:#ffffff; box-shadow:0 1px 4px rgba(0,0,0,.04); margin-bottom:10px;
-}
 .big-title{font-size:28px; font-weight:700; margin-bottom:0px;}
 .subtle{color:#666;}
 </style>
@@ -96,6 +92,24 @@ def normalize_sku(x):
     s = s.replace(".0", "")
     digits = re.sub(r"\D", "", s)
     return digits or s
+
+
+def display_sku(x):
+    if pd.isna(x):
+        return "—"
+    s = str(x).strip()
+    if not s:
+        return "—"
+    m = re.fullmatch(r"(\d+)\.0+", s)
+    if m:
+        return m.group(1)
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    return s
 
 
 def normalize_mlc(x):
@@ -384,7 +398,7 @@ def build_model(master_bytes, compras_bytes=None):
     master = sheets.get("MAESTRA de precios", pd.DataFrame()).copy()
     bridge = sheets.get("MLC -SKU", pd.DataFrame()).copy()
     promos = sheets.get("CONTROL DE PROMOCIONES", pd.DataFrame()).copy()
-    relampago = prep_relampago((sheets.get("Relampago mi pagina") if "Relampago mi pagina" in sheets else sheets.get("Relámpago mi página", pd.DataFrame())).copy())
+    relampago = prep_relampago(sheets.get("Relampago mi pagina", pd.DataFrame()).copy())
 
     if "Unnamed: 12" in master.columns and "MLC_aux" not in master.columns:
         master = master.rename(columns={"Unnamed: 12": "MLC_aux"})
@@ -641,23 +655,17 @@ if master_file is None:
 model = build_model(master_file, compras_file)
 all_sheets = model["sheets"]
 
-state_needs_refresh = st.session_state.get("source_name") != master_file.name
-if state_needs_refresh:
+if "master_df" not in st.session_state or st.session_state.get("source_name") != master_file.name:
+    st.session_state.master_df = model["master"].copy()
+    st.session_state.bridge_df = model["bridge"].copy()
+    st.session_state.promos_df = model["promos"].copy()
+    st.session_state.relampago_df = model["relampago"].copy()
     st.session_state.source_name = master_file.name
 
-if state_needs_refresh or "master_df" not in st.session_state:
-    st.session_state.master_df = model["master"].copy()
-if state_needs_refresh or "bridge_df" not in st.session_state:
-    st.session_state.bridge_df = model["bridge"].copy()
-if state_needs_refresh or "promos_df" not in st.session_state:
-    st.session_state.promos_df = model["promos"].copy()
-if state_needs_refresh or "relampago_df" not in st.session_state:
-    st.session_state.relampago_df = model.get("relampago", pd.DataFrame()).copy()
-
-master_df = st.session_state.get("master_df", model["master"].copy())
-bridge_df = st.session_state.get("bridge_df", model["bridge"].copy())
-promos_df = st.session_state.get("promos_df", model["promos"].copy())
-relampago_df = st.session_state.get("relampago_df", model.get("relampago", pd.DataFrame()).copy())
+master_df = st.session_state.master_df
+bridge_df = st.session_state.bridge_df
+promos_df = st.session_state.promos_df
+relampago_df = st.session_state.relampago_df
 
 product_df, promos_df_view, relampago_view, compras_df = rebuild_from_session(
     all_sheets, compras_file, master_df, bridge_df, promos_df, relampago_df
@@ -687,7 +695,7 @@ if page == "Cockpit por producto":
         st.warning("No encontré coincidencias.")
         st.stop()
 
-    options = filtered.apply(lambda r: f"{r.get('SKU', '')} · {str(r.get('DESCRIPCIÓN', ''))[:100]}", axis=1).tolist()
+    options = filtered.apply(lambda r: f"{display_sku(r.get('SKU', ''))} · {str(r.get('DESCRIPCIÓN', ''))[:100]}", axis=1).tolist()
     selected = st.selectbox("Selecciona producto", options)
     row = filtered.iloc[options.index(selected)]
     sku = row["SKU_norm"]
@@ -711,9 +719,8 @@ if page == "Cockpit por producto":
     left, mid, right = st.columns([1.15, 1, 1])
 
     with left:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("Identidad")
-        st.write(f"**SKU:** {row.get('SKU', '—')}")
+        st.write(f"**SKU:** {display_sku(row.get('SKU', np.nan))}")
         st.write(f"**Descripción:** {row.get('DESCRIPCIÓN', '—')}")
         st.write(f"**Ubicación:** {row.get('UBIC', '—')}")
         mlcs = row.get("MLC_norm")
@@ -724,9 +731,7 @@ if page == "Cockpit por producto":
         else:
             st.write("**MLCs asociados:** —")
         st.write(f"**Comentario maestra:** {row.get('COMENTARIO', '—')}")
-        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("Compras")
         compras_rows, compras_match_method, compras_match_score = compras_candidates_for_row(row, compras_df)
         compras_info = compras_summary_from_rows(compras_rows)
@@ -762,25 +767,22 @@ if page == "Cockpit por producto":
                     "match_score": "Score",
                 })
                 st.dataframe(hist, use_container_width=True, hide_index=True)
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with mid:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("Precio y rentabilidad")
         m1, m2 = st.columns(2)
         m1.metric("Precio neto", money(row.get("PRECIO NETO")))
         m2.metric("Cambio precio", money(row.get("CAMBIO DE PRECIO")))
         m1.metric("Margen local", pct(row.get("MARGEN LOCAL")))
-        m2.metric("Margen Meli 1", pct(row.get("MARGEN MELI 1")))
+        m2.metric("Monto en simulación", money(row.get("MONTO EN SIMULACIÓN")))
+        st.write(f"**Neto Meli 1:** {money(row.get(' NETO MELI 1'))}")
         st.write(f"**Precio promo mínimo control:** {money(row.get('min_promo_price'))}")
         st.write(f"**Precio promo máximo control:** {money(row.get('max_promo_price'))}")
         st.write(f"**Precio relámpago mínimo:** {money(row.get('relampago_min_price'))}")
         st.write(f"**Precio relámpago máximo:** {money(row.get('relampago_max_price'))}")
         st.write(f"**Ads / comentario control:** {row.get('ads_comment', '—')}")
         st.write(f"**Ads / comentario relámpago:** {row.get('relampago_comment', '—')}")
-        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("Lectura automática")
         bullets = []
         if safe_int(row.get("total_promos_control"), 0) == 0 and safe_int(row.get("relampago_count"), 0) == 0:
@@ -797,13 +799,11 @@ if page == "Cockpit por producto":
             bullets.append("Producto bajo control. No veo alertas críticas inmediatas.")
         for b in bullets:
             st.markdown(f"- {b}")
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with right:
         sku_promos = promos_df_view[promos_df_view["SKU_norm"] == sku].copy()
         sku_rel = relampago_view[relampago_view["SKU_norm"] == sku].copy()
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("Promos control")
         st.metric("Filas control", len(sku_promos))
         if not sku_promos.empty:
@@ -811,9 +811,7 @@ if page == "Cockpit por producto":
             st.dataframe(sku_promos[display_cols], use_container_width=True, hide_index=True, height=220)
         else:
             st.info("Sin promos en control.")
-        st.markdown("</div>", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("Relámpago mi página")
         st.metric("Filas relámpago", len(sku_rel))
         if not sku_rel.empty:
@@ -821,7 +819,6 @@ if page == "Cockpit por producto":
             st.dataframe(sku_rel[display_cols], use_container_width=True, hide_index=True, height=180)
         else:
             st.info("No está en relámpago mi página.")
-        st.markdown("</div>", unsafe_allow_html=True)
 
     sku_hist = compras_df[compras_df["SKU_norm"] == sku].copy() if not compras_df.empty else pd.DataFrame()
     if not sku_hist.empty and "fecha_compra" in sku_hist.columns and "precio_compra" in sku_hist.columns:
@@ -854,20 +851,19 @@ elif page == "Operador de promos":
         if filt.empty:
             st.info("Sin coincidencias.")
         else:
-            prod_options = filt.apply(lambda r: f"{r.get('SKU', '')} · {str(r.get('DESCRIPCIÓN', ''))[:100]}", axis=1).tolist()
+            prod_options = filt.apply(lambda r: f"{display_sku(r.get('SKU', ''))} · {str(r.get('DESCRIPCIÓN', ''))[:100]}", axis=1).tolist()
             selected_prod = st.selectbox("Producto", prod_options, key="op_prod_select")
             prow = filt.iloc[prod_options.index(selected_prod)]
             psku = prow["SKU_norm"]
 
-            st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            st.write(f"**SKU:** {prow.get('SKU', '—')}")
+            st.markdown("### Resumen del producto")
+            st.write(f"**SKU:** {display_sku(prow.get('SKU', np.nan))}")
             st.write(f"**Descripción:** {prow.get('DESCRIPCIÓN', '—')}")
             st.write(f"**Margen Meli 1:** {pct(prow.get('MARGEN MELI 1'))}")
             st.write(f"**Precio bruto tienda:** {money(prow.get('PRECIO BRUTO'))}")
             mlcs = prow.get("MLC_norm")
             st.write(f"**MLCs asociados:** {', '.join(mlcs) if isinstance(mlcs, list) and mlcs else '—'}")
-            st.markdown("</div>", unsafe_allow_html=True)
-
+    
             sku_control = promos_df_view[promos_df_view["SKU_norm"] == psku].copy()
             sku_rel = relampago_view[relampago_view["SKU_norm"] == psku].copy()
 
@@ -1086,16 +1082,20 @@ elif page == "Alta de producto":
         ubic = c3.text_input("Ubicación")
         costo = c1.number_input("Último costo", min_value=0.0, value=0.0, step=1.0)
         precio_tienda = c2.number_input("Precio bruto en tienda", min_value=0.0, value=0.0, step=1.0)
-        margen_meli1 = c3.number_input("Margen Meli 1", value=0.0, step=0.1)
+        monto_simulacion = c3.number_input("MONTO EN SIMULACIÓN", min_value=0.0, value=0.0, step=1.0)
         mlcs_text = st.text_input("MLCs asociados (separados por coma)")
         comentario = st.text_input("Comentario maestra")
 
         precio_neto_calc = precio_tienda / 1.19 if precio_tienda else np.nan
-        margen_local_calc = ((precio_neto_calc - costo) / costo * 100.0) if costo and precio_neto_calc == precio_neto_calc else np.nan
+        margen_local_calc = ((precio_neto_calc - costo) / precio_neto_calc) if pd.notna(precio_neto_calc) and precio_neto_calc != 0 else np.nan
+        neto_meli1_calc = monto_simulacion / 1.19 if monto_simulacion else np.nan
+        margen_meli1_calc = ((neto_meli1_calc - costo) / neto_meli1_calc) if pd.notna(neto_meli1_calc) and neto_meli1_calc != 0 else np.nan
 
-        p1, p2 = st.columns(2)
+        p1, p2, p3, p4 = st.columns(4)
         p1.write(f"**Precio neto calculado:** {money(precio_neto_calc)}")
         p2.write(f"**Margen local calculado:** {pct(margen_local_calc)}")
+        p3.write(f"**Neto Meli 1 calculado:** {money(neto_meli1_calc)}")
+        p4.write(f"**Margen Meli 1 calculado:** {pct(margen_meli1_calc)}")
 
         st.markdown("**Promo inicial opcional**")
         p1, p2, p3 = st.columns(3)
@@ -1122,7 +1122,9 @@ elif page == "Alta de producto":
                 "PRECIO BRUTO": precio_tienda,
                 "PRECIO NETO": precio_neto_calc,
                 "MARGEN LOCAL": margen_local_calc,
-                "MARGEN MELI 1": margen_meli1,
+                "MONTO EN SIMULACIÓN": monto_simulacion,
+                " NETO MELI 1": neto_meli1_calc,
+                "MARGEN MELI 1": margen_meli1_calc,
                 "COMENTARIO": comentario,
                 "SKU_norm": sku_norm,
             }
