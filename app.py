@@ -256,6 +256,8 @@ def prepare_compras_dataframe(raw_compras: pd.DataFrame):
         compras["total_linea_compra"] = np.nan
 
     compras = compras.sort_values(["SKU_norm", "fecha_compra"]).reset_index(drop=True)
+    compras["desc_match_base"] = compras["descripcion_compra"].apply(normalize_desc_for_match)
+    compras["desc_match_tokens"] = compras["descripcion_compra"].apply(desc_tokens)
     compras["precio_anterior"] = compras.groupby("SKU_norm")["precio_compra"].shift(1)
     compras["variacion_vs_anterior_pct"] = np.where(
         compras["precio_anterior"].notna() & (compras["precio_anterior"] != 0) & compras["precio_compra"].notna(),
@@ -291,6 +293,120 @@ def prepare_compras_dataframe(raw_compras: pd.DataFrame):
     return compras, summary, meta
 
 
+
+
+def normalize_desc_for_match(x):
+    if pd.isna(x):
+        return ""
+    s = str(x).upper()
+    s = re.sub(r"\[UBC:.*?\]", " ", s)
+    s = s.replace("N/GENESIS", "N GENESIS")
+    replacements = {
+        " BCO ": " BLANCO ",
+        "BCA ": "BLANCA ",
+        " BCA": " BLANCA",
+        " MOD. ": " MODULO ",
+        " MODULO ": " ",
+        " EMBUTIDO ": " EMB ",
+        " EMB. ": " EMB ",
+        " S/P ": " ",
+        " C/ ": " ",
+        "/": " ",
+        "-": " ",
+    }
+    s = f" {s} "
+    for a,b in replacements.items():
+        s = s.replace(a,b)
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+STOP_TOKENS = {
+    "", "DE", "DEL", "LA", "EL", "LOS", "LAS", "Y", "EN", "CON", "SIN", "PARA", "POR", "UN", "UNA",
+    "UND", "UNID", "PACK", "EMB", "MODULO", "ART", "ARTICULO", "TIPO", "COLOR", "N"
+}
+
+
+def desc_tokens(x):
+    s = normalize_desc_for_match(x)
+    toks = []
+    for t in s.split():
+        if t in STOP_TOKENS:
+            continue
+        if len(t) == 1:
+            continue
+        toks.append(t)
+    return toks
+
+
+def compras_candidates_for_row(row, compras_df: pd.DataFrame):
+    if compras_df is None or compras_df.empty:
+        return pd.DataFrame(), "sin_archivo", 0.0
+
+    sku_norm = row.get("SKU_norm")
+    exact = compras_df[compras_df["SKU_norm"] == sku_norm].copy()
+    if not exact.empty:
+        exact["match_score"] = 1.0
+        exact["match_method"] = "SKU exacto"
+        return exact.sort_values(["fecha_compra", "precio_compra"]), "SKU exacto", 1.0
+
+    # fallback por descripción
+    desc_col_value = row.get("DESCRIPCIÓN", "")
+    target_tokens = set(desc_tokens(desc_col_value))
+    if not target_tokens:
+        return pd.DataFrame(), "sin_match", 0.0
+
+    tmp = compras_df.copy()
+    if "desc_match_tokens" not in tmp.columns:
+        tmp["desc_match_tokens"] = tmp["descripcion_compra"].apply(desc_tokens)
+    token_sets = tmp["desc_match_tokens"].apply(set)
+    inter = token_sets.apply(lambda s: len(s & target_tokens))
+    union = token_sets.apply(lambda s: len(s | target_tokens) if (s | target_tokens) else 0)
+    coverage = token_sets.apply(lambda s: len(s & target_tokens) / max(len(target_tokens), 1))
+    jaccard = pd.Series(np.where(union > 0, inter / union, 0.0), index=tmp.index)
+
+    # muy importante: pedimos señales suficientes para no mezclar cualquier cosa
+    score = 0.65 * coverage + 0.35 * jaccard
+    tmp["match_score"] = score
+    tmp["shared_tokens"] = inter
+    cand = tmp[(tmp["shared_tokens"] >= 3) & (tmp["match_score"] >= 0.52)].copy()
+    if cand.empty:
+        return pd.DataFrame(), "sin_match", 0.0
+
+    # prioriza registros más consistentes
+    cand["match_method"] = "Descripción aproximada"
+    best_skus = (
+        cand.groupby("SKU_norm")["match_score"]
+        .max()
+        .sort_values(ascending=False)
+        .head(3)
+        .index.tolist()
+    )
+    cand = cand[cand["SKU_norm"].isin(best_skus)].copy()
+    return cand.sort_values(["match_score", "fecha_compra"], ascending=[False, True]), "Descripción aproximada", float(cand["match_score"].max())
+
+
+def compras_summary_from_rows(rows: pd.DataFrame):
+    if rows is None or rows.empty:
+        return {}
+    rows = rows.sort_values(["fecha_compra", "precio_compra"]).copy()
+    latest = rows.dropna(subset=["fecha_compra"]).tail(1)
+    if latest.empty:
+        latest = rows.tail(1)
+    latest = latest.iloc[0]
+    precios_validos = rows["precio_compra"].dropna()
+    return {
+        "ultima_compra": latest.get("fecha_compra"),
+        "ultimo_precio_compra": latest.get("precio_compra"),
+        "proveedor_ultimo": latest.get("proveedor"),
+        "cantidad_ultima_compra": latest.get("cantidad"),
+        "variacion_ultima_vs_anterior_pct": latest.get("variacion_vs_anterior_pct"),
+        "precio_min_hist": precios_validos.min() if not precios_validos.empty else np.nan,
+        "precio_max_hist": precios_validos.max() if not precios_validos.empty else np.nan,
+        "proveedores": " | ".join(pd.unique([str(x) for x in rows["proveedor"] if pd.notna(x) and str(x).strip()])),
+        "compras_registros": len(rows),
+    }
 @st.cache_data(show_spinner=False)
 def build_model(master_bytes, compras_bytes=None):
     sheets = read_excel_all(master_bytes)
@@ -626,15 +742,46 @@ if page == "Cockpit por producto":
 
         st.markdown('<div class="section-card">', unsafe_allow_html=True)
         st.subheader("Compras")
-        st.write(f"**Última compra:** {pd.to_datetime(row.get('ultima_compra')).strftime('%d-%m-%Y') if pd.notna(row.get('ultima_compra')) else '—'}")
-        st.write(f"**Último precio compra:** {money(row.get('ultimo_precio_compra'))}")
-        st.write(f"**Proveedor último:** {row.get('proveedor_ultimo', '—')}")
-        st.write(f"**Cantidad última compra:** {safe_int(row.get('cantidad_ultima_compra'), 0) if pd.notna(row.get('cantidad_ultima_compra')) else '—'}")
-        st.write(f"**Variación vs compra anterior:** {pct((row.get('variacion_ultima_vs_anterior_pct') / 100.0) if pd.notna(row.get('variacion_ultima_vs_anterior_pct')) else np.nan)}")
-        st.write(f"**Rango histórico:** {money(row.get('precio_min_hist'))} a {money(row.get('precio_max_hist'))}")
-        proveedores_hist = row.get('proveedores', '')
-        if pd.notna(proveedores_hist) and str(proveedores_hist).strip():
-            st.write(f"**Proveedores históricos:** {proveedores_hist}")
+        compras_rows, compras_match_method, compras_match_score = compras_candidates_for_row(row, model.get("compras", pd.DataFrame()))
+        compras_info = compras_summary_from_rows(compras_rows)
+        if compras_rows.empty:
+            st.write("**Coincidencia de compras:** No encontré compras para este producto")
+            st.write("**Última compra:** —")
+            st.write("**Último precio compra:** —")
+            st.write("**Proveedor último:** —")
+            st.write("**Cantidad última compra:** —")
+            st.write("**Variación vs compra anterior:** —")
+            st.write("**Rango histórico:** — a —")
+        else:
+            if compras_match_method == "SKU exacto":
+                render_badge("Compras vinculadas por SKU exacto", "badge-green")
+            else:
+                render_badge(f"Compras vinculadas por descripción ({compras_match_score:.2f})", "badge-yellow")
+            st.write(f"**Última compra:** {pd.to_datetime(compras_info.get('ultima_compra')).strftime('%d-%m-%Y') if pd.notna(compras_info.get('ultima_compra')) else '—'}")
+            st.write(f"**Último precio compra:** {money(compras_info.get('ultimo_precio_compra'))}")
+            st.write(f"**Proveedor último:** {compras_info.get('proveedor_ultimo', '—')}")
+            st.write(f"**Cantidad última compra:** {safe_int(compras_info.get('cantidad_ultima_compra'), 0) if pd.notna(compras_info.get('cantidad_ultima_compra')) else '—'}")
+            st.write(f"**Variación vs compra anterior:** {pct((compras_info.get('variacion_ultima_vs_anterior_pct') / 100.0) if pd.notna(compras_info.get('variacion_ultima_vs_anterior_pct')) else np.nan)}")
+            st.write(f"**Rango histórico:** {money(compras_info.get('precio_min_hist'))} a {money(compras_info.get('precio_max_hist'))}")
+            proveedores_hist = compras_info.get('proveedores', '')
+            if pd.notna(proveedores_hist) and str(proveedores_hist).strip():
+                st.write(f"**Proveedores históricos:** {proveedores_hist}")
+            with st.expander("Ver historial de compras"):
+                hist = compras_rows.sort_values("fecha_compra", ascending=False)[[
+                    c for c in ["fecha_compra", "proveedor", "precio_compra", "cantidad", "descripcion_compra", "SKU_norm", "match_method", "match_score"]
+                    if c in compras_rows.columns
+                ]].copy()
+                hist = hist.rename(columns={
+                    "fecha_compra": "Fecha",
+                    "proveedor": "Proveedor",
+                    "precio_compra": "Precio compra",
+                    "cantidad": "Cantidad",
+                    "descripcion_compra": "Descripción compra",
+                    "SKU_norm": "SKU compra",
+                    "match_method": "Método match",
+                    "match_score": "Score",
+                })
+                st.dataframe(hist, use_container_width=True, hide_index=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
     with mid:
