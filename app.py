@@ -41,6 +41,10 @@ div[data-testid="stMetric"] {
 }
 .big-title{font-size:28px; font-weight:700; margin-bottom:0px;}
 .subtle{color:#666;}
+.promo-bubble{border:1px solid #e8e8e8; border-radius:18px; padding:10px 12px; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.04); margin-bottom:10px; min-height:112px;}
+.promo-bubble .sku{font-size:14px; font-weight:700; line-height:1.2; margin-bottom:4px;}
+.promo-bubble .desc{font-size:13px; line-height:1.25; color:#333; height:34px; overflow:hidden; margin-bottom:6px;}
+.promo-bubble .meta{font-size:12px; color:#666; line-height:1.25;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -106,6 +110,26 @@ def normalize_mlc(x):
         return None
     digits = re.sub(r"\D", "", s)
     return f"MLC{digits}" if digits else None
+
+
+def first_scalar(value, default=""):
+    if isinstance(value, pd.DataFrame):
+        value = value.iloc[0, 0] if not value.empty else default
+    elif isinstance(value, pd.Series):
+        value = value.iloc[0] if not value.empty else default
+    try:
+        if pd.isna(value):
+            return default
+    except Exception:
+        pass
+    return value
+
+
+def row_by_index(df, idx):
+    rows = df[df.index == idx]
+    if rows.empty:
+        return pd.Series(dtype=object)
+    return rows.iloc[0]
 
 
 def extract_mlcs(raw):
@@ -1100,29 +1124,29 @@ elif page == "Operador de promos":
 
             st.markdown("#### Bandeja visual")
             preview = work.head(12)
-            cols = st.columns(3)
+            cols = st.columns(4)
             for n, (_, r) in enumerate(preview.iterrows()):
-                with cols[n % 3]:
-                    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-                    render_badge(r.get("urgency_text", "Sin fecha"), r.get("urgency_cls", "badge-gray"))
-                    st.write(f"**{r.get('Origen')}**")
-                    st.write(f"**SKU:** {r.get('SKU_norm') or '—'}")
-                    desc = str(r.get("Descripción") or "—")
-                    st.write(f"**Desc.:** {desc[:85]}")
-                    if r.get("MLC_norm"):
-                        st.write(f"**MLC:** {r.get('MLC_norm')}")
-                    st.write(f"**B2C publicado:** {money(r.get('PRECIO B2C PUBLICADO '))}")
-                    st.write(f"**Promo:** {money(r.get('Precio promocional'))}")
+                with cols[n % 4]:
                     fecha = pd.to_datetime(r.get("next_campaign_date"), errors="coerce")
-                    st.write(f"**Fecha:** {fecha.strftime('%d/%m/%Y') if pd.notna(fecha) else '—'}")
-                    st.write(f"**Motivo:** {r.get('Motivo promoción') or '—'}")
-                    st.write(f"**Ads:** {r.get('Ads/Comentario') or '—'}")
-                    if st.button("Editar esta promo", key=f"edit_card_{n}_{r.get('Origen')}_{r.get('source_index')}", use_container_width=True):
-                        st.session_state.promo_editor_pick = int(r.name)
-                        st.rerun()
-                    st.markdown('</div>', unsafe_allow_html=True)
+                    fecha_txt = fecha.strftime('%d/%m/%Y') if pd.notna(fecha) else '—'
+                    desc = str(r.get("Descripción") or "—")[:55]
+                    mlc_txt = str(r.get('MLC_norm') or '—')
+                    sku_txt = str(r.get('SKU_norm') or '—')
+                    badge_cls = r.get("urgency_cls", "badge-gray")
+                    badge_txt = r.get("urgency_text", "Sin fecha")
+                    bubble_html = f"""
+                    <div class="promo-bubble">
+                        <div style="margin-bottom:6px;"><span class="badge {badge_cls}">{badge_txt}</span></div>
+                        <div class="sku">{sku_txt}</div>
+                        <div class="desc">{desc}</div>
+                        <div class="meta">MLC: {mlc_txt}</div>
+                        <div class="meta">Fecha: {fecha_txt}</div>
+                    </div>
+                    """
+                    st.markdown(bubble_html, unsafe_allow_html=True)
+            st.caption("Bandeja visual resumida. Usa el selector superior para elegir la promo que quieres editar.")
             if len(work) > 12:
-                st.caption(f"Mostrando 12 de {len(work)} promos filtradas. Usa el selector superior para editar cualquier fila.")
+                st.caption(f"Mostrando 12 de {len(work)} promos filtradas.")
 
             st.markdown("---")
             st.markdown("### Editor interactivo de promo")
@@ -1142,7 +1166,7 @@ elif page == "Operador de promos":
             if selected_row.get("Origen") == "Control":
                 source_index = int(selected_row["source_index"])
                 base = st.session_state.promos_df.copy()
-                base_row = base.loc[source_index]
+                base_row = row_by_index(base, source_index)
                 initial_dates = {c: pd.to_datetime(base_row.get(c), errors="coerce") for c in CAMPAIGN_COLS}
 
                 action_cols = st.columns(4)
@@ -1172,10 +1196,10 @@ elif page == "Operador de promos":
 
                 with st.form(f"control_editor_form_{source_index}"):
                     c1, c2 = st.columns(2)
-                    new_mlc = c1.text_input("MLC", value=str(base_row.get("N° Publicación") or selected_row.get("MLC_norm") or ""))
+                    new_mlc = c1.text_input("MLC", value=str(first_scalar(base_row.get("N° Publicación"), "") or first_scalar(selected_row.get("MLC_norm"), "")))
                     new_price = c2.number_input("Precio promocional", min_value=0.0, value=float(safe_float(base_row.get("Precio promocional"), 0.0)), step=1.0)
-                    new_motivo = c1.text_input("Motivo promoción", value=str(base_row.get("Motivo promoción") or ""))
-                    new_ads = c2.text_input("Ads / comentario", value=str(base_row.get("Ads/Comentario") or ""))
+                    new_motivo = c1.text_input("Motivo promoción", value=str(first_scalar(base_row.get("Motivo promoción"), "")))
+                    new_ads = c2.text_input("Ads / comentario", value=str(first_scalar(base_row.get("Ads/Comentario"), "")))
                     dcols = st.columns(4)
                     date_values = []
                     for i, col in enumerate(CAMPAIGN_COLS):
@@ -1200,7 +1224,7 @@ elif page == "Operador de promos":
             else:
                 source_index = int(selected_row["source_index"])
                 base = st.session_state.relampago_df.copy()
-                base_row = base.loc[source_index]
+                base_row = row_by_index(base, source_index)
                 action_cols = st.columns(4)
                 if action_cols[0].button("Bajar 100", key=f"minus100_rel_{source_index}", use_container_width=True):
                     cur = safe_float(base_row.get("Precio promocional"), 0.0)
@@ -1223,10 +1247,10 @@ elif page == "Operador de promos":
 
                 with st.form(f"rel_editor_form_{source_index}"):
                     r1, r2 = st.columns(2)
-                    rel_desc = r1.text_input("Descripción", value=str(base_row.get("Descripción") or selected_row.get("Descripción") or ""))
+                    rel_desc = r1.text_input("Descripción", value=str(first_scalar(base_row.get("Descripción"), "") or first_scalar(selected_row.get("Descripción"), "")))
                     rel_price = r2.number_input("Precio promocional", min_value=0.0, value=float(safe_float(base_row.get("Precio promocional"), 0.0)), step=1.0)
-                    rel_motivo = r1.text_input("Motivo promoción", value=str(base_row.get("Motivo promoción") or ""))
-                    rel_ads = r2.text_input("Ads / comentario", value=str(base_row.get("Ads/Comentario") or ""))
+                    rel_motivo = r1.text_input("Motivo promoción", value=str(first_scalar(base_row.get("Motivo promoción"), "")))
+                    rel_ads = r2.text_input("Ads / comentario", value=str(first_scalar(base_row.get("Ads/Comentario"), "")))
                     rel_save = st.form_submit_button("Guardar cambios de relámpago", type="primary", use_container_width=True)
                 if rel_save:
                     base.loc[source_index, "Descripción"] = rel_desc
