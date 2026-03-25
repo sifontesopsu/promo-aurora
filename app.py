@@ -1009,6 +1009,9 @@ elif page == "Operador de promos":
                         st.rerun()
 
     with op_tab2:
+        st.markdown("### Bandeja dinámica de promos")
+        st.caption("Filtra, prioriza y edita una promo por vez con una ficha más visual.")
+
         promo_universe = promos_df_view.copy().reset_index().rename(columns={"index": "source_index"})
         promo_universe["Origen"] = "Control"
         rel_table = relampago_view.copy().reset_index().rename(columns={"index": "source_index"})
@@ -1021,114 +1024,237 @@ elif page == "Operador de promos":
             promo_universe[[c for c in ["source_index", "SKU_norm", "MLC_norm", "Descripción", "Precio promocional", "Motivo promoción", "Ads/Comentario", "next_campaign_date", "days_to_next", "Origen"] if c in promo_universe.columns]],
             rel_table[[c for c in ["source_index", "SKU_norm", "MLC_norm", "Descripción", "Precio promocional", "Motivo promoción", "Ads/Comentario", "next_campaign_date", "days_to_next", "Origen"] if c in rel_table.columns]],
         ], ignore_index=True)
+        b2c_map = product_df[[c for c in ["SKU_norm", "PRECIO B2C PUBLICADO ", "DESCRIPCIÓN"] if c in product_df.columns]].drop_duplicates(subset=["SKU_norm"])
+        all_ops = all_ops.merge(b2c_map, on="SKU_norm", how="left")
+        if "DESCRIPCIÓN" in all_ops.columns:
+            all_ops["Descripción"] = df_series(all_ops, "Descripción").where(
+                df_series(all_ops, "Descripción").astype(str).str.strip() != "", all_ops["DESCRIPCIÓN"]
+            )
+        all_ops["urgency_text"] = all_ops["days_to_next"].apply(lambda x: urgency_info(x)[0])
+        all_ops["urgency_cls"] = all_ops["days_to_next"].apply(lambda x: urgency_info(x)[1])
+        all_ops["sort_rank"] = all_ops["days_to_next"].apply(lambda x: urgency_info(x)[2])
 
-        f1, f2, f3, f4, f5 = st.columns(5)
-        only_today = f1.checkbox("Vencen hoy")
-        only_tomorrow = f2.checkbox("Vencen mañana")
-        only_3d = f3.checkbox("Vencen en 3 días")
-        without_price = f4.checkbox("Sin precio promocional")
-        rel_only = f5.checkbox("Solo relámpago")
-
-        f6, f7 = st.columns([1, 2])
-        source_filter = f6.selectbox("Origen", ["Todos", "Control", "Relámpago"], key="op_source_filter")
-        search = f7.text_input("Buscar SKU / MLC / descripción", key="promo_search")
+        f1, f2, f3 = st.columns([1.2, 1.2, 2.6])
+        source_filter = f1.selectbox("Origen", ["Todos", "Control", "Relámpago"], key="op_source_filter")
+        urgency_filter = f2.selectbox(
+            "Prioridad",
+            ["Todos", "Vencidas", "Hoy", "Mañana", "En 2 días", "En 3 días", "Próximos 7 días", "Sin fecha", "Sin precio promocional", "Ads vacío"],
+            key="op_urgency_filter",
+        )
+        search = f3.text_input("Buscar SKU / MLC / descripción", key="promo_search")
 
         work = all_ops.copy()
-        if only_today:
+        if source_filter != "Todos":
+            work = work[work["Origen"] == source_filter]
+        if urgency_filter == "Vencidas":
+            work = work[work["days_to_next"] < 0]
+        elif urgency_filter == "Hoy":
             work = work[work["days_to_next"] == 0]
-        if only_tomorrow:
+        elif urgency_filter == "Mañana":
             work = work[work["days_to_next"] == 1]
-        if only_3d:
+        elif urgency_filter == "En 2 días":
+            work = work[work["days_to_next"] == 2]
+        elif urgency_filter == "En 3 días":
             work = work[work["days_to_next"] == 3]
-        if without_price:
+        elif urgency_filter == "Próximos 7 días":
+            work = work[(work["days_to_next"] >= 0) & (work["days_to_next"] <= 7)]
+        elif urgency_filter == "Sin fecha":
+            work = work[work["next_campaign_date"].isna()]
+        elif urgency_filter == "Sin precio promocional":
             work = work[work["Precio promocional"].isna()]
-        if rel_only or source_filter == "Relámpago":
-            work = work[work["Origen"] == "Relámpago"]
-        elif source_filter == "Control":
-            work = work[work["Origen"] == "Control"]
+        elif urgency_filter == "Ads vacío":
+            ads_mask = df_series(work, "Ads/Comentario").isna() | df_series(work, "Ads/Comentario").astype(str).str.strip().eq("")
+            work = work[ads_mask]
         if search.strip():
+            s = search.strip()
             mask = (
-                df_series(work, "SKU_norm").astype(str).str.contains(search, case=False, na=False) |
-                df_series(work, "MLC_norm").astype(str).str.contains(search, case=False, na=False) |
-                df_series(work, "Descripción").astype(str).str.contains(search, case=False, na=False)
+                df_series(work, "SKU_norm").astype(str).str.contains(s, case=False, na=False) |
+                df_series(work, "MLC_norm").astype(str).str.contains(s, case=False, na=False) |
+                df_series(work, "Descripción").astype(str).str.contains(s, case=False, na=False)
             )
             work = work[mask]
 
-        work = work.sort_values(["Origen", "days_to_next"], ascending=[True, True], na_position="last")
-        display_work = work.copy()
-        if "next_campaign_date" in display_work.columns:
-            display_work["next_campaign_date"] = pd.to_datetime(display_work["next_campaign_date"], errors="coerce").dt.strftime("%d/%m/%Y").fillna("")
-        st.dataframe(display_work.drop(columns=["source_index"], errors="ignore"), use_container_width=True, hide_index=True, height=300)
+        work = work.sort_values(["sort_rank", "Origen", "Descripción"], ascending=[True, True, True], na_position="last").reset_index(drop=True)
 
-        st.markdown("### Edición rápida de la bandeja")
-        if source_filter == "Todos" and not rel_only:
-            st.info("Para editar desde la bandeja, elige un origen específico: Control o Relámpago.")
-        elif work.empty:
-            st.info("No hay filas para editar con esos filtros.")
-        elif (rel_only or source_filter == "Relámpago"):
-            edit_rel = work[[c for c in ["source_index", "SKU_norm", "Descripción", "Precio promocional", "Motivo promoción", "Ads/Comentario"] if c in work.columns]].copy()
-            editor_rel = st.data_editor(
-                edit_rel,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                height=320,
-                key="rel_bandeja_editor",
-                column_config={"source_index": st.column_config.NumberColumn("idx", disabled=True), "SKU_norm": st.column_config.TextColumn("SKU", disabled=True)}
-            )
-            if st.button("Guardar cambios relámpago desde bandeja", type="primary", use_container_width=True):
-                base = st.session_state.relampago_df.copy()
-                for _, r in editor_rel.iterrows():
-                    idx = int(r["source_index"])
-                    for col in ["Descripción", "Precio promocional", "Motivo promoción", "Ads/Comentario"]:
-                        if col in base.columns and col in r.index:
-                            base.loc[idx, col] = r[col]
-                st.session_state.relampago_df = base
-                st.success("Cambios de relámpago guardados.")
-                st.rerun()
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Filas filtradas", len(work))
+        s2.metric("Sin precio promo", int(work["Precio promocional"].isna().sum()))
+        s3.metric("Con fecha crítica", int(work["days_to_next"].isin([0, 1, 2, 3]).sum()))
+        s4.metric("Ads vacío", int((df_series(work, "Ads/Comentario").isna() | df_series(work, "Ads/Comentario").astype(str).str.strip().eq("")).sum()))
+
+        if work.empty:
+            st.info("No hay promos que coincidan con los filtros.")
         else:
-            edit_ctrl = work[[c for c in ["source_index", "SKU_norm", "MLC_norm", "Descripción", "Precio promocional", "Motivo promoción", "Ads/Comentario", "next_campaign_date"] if c in work.columns]].copy()
-            edit_ctrl["next_campaign_date"] = pd.to_datetime(edit_ctrl["next_campaign_date"], errors="coerce").dt.date
-            editor_ctrl = st.data_editor(
-                edit_ctrl,
-                use_container_width=True,
-                hide_index=True,
-                num_rows="fixed",
-                height=320,
-                key="ctrl_bandeja_editor",
-                column_config={
-                    "source_index": st.column_config.NumberColumn("idx", disabled=True),
-                    "SKU_norm": st.column_config.TextColumn("SKU", disabled=True),
-                    "MLC_norm": st.column_config.TextColumn("MLC", disabled=False),
-                    "next_campaign_date": st.column_config.DateColumn("Fecha promo", format="D/M/YYYY")
-                }
-            )
-            st.markdown("#### Actualización masiva de fecha")
-            m1, m2 = st.columns([2,1])
-            bulk_date = m1.date_input("Nueva fecha para todas las filas filtradas", value=None, key="bulk_date_ctrl")
-            apply_bulk = m2.checkbox("Aplicar a todas las filas filtradas")
-            if st.button("Guardar cambios control desde bandeja", type="primary", use_container_width=True):
+            picker_labels = []
+            for i, r in work.iterrows():
+                fecha_txt = pd.to_datetime(r.get("next_campaign_date"), errors="coerce")
+                fecha_txt = fecha_txt.strftime("%d/%m/%Y") if pd.notna(fecha_txt) else "Sin fecha"
+                picker_labels.append(
+                    f"{r.get('Origen')} · {r.get('SKU_norm') or 'Sin SKU'} · {str(r.get('Descripción') or '')[:55]} · {r.get('urgency_text')} · {fecha_txt}"
+                )
+            default_idx = min(st.session_state.get("promo_editor_pick", 0), len(picker_labels) - 1)
+            chosen_label = st.selectbox("Selecciona una promo para editar", picker_labels, index=default_idx, key="promo_card_select")
+            selected_idx = picker_labels.index(chosen_label)
+            st.session_state.promo_editor_pick = selected_idx
+            selected_row = work.iloc[selected_idx]
+
+            st.markdown("#### Bandeja visual")
+            preview = work.head(12)
+            cols = st.columns(3)
+            for n, (_, r) in enumerate(preview.iterrows()):
+                with cols[n % 3]:
+                    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+                    render_badge(r.get("urgency_text", "Sin fecha"), r.get("urgency_cls", "badge-gray"))
+                    st.write(f"**{r.get('Origen')}**")
+                    st.write(f"**SKU:** {r.get('SKU_norm') or '—'}")
+                    desc = str(r.get("Descripción") or "—")
+                    st.write(f"**Desc.:** {desc[:85]}")
+                    if r.get("MLC_norm"):
+                        st.write(f"**MLC:** {r.get('MLC_norm')}")
+                    st.write(f"**B2C publicado:** {money(r.get('PRECIO B2C PUBLICADO '))}")
+                    st.write(f"**Promo:** {money(r.get('Precio promocional'))}")
+                    fecha = pd.to_datetime(r.get("next_campaign_date"), errors="coerce")
+                    st.write(f"**Fecha:** {fecha.strftime('%d/%m/%Y') if pd.notna(fecha) else '—'}")
+                    st.write(f"**Motivo:** {r.get('Motivo promoción') or '—'}")
+                    st.write(f"**Ads:** {r.get('Ads/Comentario') or '—'}")
+                    if st.button("Editar esta promo", key=f"edit_card_{n}_{r.get('Origen')}_{r.get('source_index')}", use_container_width=True):
+                        st.session_state.promo_editor_pick = int(r.name)
+                        st.rerun()
+                    st.markdown('</div>', unsafe_allow_html=True)
+            if len(work) > 12:
+                st.caption(f"Mostrando 12 de {len(work)} promos filtradas. Usa el selector superior para editar cualquier fila.")
+
+            st.markdown("---")
+            st.markdown("### Editor interactivo de promo")
+            top1, top2 = st.columns([2, 1])
+            with top1:
+                st.write(f"**Producto:** {selected_row.get('Descripción') or '—'}")
+                st.write(f"**SKU:** {selected_row.get('SKU_norm') or '—'}")
+                st.write(f"**Origen:** {selected_row.get('Origen')}")
+                if selected_row.get("MLC_norm"):
+                    st.write(f"**MLC:** {selected_row.get('MLC_norm')}")
+                st.write(f"**Precio B2C publicado:** {money(selected_row.get('PRECIO B2C PUBLICADO '))}")
+            with top2:
+                render_badge(selected_row.get("urgency_text", "Sin fecha"), selected_row.get("urgency_cls", "badge-gray"))
+                fecha = pd.to_datetime(selected_row.get("next_campaign_date"), errors="coerce")
+                st.write(f"**Fecha activa:** {fecha.strftime('%d/%m/%Y') if pd.notna(fecha) else '—'}")
+
+            if selected_row.get("Origen") == "Control":
+                source_index = int(selected_row["source_index"])
                 base = st.session_state.promos_df.copy()
-                for _, r in editor_ctrl.iterrows():
-                    idx = int(r["source_index"])
+                base_row = base.loc[source_index]
+                initial_dates = {c: pd.to_datetime(base_row.get(c), errors="coerce") for c in CAMPAIGN_COLS}
+
+                action_cols = st.columns(4)
+                if action_cols[0].button("+1 día", key=f"plus1_ctrl_{source_index}", use_container_width=True):
+                    target = next((c for c, v in initial_dates.items() if pd.notna(v)), CAMPAIGN_COLS[0])
+                    current = initial_dates.get(target)
+                    base.loc[source_index, target] = (current + pd.Timedelta(days=1)) if pd.notna(current) else pd.Timestamp(date.today()) + pd.Timedelta(days=1)
+                    st.session_state.promos_df = base
+                    st.rerun()
+                if action_cols[1].button("+3 días", key=f"plus3_ctrl_{source_index}", use_container_width=True):
+                    target = next((c for c, v in initial_dates.items() if pd.notna(v)), CAMPAIGN_COLS[0])
+                    current = initial_dates.get(target)
+                    base.loc[source_index, target] = (current + pd.Timedelta(days=3)) if pd.notna(current) else pd.Timestamp(date.today()) + pd.Timedelta(days=3)
+                    st.session_state.promos_df = base
+                    st.rerun()
+                if action_cols[2].button("+7 días", key=f"plus7_ctrl_{source_index}", use_container_width=True):
+                    target = next((c for c, v in initial_dates.items() if pd.notna(v)), CAMPAIGN_COLS[0])
+                    current = initial_dates.get(target)
+                    base.loc[source_index, target] = (current + pd.Timedelta(days=7)) if pd.notna(current) else pd.Timestamp(date.today()) + pd.Timedelta(days=7)
+                    st.session_state.promos_df = base
+                    st.rerun()
+                if action_cols[3].button("Limpiar fecha", key=f"clear_ctrl_{source_index}", use_container_width=True):
+                    target = next((c for c, v in initial_dates.items() if pd.notna(v)), CAMPAIGN_COLS[0])
+                    base.loc[source_index, target] = pd.NaT
+                    st.session_state.promos_df = base
+                    st.rerun()
+
+                with st.form(f"control_editor_form_{source_index}"):
+                    c1, c2 = st.columns(2)
+                    new_mlc = c1.text_input("MLC", value=str(base_row.get("N° Publicación") or selected_row.get("MLC_norm") or ""))
+                    new_price = c2.number_input("Precio promocional", min_value=0.0, value=float(safe_float(base_row.get("Precio promocional"), 0.0)), step=1.0)
+                    new_motivo = c1.text_input("Motivo promoción", value=str(base_row.get("Motivo promoción") or ""))
+                    new_ads = c2.text_input("Ads / comentario", value=str(base_row.get("Ads/Comentario") or ""))
+                    dcols = st.columns(4)
+                    date_values = []
+                    for i, col in enumerate(CAMPAIGN_COLS):
+                        cur = initial_dates.get(col)
+                        date_values.append(dcols[i].date_input(col, value=cur.date() if pd.notna(cur) else None, format="DD/MM/YYYY", key=f"dyn_{col}_{source_index}"))
+                    save_btn = st.form_submit_button("Guardar cambios de control", type="primary", use_container_width=True)
+                if save_btn:
                     if "N° Publicación" in base.columns:
-                        base.loc[idx, "N° Publicación"] = r.get("MLC_norm")
+                        base.loc[source_index, "N° Publicación"] = new_mlc
                     if "Precio promocional" in base.columns:
-                        val = r.get("Precio promocional")
-                        base.loc[idx, "Precio promocional"] = val if pd.notna(val) and float(val) != 0 else np.nan
+                        base.loc[source_index, "Precio promocional"] = new_price if new_price > 0 else np.nan
                     if "Motivo promoción" in base.columns:
-                        base.loc[idx, "Motivo promoción"] = r.get("Motivo promoción")
+                        base.loc[source_index, "Motivo promoción"] = new_motivo
                     if "Ads/Comentario" in base.columns:
-                        base.loc[idx, "Ads/Comentario"] = r.get("Ads/Comentario")
-                    if apply_bulk and bulk_date:
-                        if "Campaña 1" in base.columns:
-                            base.loc[idx, "Campaña 1"] = pd.to_datetime(bulk_date)
+                        base.loc[source_index, "Ads/Comentario"] = new_ads
+                    for col, val in zip(CAMPAIGN_COLS, date_values):
+                        if col in base.columns:
+                            base.loc[source_index, col] = pd.to_datetime(val) if val else pd.NaT
+                    st.session_state.promos_df = base
+                    st.success("Promo de control actualizada.")
+                    st.rerun()
+            else:
+                source_index = int(selected_row["source_index"])
+                base = st.session_state.relampago_df.copy()
+                base_row = base.loc[source_index]
+                action_cols = st.columns(4)
+                if action_cols[0].button("Bajar 100", key=f"minus100_rel_{source_index}", use_container_width=True):
+                    cur = safe_float(base_row.get("Precio promocional"), 0.0)
+                    base.loc[source_index, "Precio promocional"] = max(cur - 100, 0)
+                    st.session_state.relampago_df = base
+                    st.rerun()
+                if action_cols[1].button("Subir 100", key=f"plus100_rel_{source_index}", use_container_width=True):
+                    cur = safe_float(base_row.get("Precio promocional"), 0.0)
+                    base.loc[source_index, "Precio promocional"] = cur + 100
+                    st.session_state.relampago_df = base
+                    st.rerun()
+                if action_cols[2].button("Copiar B2C", key=f"copyb2c_rel_{source_index}", use_container_width=True):
+                    base.loc[source_index, "Precio promocional"] = safe_float(selected_row.get("PRECIO B2C PUBLICADO "), np.nan)
+                    st.session_state.relampago_df = base
+                    st.rerun()
+                if action_cols[3].button("Vaciar precio", key=f"clear_rel_{source_index}", use_container_width=True):
+                    base.loc[source_index, "Precio promocional"] = np.nan
+                    st.session_state.relampago_df = base
+                    st.rerun()
+
+                with st.form(f"rel_editor_form_{source_index}"):
+                    r1, r2 = st.columns(2)
+                    rel_desc = r1.text_input("Descripción", value=str(base_row.get("Descripción") or selected_row.get("Descripción") or ""))
+                    rel_price = r2.number_input("Precio promocional", min_value=0.0, value=float(safe_float(base_row.get("Precio promocional"), 0.0)), step=1.0)
+                    rel_motivo = r1.text_input("Motivo promoción", value=str(base_row.get("Motivo promoción") or ""))
+                    rel_ads = r2.text_input("Ads / comentario", value=str(base_row.get("Ads/Comentario") or ""))
+                    rel_save = st.form_submit_button("Guardar cambios de relámpago", type="primary", use_container_width=True)
+                if rel_save:
+                    base.loc[source_index, "Descripción"] = rel_desc
+                    base.loc[source_index, "Precio promocional"] = rel_price if rel_price > 0 else np.nan
+                    base.loc[source_index, "Motivo promoción"] = rel_motivo
+                    base.loc[source_index, "Ads/Comentario"] = rel_ads
+                    st.session_state.relampago_df = base
+                    st.success("Promo de relámpago actualizada.")
+                    st.rerun()
+
+            st.markdown("#### Cambio masivo de fecha para filas filtradas de control")
+            ctrl_filtered = work[work["Origen"] == "Control"].copy()
+            if ctrl_filtered.empty:
+                st.info("Con los filtros actuales no hay filas de control para actualización masiva.")
+            else:
+                m1, m2 = st.columns([2, 1])
+                bulk_date = m1.date_input("Nueva fecha para todas las filas control filtradas", value=None, format="DD/MM/YYYY", key="bulk_date_ctrl_cards")
+                bulk_col = m2.selectbox("Campo fecha", [c for c in CAMPAIGN_COLS if c in st.session_state.promos_df.columns], key="bulk_ctrl_col")
+                if st.button("Aplicar fecha masiva", use_container_width=True):
+                    if bulk_date:
+                        base = st.session_state.promos_df.copy()
+                        for idx in ctrl_filtered["source_index"].tolist():
+                            base.loc[int(idx), bulk_col] = pd.to_datetime(bulk_date)
+                        st.session_state.promos_df = base
+                        st.success(f"Fecha aplicada a {len(ctrl_filtered)} filas de control.")
+                        st.rerun()
                     else:
-                        if "Campaña 1" in base.columns:
-                            base.loc[idx, "Campaña 1"] = pd.to_datetime(r.get("next_campaign_date")) if pd.notna(r.get("next_campaign_date")) and r.get("next_campaign_date") else pd.NaT
-                st.session_state.promos_df = base
-                st.success("Cambios de control guardados.")
-                st.rerun()
+                        st.warning("Elige una fecha antes de aplicar.")
 
     with op_tab3:
         st.caption("Lista dedicada para agregar, sacar o modificar filas de relámpago mi página.")
