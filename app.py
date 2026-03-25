@@ -384,7 +384,7 @@ def build_model(master_bytes, compras_bytes=None):
     master = sheets.get("MAESTRA de precios", pd.DataFrame()).copy()
     bridge = sheets.get("MLC -SKU", pd.DataFrame()).copy()
     promos = sheets.get("CONTROL DE PROMOCIONES", pd.DataFrame()).copy()
-    relampago = prep_relampago(sheets.get("Relampago mi pagina", pd.DataFrame()).copy())
+    relampago = prep_relampago((sheets.get("Relampago mi pagina") if "Relampago mi pagina" in sheets else sheets.get("Relámpago mi página", pd.DataFrame())).copy())
 
     if "Unnamed: 12" in master.columns and "MLC_aux" not in master.columns:
         master = master.rename(columns={"Unnamed: 12": "MLC_aux"})
@@ -641,17 +641,23 @@ if master_file is None:
 model = build_model(master_file, compras_file)
 all_sheets = model["sheets"]
 
-if "master_df" not in st.session_state or st.session_state.get("source_name") != master_file.name:
-    st.session_state.master_df = model["master"].copy()
-    st.session_state.bridge_df = model["bridge"].copy()
-    st.session_state.promos_df = model["promos"].copy()
-    st.session_state.relampago_df = model["relampago"].copy()
+state_needs_refresh = st.session_state.get("source_name") != master_file.name
+if state_needs_refresh:
     st.session_state.source_name = master_file.name
 
-master_df = st.session_state.master_df
-bridge_df = st.session_state.bridge_df
-promos_df = st.session_state.promos_df
-relampago_df = st.session_state.relampago_df
+if state_needs_refresh or "master_df" not in st.session_state:
+    st.session_state.master_df = model["master"].copy()
+if state_needs_refresh or "bridge_df" not in st.session_state:
+    st.session_state.bridge_df = model["bridge"].copy()
+if state_needs_refresh or "promos_df" not in st.session_state:
+    st.session_state.promos_df = model["promos"].copy()
+if state_needs_refresh or "relampago_df" not in st.session_state:
+    st.session_state.relampago_df = model.get("relampago", pd.DataFrame()).copy()
+
+master_df = st.session_state.get("master_df", model["master"].copy())
+bridge_df = st.session_state.get("bridge_df", model["bridge"].copy())
+promos_df = st.session_state.get("promos_df", model["promos"].copy())
+relampago_df = st.session_state.get("relampago_df", model.get("relampago", pd.DataFrame()).copy())
 
 product_df, promos_df_view, relampago_view, compras_df = rebuild_from_session(
     all_sheets, compras_file, master_df, bridge_df, promos_df, relampago_df
