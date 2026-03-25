@@ -142,6 +142,15 @@ def safe_to_numeric(series):
     return pd.to_numeric(series, errors="coerce")
 
 
+def safe_int(value, default=0):
+    try:
+        if pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
 def upcoming_status(next_date: pd.Timestamp | None):
     if pd.isna(next_date) or next_date is None:
         return "Sin fecha"
@@ -441,7 +450,7 @@ with tab1:
             c1.metric("SKU", sanitize_numeric_text(p.get("SKU")) or "-")
             c2.metric("Ubicación", sanitize_numeric_text(p.get("UBIC")) or "-")
             c3.metric("Estado promo", p.get("campaign_status") or "Sin datos")
-            c4.metric("Promos asociadas", int(p.get("total_promos", 0) or 0))
+            c4.metric("Promos asociadas", safe_int(p.get("total_promos", 0)))
             st.markdown(f"### {p.get('DESCRIPCIÓN', '-')}")
 
             l1, l2, l3 = st.columns([1.2, 1.2, 1.6])
