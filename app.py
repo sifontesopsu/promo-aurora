@@ -155,6 +155,142 @@ def df_series(df, col, default=""):
     return pd.Series([default] * len(df), index=df.index, dtype=object)
 
 
+def pick_first_existing(columns_lower, preferred_names=(), contains_terms=()):
+    for name in preferred_names:
+        for original, lowered in columns_lower.items():
+            if lowered == name.lower():
+                return original
+    for term in contains_terms:
+        for original, lowered in columns_lower.items():
+            if term.lower() in lowered:
+                return original
+    return None
+
+
+def prepare_compras_dataframe(raw_compras: pd.DataFrame):
+    compras = raw_compras.copy()
+    if compras.empty:
+        return compras, pd.DataFrame(), {}
+
+    columns_lower = {c: str(c).strip().lower() for c in compras.columns}
+
+    sku_col = pick_first_existing(
+        columns_lower,
+        preferred_names=["SKU", "Codigo", "Código"],
+        contains_terms=["sku"],
+    )
+    date_col = pick_first_existing(columns_lower, preferred_names=["Fecha"], contains_terms=["fecha"])
+    provider_col = pick_first_existing(
+        columns_lower,
+        preferred_names=["Razón Social", "Proveedor", "Proveedor / Razón Social"],
+        contains_terms=["razón social", "proveedor"],
+    )
+    price_col = pick_first_existing(
+        columns_lower,
+        preferred_names=["Precio Un.", "Precio Unitario", "Costo Unitario"],
+        contains_terms=["precio un", "precio", "costo unit"],
+    )
+    qty_col = pick_first_existing(columns_lower, preferred_names=["Cantidad"], contains_terms=["cantidad", "cant"])
+    desc_col = pick_first_existing(
+        columns_lower,
+        preferred_names=["Concepto / Artículo", "Descripción", "Detalle Concepto Compra"],
+        contains_terms=["concepto", "artículo", "articulo", "descripción", "descripcion", "detalle"],
+    )
+    doc_col = pick_first_existing(columns_lower, preferred_names=["Documento"], contains_terms=["documento", "tipo doc", "tipo documento"])
+    folio_col = pick_first_existing(columns_lower, preferred_names=["Folio"], contains_terms=["folio"])
+    total_col = pick_first_existing(columns_lower, preferred_names=["Total Línea", "Total"], contains_terms=["total línea", "total linea", "total"])
+
+    meta = {
+        "sku_col": sku_col,
+        "date_col": date_col,
+        "provider_col": provider_col,
+        "price_col": price_col,
+        "qty_col": qty_col,
+        "desc_col": desc_col,
+    }
+
+    if sku_col is None:
+        return pd.DataFrame(), pd.DataFrame(), meta
+
+    compras["SKU_norm"] = compras[sku_col].apply(normalize_sku)
+    compras = compras[compras["SKU_norm"].notna()].copy()
+
+    if date_col:
+        compras["fecha_compra"] = pd.to_datetime(compras[date_col], errors="coerce", dayfirst=True)
+    else:
+        compras["fecha_compra"] = pd.NaT
+
+    if provider_col:
+        compras["proveedor"] = compras[provider_col].astype(str).replace("nan", "").str.strip()
+    else:
+        compras["proveedor"] = ""
+
+    if price_col:
+        compras["precio_compra"] = pd.to_numeric(compras[price_col], errors="coerce")
+    else:
+        compras["precio_compra"] = np.nan
+
+    if qty_col:
+        compras["cantidad"] = pd.to_numeric(compras[qty_col], errors="coerce")
+    else:
+        compras["cantidad"] = np.nan
+
+    if desc_col:
+        compras["descripcion_compra"] = compras[desc_col].astype(str).replace("nan", "").str.strip()
+    else:
+        compras["descripcion_compra"] = ""
+
+    if doc_col:
+        compras["documento_compra"] = compras[doc_col].astype(str).replace("nan", "").str.strip()
+    else:
+        compras["documento_compra"] = ""
+
+    if folio_col:
+        compras["folio_compra"] = compras[folio_col].astype(str).replace("nan", "").str.strip()
+    else:
+        compras["folio_compra"] = ""
+
+    if total_col:
+        compras["total_linea_compra"] = pd.to_numeric(compras[total_col], errors="coerce")
+    else:
+        compras["total_linea_compra"] = np.nan
+
+    compras = compras.sort_values(["SKU_norm", "fecha_compra"]).reset_index(drop=True)
+    compras["precio_anterior"] = compras.groupby("SKU_norm")["precio_compra"].shift(1)
+    compras["variacion_vs_anterior_pct"] = np.where(
+        compras["precio_anterior"].notna() & (compras["precio_anterior"] != 0) & compras["precio_compra"].notna(),
+        (compras["precio_compra"] / compras["precio_anterior"] - 1.0) * 100.0,
+        np.nan,
+    )
+
+    latest = compras.dropna(subset=["fecha_compra"]).groupby("SKU_norm", as_index=False).tail(1)
+    if latest.empty:
+        latest = compras.groupby("SKU_norm", as_index=False).tail(1)
+
+    summary = compras.groupby("SKU_norm").agg(
+        ultima_compra=("fecha_compra", "max"),
+        precio_min_hist=("precio_compra", "min"),
+        precio_max_hist=("precio_compra", "max"),
+        compras_registros=("SKU_norm", "count"),
+        proveedores=("proveedor", lambda s: " | ".join(pd.unique([str(x) for x in s if pd.notna(x) and str(x).strip()]))),
+    ).reset_index()
+
+    latest_fields = latest[["SKU_norm", "fecha_compra", "precio_compra", "proveedor", "cantidad", "variacion_vs_anterior_pct", "descripcion_compra", "documento_compra", "folio_compra"]].rename(columns={
+        "fecha_compra": "ultima_compra_registro",
+        "precio_compra": "ultimo_precio_compra",
+        "proveedor": "proveedor_ultimo",
+        "cantidad": "cantidad_ultima_compra",
+        "variacion_vs_anterior_pct": "variacion_ultima_vs_anterior_pct",
+        "descripcion_compra": "descripcion_ultima_compra",
+        "documento_compra": "documento_ultima_compra",
+        "folio_compra": "folio_ultima_compra",
+    })
+    summary = summary.merge(latest_fields, on="SKU_norm", how="left")
+    summary["ultima_compra"] = summary["ultima_compra"].combine_first(summary["ultima_compra_registro"])
+    summary = summary.drop(columns=["ultima_compra_registro"], errors="ignore")
+    return compras, summary, meta
+
+
 @st.cache_data(show_spinner=False)
 def build_model(master_bytes, compras_bytes=None):
     sheets = read_excel_all(master_bytes)
@@ -234,43 +370,18 @@ def build_model(master_bytes, compras_bytes=None):
     # compras prep
     compras = pd.DataFrame()
     compras_summary = pd.DataFrame()
+    compras_meta = {}
     if compras_bytes is not None:
         try:
             c_sheets = read_excel_all(compras_bytes)
-            # choose largest sheet
             best_name = max(c_sheets, key=lambda k: len(c_sheets[k]))
-            compras = c_sheets[best_name].copy()
-            norm_cols = {c: str(c).strip().lower() for c in compras.columns}
-            # heuristics
-            sku_col = next((c for c in compras.columns if "sku" in norm_cols[c] or "codigo" in norm_cols[c] or "art" in norm_cols[c]), None)
-            date_col = next((c for c in compras.columns if "fecha" in norm_cols[c]), None)
-            prov_col = next((c for c in compras.columns if "prove" in norm_cols[c]), None)
-            price_col = next((c for c in compras.columns if "precio" in norm_cols[c] or "costo" in norm_cols[c] or "neto" in norm_cols[c]), None)
-            qty_col = next((c for c in compras.columns if "cant" in norm_cols[c]), None)
-
-            if sku_col:
-                compras["SKU_norm"] = compras[sku_col].apply(normalize_sku)
-            if date_col:
-                compras["fecha_compra"] = pd.to_datetime(compras[date_col], errors="coerce")
-            if prov_col:
-                compras["proveedor"] = compras[prov_col]
-            if price_col:
-                compras["precio_compra"] = pd.to_numeric(compras[price_col], errors="coerce")
-            if qty_col:
-                compras["cantidad"] = pd.to_numeric(compras[qty_col], errors="coerce")
-            compras_summary = compras.groupby("SKU_norm").agg(
-                ultima_compra=("fecha_compra", "max"),
-                ultimo_precio_compra=("precio_compra", "last"),
-                proveedor_ultimo=("proveedor", "last"),
-                proveedores=("proveedor", lambda s: " | ".join(pd.unique([str(x) for x in s if pd.notna(x)]))),
-                precio_min_hist=("precio_compra", "min"),
-                precio_max_hist=("precio_compra", "max"),
-                compras_registros=("SKU_norm", "count"),
-            ).reset_index()
-            product = product.merge(compras_summary, on="SKU_norm", how="left")
+            compras, compras_summary, compras_meta = prepare_compras_dataframe(c_sheets[best_name])
+            if not compras_summary.empty:
+                product = product.merge(compras_summary, on="SKU_norm", how="left")
         except Exception:
             compras = pd.DataFrame()
             compras_summary = pd.DataFrame()
+            compras_meta = {}
 
     return {
         "sheets": sheets,
@@ -281,6 +392,7 @@ def build_model(master_bytes, compras_bytes=None):
         "product": product,
         "compras": compras,
         "compras_summary": compras_summary,
+        "compras_meta": compras_meta,
     }
 
 
@@ -344,6 +456,8 @@ st.sidebar.title("Aurora Pricing Cockpit")
 master_file = st.sidebar.file_uploader("Maestra integrada", type=["xlsx"], key="master")
 compras_file = st.sidebar.file_uploader("Compras históricas", type=["xlsx"], key="compras")
 st.sidebar.caption("Carga manual para trabajar siempre con el último archivo.")
+if compras_file is not None:
+    st.sidebar.success("Archivo de compras cargado")
 
 if master_file is None:
     st.info("Carga la maestra integrada para empezar.")
@@ -515,7 +629,12 @@ if page == "Cockpit por producto":
         st.write(f"**Última compra:** {pd.to_datetime(row.get('ultima_compra')).strftime('%d-%m-%Y') if pd.notna(row.get('ultima_compra')) else '—'}")
         st.write(f"**Último precio compra:** {money(row.get('ultimo_precio_compra'))}")
         st.write(f"**Proveedor último:** {row.get('proveedor_ultimo', '—')}")
+        st.write(f"**Cantidad última compra:** {safe_int(row.get('cantidad_ultima_compra'), 0) if pd.notna(row.get('cantidad_ultima_compra')) else '—'}")
+        st.write(f"**Variación vs compra anterior:** {pct((row.get('variacion_ultima_vs_anterior_pct') / 100.0) if pd.notna(row.get('variacion_ultima_vs_anterior_pct')) else np.nan)}")
         st.write(f"**Rango histórico:** {money(row.get('precio_min_hist'))} a {money(row.get('precio_max_hist'))}")
+        proveedores_hist = row.get('proveedores', '')
+        if pd.notna(proveedores_hist) and str(proveedores_hist).strip():
+            st.write(f"**Proveedores históricos:** {proveedores_hist}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with mid:
@@ -568,6 +687,13 @@ if page == "Cockpit por producto":
             if not chart_df.empty:
                 st.subheader("Evolución precio de compra")
                 st.line_chart(chart_df.set_index("fecha_compra"))
+            detail_cols = [c for c in ["fecha_compra", "proveedor", "precio_compra", "cantidad", "variacion_vs_anterior_pct", "documento_compra", "folio_compra", "descripcion_compra"] if c in sku_hist.columns]
+            if detail_cols:
+                detail_df = sku_hist[detail_cols].sort_values("fecha_compra", ascending=False).copy()
+                if "variacion_vs_anterior_pct" in detail_df.columns:
+                    detail_df["variacion_vs_anterior_pct"] = detail_df["variacion_vs_anterior_pct"].round(2)
+                st.subheader("Detalle histórico de compras")
+                st.dataframe(detail_df, use_container_width=True, hide_index=True, height=260)
 
 # ---------- Operator ----------
 elif page == "Operador de promos":
@@ -587,9 +713,9 @@ elif page == "Operador de promos":
         promo_work = promo_work[promo_work["next_campaign_date"].isna()]
     if search.strip():
         mask = (
-            promo_work.get("SKU_norm", "").astype(str).str.contains(search, case=False, na=False) |
-            promo_work.get("MLC_norm", "").astype(str).str.contains(search, case=False, na=False) |
-            promo_work.get("Descripción", "").astype(str).str.contains(search, case=False, na=False)
+            df_series(promo_work, "SKU_norm").astype(str).str.contains(search, case=False, na=False) |
+            df_series(promo_work, "MLC_norm").astype(str).str.contains(search, case=False, na=False) |
+            df_series(promo_work, "Descripción").astype(str).str.contains(search, case=False, na=False)
         )
         promo_work = promo_work[mask]
 
