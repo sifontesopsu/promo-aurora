@@ -149,6 +149,12 @@ def read_excel_all(uploaded_file):
     return sheets
 
 
+def df_series(df, col, default=""):
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index, dtype=object)
+
+
 @st.cache_data(show_spinner=False)
 def build_model(master_bytes, compras_bytes=None):
     sheets = read_excel_all(master_bytes)
@@ -220,9 +226,9 @@ def build_model(master_bytes, compras_bytes=None):
     product = product.merge(promo_agg, on="SKU_norm", how="left")
     product["days_to_next"] = (pd.to_datetime(product["next_campaign_date"]).dt.normalize() - pd.Timestamp.today().normalize()).dt.days
     product["search_text"] = (
-        product.get("SKU", "").astype(str).fillna("") + " | " +
-        product.get("DESCRIPCIÓN", "").astype(str).fillna("") + " | " +
-        product.get("MLC_norm", "").astype(str).fillna("")
+        df_series(product, "SKU").astype(str).fillna("") + " | " +
+        df_series(product, "DESCRIPCIÓN").astype(str).fillna("") + " | " +
+        df_series(product, "MLC_norm").astype(str).fillna("")
     ).str.lower()
 
     # compras prep
@@ -426,9 +432,9 @@ def rebuild_from_session(sheets, compras_file):
     product = product.merge(promo_agg, on="SKU_norm", how="left")
     product["days_to_next"] = (pd.to_datetime(product["next_campaign_date"]).dt.normalize() - pd.Timestamp.today().normalize()).dt.days
     product["search_text"] = (
-        product.get("SKU", "").astype(str).fillna("") + " | " +
-        product.get("DESCRIPCIÓN", "").astype(str).fillna("") + " | " +
-        product.get("MLC_norm", "").astype(str).fillna("")
+        df_series(product, "SKU").astype(str).fillna("") + " | " +
+        df_series(product, "DESCRIPCIÓN").astype(str).fillna("") + " | " +
+        df_series(product, "MLC_norm").astype(str).fillna("")
     ).str.lower()
 
     compras = model["compras"]
