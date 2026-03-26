@@ -976,34 +976,32 @@ elif page == "Alta de producto":
     st.markdown('<div class="big-title">Alta de producto nuevo</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtle">Crea un SKU nuevo directamente sobre la maestra actual.</div>', unsafe_allow_html=True)
 
-    with st.form("new_product"):
-        c1, c2, c3 = st.columns(3)
-        sku = c1.text_input("SKU")
-        desc = c2.text_input("Descripción")
-        ubic = c3.text_input("Ubicación")
-        costo = c1.number_input("Último costo", min_value=0.0, value=0.0, step=1.0)
-        bruto_tienda = c2.number_input("Precio bruto en tienda", min_value=0.0, value=0.0, step=1.0)
-        monto_sim = c3.number_input("MONTO EN SIMULACIÓN", min_value=0.0, value=0.0, step=1.0)
+    c1, c2, c3 = st.columns(3)
+    sku = c1.text_input("SKU", key="alta_sku")
+    desc = c2.text_input("Descripción", key="alta_desc")
+    ubic = c3.text_input("Ubicación", key="alta_ubic")
+    costo = c1.number_input("Último costo", min_value=0.0, value=0.0, step=1.0, key="alta_costo")
+    bruto_tienda = c2.number_input("Precio bruto en tienda", min_value=0.0, value=0.0, step=1.0, key="alta_bruto")
+    monto_sim = c3.number_input("MONTO EN SIMULACIÓN", min_value=0.0, value=0.0, step=1.0, key="alta_monto")
 
-        st.markdown("#### Promo base")
-        p1, p2, p3 = st.columns(3)
-        mlc = p1.text_input("MLC")
-        b2c = p2.number_input("Precio B2C publicado", min_value=0.0, value=0.0, step=1.0)
-        promo_price = p3.number_input("Precio promocional", min_value=0.0, value=0.0, step=1.0)
-        promo_date = p1.date_input("Fecha vencimiento", value=None, format="DD/MM/YYYY")
-        promo_comment = p2.text_input("Comentario")
-        add_relampago = p3.checkbox("Agregar a relámpago")
+    st.markdown("#### Promo base")
+    p1, p2, p3 = st.columns(3)
+    mlc = p1.text_input("MLC", key="alta_mlc")
+    b2c = p2.number_input("Precio B2C publicado", min_value=0.0, value=0.0, step=1.0, key="alta_b2c")
+    promo_date = p3.date_input("Fecha vencimiento", value=None, format="DD/MM/YYYY", key="alta_fecha")
+    promo_comment = p1.text_input("Comentario", key="alta_comentario")
+    add_relampago = p2.checkbox("Agregar a relámpago", key="alta_relampago")
 
-        precio_neto = bruto_tienda / 1.19 if bruto_tienda else np.nan
-        margen_local = ((precio_neto - costo) / precio_neto) if precio_neto and precio_neto != 0 else np.nan
-        neto_meli_1 = monto_sim / 1.19 if monto_sim else np.nan
-        margen_meli_1 = ((neto_meli_1 - costo) / neto_meli_1) if neto_meli_1 and neto_meli_1 != 0 else np.nan
+    precio_neto = bruto_tienda / 1.19 if bruto_tienda else np.nan
+    margen_local = ((precio_neto - costo) / precio_neto) if pd.notna(precio_neto) and precio_neto != 0 else np.nan
+    neto_meli_1 = monto_sim / 1.19 if monto_sim else np.nan
+    margen_meli_1 = ((neto_meli_1 - costo) / neto_meli_1) if pd.notna(neto_meli_1) and neto_meli_1 != 0 else np.nan
 
-        s1, s2 = st.columns(2)
-        s1.metric("Margen local proyectado", pct(margen_local))
-        s2.metric("Margen Meli 1 proyectado", pct(margen_meli_1))
+    s1, s2 = st.columns(2)
+    s1.metric("Margen local proyectado", pct(margen_local))
+    s2.metric("Margen Meli 1 proyectado", pct(margen_meli_1))
 
-        create = st.form_submit_button("Crear producto", type="primary", use_container_width=True)
+    create = st.button("Crear producto", type="primary", use_container_width=True)
 
     if create:
         if not normalize_sku(sku):
@@ -1025,8 +1023,6 @@ elif page == "Alta de producto":
                 new_row["MLC"] = mlc
             if b2c > 0:
                 new_row["PRECIO B2C PUBLICADO "] = b2c
-            if promo_price > 0 and b2c > 0:
-                new_row["% DCTO"] = 1 - (promo_price / b2c)
             if promo_date:
                 new_row["FECHA VENCI"] = pd.to_datetime(promo_date)
             if promo_comment.strip():
@@ -1044,7 +1040,7 @@ elif page == "Alta de producto":
                 rel_row = {c: np.nan for c in RELAMPAGO_COLS}
                 rel_row["SKU"] = normalize_sku(sku)
                 rel_row["Descripción"] = desc
-                rel_row["Precio promocional"] = promo_price if promo_price > 0 else np.nan
+                rel_row["Precio promocional"] = b2c if b2c > 0 else np.nan
                 rel_row["COMENTARIO"] = promo_comment if promo_comment.strip() else np.nan
                 rel = pd.concat([rel, pd.DataFrame([rel_row])], ignore_index=True)
                 st.session_state.relampago_df = rel
