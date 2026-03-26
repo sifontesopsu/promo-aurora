@@ -1,6 +1,7 @@
 
 import io
 import re
+import hashlib
 from datetime import date
 
 import numpy as np
@@ -204,8 +205,16 @@ def first_nonempty(*values):
     return None
 
 
-def read_excel_all(uploaded_file):
-    raw_bytes = uploaded_file.getvalue()
+def file_bytes_and_sig(uploaded_file):
+    if uploaded_file is None:
+        return None, None
+    raw = uploaded_file.getvalue()
+    sig = hashlib.md5(raw).hexdigest()
+    return raw, sig
+
+
+@st.cache_data(show_spinner=False)
+def read_excel_all_from_bytes(raw_bytes):
     xls = pd.ExcelFile(io.BytesIO(raw_bytes))
     sheets = {}
     for sh in xls.sheet_names:
@@ -222,52 +231,12 @@ def read_excel_all(uploaded_file):
     return sheets
 
 
+def read_excel_all(uploaded_file):
+    raw_bytes, _ = file_bytes_and_sig(uploaded_file)
+    if raw_bytes is None:
+        return {}
+    return read_excel_all_from_bytes(raw_bytes)
 
-
-@st.cache_data(show_spinner=False)
-def load_compras_cached(compras_bytes):
-    if compras_bytes is None:
-        return pd.DataFrame(), pd.DataFrame(), {}
-    c_sheets = read_excel_all(compras_bytes)
-    best_name = max(c_sheets, key=lambda k: len(c_sheets[k]))
-    return prepare_compras_dataframe(c_sheets[best_name])
-
-
-@st.cache_data(show_spinner=False)
-def derive_runtime(master_df, bridge_df, relampago_df, compras_df):
-    relampago = prep_relampago(relampago_df.copy())
-    promo_cards = build_master_promo_cards(master_df.copy())
-    product, bridge = aggregate_product(master_df.copy(), bridge_df.copy(), promo_cards, relampago)
-    if compras_df is not None and not compras_df.empty:
-        compras_summary = compras_summary_from_all(compras_df)
-        if not compras_summary.empty:
-            product = product.merge(compras_summary, on="SKU_norm", how="left")
-    return product, promo_cards, relampago
-
-
-def compras_summary_from_all(compras_df: pd.DataFrame):
-    if compras_df is None or compras_df.empty:
-        return pd.DataFrame()
-    latest = compras_df.dropna(subset=["fecha_compra"]).groupby("SKU_norm", as_index=False).tail(1)
-    if latest.empty:
-        latest = compras_df.groupby("SKU_norm", as_index=False).tail(1)
-    summary = compras_df.groupby("SKU_norm").agg(
-        ultima_compra=("fecha_compra", "max"),
-        precio_min_hist=("precio_compra", "min"),
-        precio_max_hist=("precio_compra", "max"),
-        compras_registros=("SKU_norm", "count"),
-        proveedores=("proveedor", lambda s: " | ".join(pd.unique([str(x) for x in s if pd.notna(x) and str(x).strip()]))),
-    ).reset_index()
-    latest_fields = latest[["SKU_norm", "fecha_compra", "precio_compra", "proveedor", "cantidad", "variacion_vs_anterior_pct"]].rename(columns={
-        "fecha_compra": "ultima_compra_registro",
-        "precio_compra": "ultimo_precio_compra",
-        "proveedor": "proveedor_ultimo",
-        "cantidad": "cantidad_ultima_compra",
-        "variacion_vs_anterior_pct": "variacion_ultima_vs_anterior_pct",
-    })
-    summary = summary.merge(latest_fields, on="SKU_norm", how="left")
-    summary["ultima_compra"] = summary["ultima_compra"].combine_first(summary["ultima_compra_registro"])
-    return summary.drop(columns=["ultima_compra_registro"], errors="ignore")
 
 def pick_first_existing(columns_lower, preferred_names=(), contains_terms=()):
     for name in preferred_names:
@@ -471,7 +440,10 @@ def build_master_promo_cards(master: pd.DataFrame):
         for slot in PROMO_SLOTS:
             mlcs = extract_mlcs(row.get(slot["mlc_col"])) if slot["mlc_col"] in master.columns else []
             published = safe_float(row.get(slot["published_col"]))
-            promo_price = published if pd.notna(published) else np.nan
+            discount = safe_float(row.get(slot["discount_col"]))
+            promo_price = np.nan
+            if pd.notna(published) and pd.notna(discount):
+                promo_price = published * (1 - discount)
             fe = pd.to_datetime(row.get(slot["date_col"]), errors="coerce") if slot["date_col"] in master.columns else pd.NaT
             comment = first_nonempty(row.get(slot["comment_col"]), "")
             should_create = bool(mlcs) or pd.notna(fe) or pd.notna(promo_price) or (isinstance(comment, str) and comment.strip())
@@ -582,14 +554,44 @@ def compute_decision_row(row):
 
 
 @st.cache_data(show_spinner=False)
+def cached_prepare_compras_from_bytes(compras_bytes):
+    if compras_bytes is None:
+        return pd.DataFrame(), pd.DataFrame()
+    try:
+        c_sheets = read_excel_all_from_bytes(compras_bytes)
+        best_name = max(c_sheets, key=lambda k: len(c_sheets[k]))
+        compras, compras_summary, _ = prepare_compras_dataframe(c_sheets[best_name])
+        return compras, compras_summary
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def cached_rebuild_from_frames(master_df, bridge_df, relampago_df, compras_bytes=None):
+    relampago = prep_relampago(relampago_df.copy())
+    promo_cards = build_master_promo_cards(master_df)
+    product, bridge = aggregate_product(master_df, bridge_df, promo_cards, relampago)
+    compras = pd.DataFrame()
+    if compras_bytes is not None:
+        compras, compras_summary = cached_prepare_compras_from_bytes(compras_bytes)
+        if not compras_summary.empty:
+            product = product.merge(compras_summary, on="SKU_norm", how="left")
+    return product, promo_cards, relampago, compras
+
+
+@st.cache_data(show_spinner=False)
 def build_model(master_bytes, compras_bytes=None):
-    sheets = read_excel_all(master_bytes)
+    sheets = read_excel_all_from_bytes(master_bytes)
     master = sheets.get("MAESTRA de precios", pd.DataFrame()).copy()
     bridge = sheets.get("MLC -SKU", pd.DataFrame()).copy()
     relampago_sheet = sheets.get("Relampago mi pagina") if "Relampago mi pagina" in sheets else sheets.get("Relámpago mi página", pd.DataFrame())
     relampago = prep_relampago(relampago_sheet.copy())
-    compras, _, _ = load_compras_cached(compras_bytes) if compras_bytes is not None else (pd.DataFrame(), pd.DataFrame(), {})
-    product, promo_cards, relampago = derive_runtime(master.copy(), bridge.copy(), relampago.copy(), compras.copy())
+    promo_cards = build_master_promo_cards(master)
+    product, bridge = aggregate_product(master, bridge, promo_cards, relampago)
+
+    compras, compras_summary = cached_prepare_compras_from_bytes(compras_bytes)
+    if not compras_summary.empty:
+        product = product.merge(compras_summary, on="SKU_norm", how="left")
 
     return {
         "sheets": sheets,
@@ -602,11 +604,11 @@ def build_model(master_bytes, compras_bytes=None):
     }
 
 
-def rebuild_from_session(master_df, bridge_df, relampago_df, compras_df):
-    product, promo_cards, relampago = derive_runtime(master_df.copy(), bridge_df.copy(), relampago_df.copy(), compras_df.copy() if compras_df is not None else pd.DataFrame())
-    return product, promo_cards, relampago, compras_df.copy() if compras_df is not None else pd.DataFrame()
+def rebuild_from_session(compras_bytes, master_df, bridge_df, relampago_df):
+    return cached_rebuild_from_frames(master_df, bridge_df, relampago_df, compras_bytes)
 
 
+@st.cache_data(show_spinner=False)
 def make_download_workbook(all_sheets, master_df, bridge_df, relampago_df):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -632,13 +634,19 @@ def display_date(v):
 
 def promo_price_from_row(row, slot):
     published = safe_float(row.get(slot["published_col"]))
-    return published if pd.notna(published) else np.nan
+    dcto = safe_float(row.get(slot["discount_col"]))
+    if pd.notna(published) and pd.notna(dcto):
+        return published * (1 - dcto)
+    return np.nan
 
 
 def update_master_promo(master_df, source_index, slot_key, new_price, new_date, new_comment):
     slot = next(s for s in PROMO_SLOTS if s["slot_key"] == slot_key)
-    master_df.loc[source_index, slot["published_col"]] = float(new_price) if pd.notna(new_price) and float(new_price) > 0 else np.nan
-    if slot["discount_col"] in master_df.columns:
+    row = master_df.loc[source_index].copy()
+    published = safe_float(row.get(slot["published_col"]))
+    if pd.notna(published) and published > 0 and pd.notna(new_price) and new_price > 0:
+        master_df.loc[source_index, slot["discount_col"]] = 1 - (float(new_price) / published)
+    else:
         master_df.loc[source_index, slot["discount_col"]] = np.nan
     master_df.loc[source_index, slot["date_col"]] = pd.to_datetime(new_date) if new_date else pd.NaT
     master_df.loc[source_index, slot["comment_col"]] = new_comment if str(new_comment).strip() else np.nan
@@ -665,17 +673,23 @@ def promo_dialog(card):
     st.write(f"**Descripción:** {card.get('Descripción')}")
     if card.get("MLC_norm"):
         st.write(f"**MLC:** {card.get('MLC_norm')}")
-    st.write(f"**Precio promocional actual:** {money(row.get(slot['published_col']))}")
+    st.caption(f"Precio B2C publicado: {money(row.get(slot['published_col']))}")
+    st.markdown("#### Fecha de vencimiento")
 
     with st.form(f"promo_edit_{source_index}_{slot_key}"):
-        c1, c2 = st.columns(2)
-        new_price = c1.number_input("Precio promocional / B2C", min_value=0.0, value=float(safe_float(current_price, 0.0)), step=1.0)
-        new_date = c2.date_input("Fecha", value=current_date.date() if pd.notna(current_date) else None, format="DD/MM/YYYY")
-        new_comment = st.text_input("Comentario", value=str(current_comment))
+        new_date = st.date_input(
+            "Fecha",
+            value=current_date.date() if pd.notna(current_date) else date.today(),
+            format="DD/MM/YYYY",
+            help="Este es el cambio principal de la promo.",
+        )
+        with st.expander("Precio promocional y comentario", expanded=False):
+            c1, c2 = st.columns([1, 1])
+            new_price = c1.number_input("Precio promocional", min_value=0.0, value=float(safe_float(current_price, 0.0)), step=1.0)
+            new_comment = c2.text_input("Comentario", value=str(current_comment))
         save = st.form_submit_button("Guardar cambios", type="primary", use_container_width=True)
     if save:
         st.session_state.master_df = update_master_promo(master_df, source_index, slot_key, new_price if new_price > 0 else np.nan, new_date, new_comment)
-        st.session_state.download_dirty = True
         dialog_save_and_close()
 
     if st.button("Cerrar", use_container_width=True):
@@ -691,16 +705,19 @@ if master_file is None:
     st.info("Carga la maestra integrada para empezar.")
     st.stop()
 
-model = build_model(master_file, compras_file)
+master_bytes, master_sig = file_bytes_and_sig(master_file)
+compras_bytes, compras_sig = file_bytes_and_sig(compras_file)
+model = build_model(master_bytes, compras_bytes)
 all_sheets = model["sheets"]
 
-state_needs_refresh = st.session_state.get("source_name") != master_file.name
+state_needs_refresh = (st.session_state.get("master_sig") != master_sig) or (st.session_state.get("compras_sig") != compras_sig)
 if state_needs_refresh:
+    st.session_state.master_sig = master_sig
+    st.session_state.compras_sig = compras_sig
     st.session_state.source_name = master_file.name
 
 if state_needs_refresh or "master_df" not in st.session_state:
     st.session_state.master_df = model["master"].copy()
-    st.session_state.download_dirty = True
 if state_needs_refresh or "bridge_df" not in st.session_state:
     st.session_state.bridge_df = model["bridge"].copy()
 if state_needs_refresh or "relampago_df" not in st.session_state:
@@ -709,21 +726,13 @@ if "dialog_card" not in st.session_state:
     st.session_state.dialog_card = None
 
 product_df, promo_cards_df, relampago_view, compras_df = rebuild_from_session(
-    st.session_state.master_df, st.session_state.bridge_df, st.session_state.relampago_df, model["compras"]
+    compras_bytes, st.session_state.master_df, st.session_state.bridge_df, st.session_state.relampago_df
 )
 
-if state_needs_refresh or "download_bytes" not in st.session_state:
-    st.session_state.download_bytes = None
-    st.session_state.download_dirty = True
-if "download_dirty" not in st.session_state:
-    st.session_state.download_dirty = True
-if st.session_state.download_dirty or st.session_state.download_bytes is None:
-    st.session_state.download_bytes = make_download_workbook(all_sheets, st.session_state.master_df, st.session_state.bridge_df, st.session_state.relampago_df)
-    st.session_state.download_dirty = False
-
+download_bytes = make_download_workbook(all_sheets, st.session_state.master_df, st.session_state.bridge_df, st.session_state.relampago_df)
 st.sidebar.download_button(
     "Descargar Excel actualizado",
-    data=st.session_state.download_bytes,
+    data=download_bytes,
     file_name=f"MAESTRA_ACTUALIZADA_{date.today().isoformat()}.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     use_container_width=True,
@@ -881,15 +890,14 @@ elif page == "Operador de promos":
             cards["MLC_norm"].astype(str).fillna("")
         ).str.lower()
 
-        k1, k2, k3, k4, k5 = st.columns(5)
+        k1, k2, k3, k4 = st.columns(4)
         k1.metric("Vencen hoy", int((cards["days_to_next"] == 0).sum()))
         k2.metric("Vencen mañana", int((cards["days_to_next"] == 1).sum()))
         k3.metric("Vencen en 3 días", int((cards["days_to_next"] == 3).sum()))
         k4.metric("Sin precio promo", int(cards["Precio promocional"].isna().sum()))
-        k5.metric("Sin comentario", int(cards["COMENTARIO"].fillna("").astype(str).str.strip().eq("").sum()))
 
         f1, f2, f3 = st.columns([1, 1, 2])
-        prioridad = f1.selectbox("Prioridad", ["Todas", "Hoy", "Mañana", "En 3 días", "Sin precio promocional", "Sin comentario", "Vigentes"], key="prio_cards")
+        prioridad = f1.selectbox("Prioridad", ["Todas", "Hoy", "Mañana", "En 3 días", "Sin precio promocional", "Vigentes"], key="prio_cards")
         q = f3.text_input("Buscar SKU / MLC / descripción", key="search_cards")
         filtered = cards.copy()
         if prioridad == "Hoy":
@@ -900,8 +908,6 @@ elif page == "Operador de promos":
             filtered = filtered[filtered["days_to_next"] == 3]
         elif prioridad == "Sin precio promocional":
             filtered = filtered[filtered["Precio promocional"].isna()]
-        elif prioridad == "Sin comentario":
-            filtered = filtered[filtered["COMENTARIO"].fillna("").astype(str).str.strip().eq("")]
         elif prioridad == "Vigentes":
             filtered = filtered[(filtered["days_to_next"].notna()) & (filtered["days_to_next"] >= 0)]
         if q.strip():
@@ -919,7 +925,6 @@ elif page == "Operador de promos":
                 for _, r in filtered[["source_index", "slot_key"]].drop_duplicates().iterrows():
                     master = update_master_promo(master, int(r["source_index"]), r["slot_key"], promo_price_from_row(master.loc[int(r["source_index"])], next(s for s in PROMO_SLOTS if s["slot_key"] == r["slot_key"])), bulk_date, first_nonempty(master.loc[int(r["source_index"])].get(next(s for s in PROMO_SLOTS if s["slot_key"] == r["slot_key"])["comment_col"]), ""))
                 st.session_state.master_df = master
-                st.session_state.download_dirty = True
                 st.success(f"Fecha aplicada a {len(filtered[['source_index', 'slot_key']].drop_duplicates())} bloques de promo.")
                 st.rerun()
             else:
@@ -964,7 +969,6 @@ elif page == "Operador de promos":
             for c in rel_cols:
                 base[c] = rel_edit[c]
             st.session_state.relampago_df = base
-            st.session_state.download_dirty = True
             st.success("Lista relámpago actualizada.")
             st.rerun()
 
@@ -984,8 +988,8 @@ elif page == "Alta de producto":
         st.markdown("#### Promo base")
         p1, p2, p3 = st.columns(3)
         mlc = p1.text_input("MLC")
-        b2c = p2.number_input("Precio promocional / B2C", min_value=0.0, value=0.0, step=1.0)
-        promo_price = p3.number_input("Precio relámpago opcional", min_value=0.0, value=0.0, step=1.0)
+        b2c = p2.number_input("Precio B2C publicado", min_value=0.0, value=0.0, step=1.0)
+        promo_price = p3.number_input("Precio promocional", min_value=0.0, value=0.0, step=1.0)
         promo_date = p1.date_input("Fecha vencimiento", value=None, format="DD/MM/YYYY")
         promo_comment = p2.text_input("Comentario")
         add_relampago = p3.checkbox("Agregar a relámpago")
@@ -1021,21 +1025,19 @@ elif page == "Alta de producto":
                 new_row["MLC"] = mlc
             if b2c > 0:
                 new_row["PRECIO B2C PUBLICADO "] = b2c
-            if "% DCTO" in new_row:
-                new_row["% DCTO"] = np.nan
+            if promo_price > 0 and b2c > 0:
+                new_row["% DCTO"] = 1 - (promo_price / b2c)
             if promo_date:
                 new_row["FECHA VENCI"] = pd.to_datetime(promo_date)
             if promo_comment.strip():
                 new_row["COMENTARIO"] = promo_comment
             master = pd.concat([master, pd.DataFrame([new_row])], ignore_index=True)
             st.session_state.master_df = master
-            st.session_state.download_dirty = True
 
             if mlc:
                 bridge = st.session_state.bridge_df.copy()
                 bridge = pd.concat([bridge, pd.DataFrame([{"SKU_norm": normalize_sku(sku), "MLC_norm": normalize_mlc(mlc)}])], ignore_index=True)
                 st.session_state.bridge_df = bridge
-                st.session_state.download_dirty = True
 
             if add_relampago:
                 rel = st.session_state.relampago_df.copy()
@@ -1046,7 +1048,6 @@ elif page == "Alta de producto":
                 rel_row["COMENTARIO"] = promo_comment if promo_comment.strip() else np.nan
                 rel = pd.concat([rel, pd.DataFrame([rel_row])], ignore_index=True)
                 st.session_state.relampago_df = rel
-                st.session_state.download_dirty = True
 
             st.success("Producto creado. Descarga el Excel actualizado desde la barra lateral.")
             st.rerun()
