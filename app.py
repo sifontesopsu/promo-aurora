@@ -1,7 +1,6 @@
 
 import io
 import re
-import hashlib
 from datetime import date
 
 import numpy as np
@@ -205,16 +204,8 @@ def first_nonempty(*values):
     return None
 
 
-def file_bytes_and_sig(uploaded_file):
-    if uploaded_file is None:
-        return None, None
-    raw = uploaded_file.getvalue()
-    sig = hashlib.md5(raw).hexdigest()
-    return raw, sig
-
-
-@st.cache_data(show_spinner=False)
-def read_excel_all_from_bytes(raw_bytes):
+def read_excel_all(uploaded_file):
+    raw_bytes = uploaded_file.getvalue()
     xls = pd.ExcelFile(io.BytesIO(raw_bytes))
     sheets = {}
     for sh in xls.sheet_names:
@@ -229,13 +220,6 @@ def read_excel_all_from_bytes(raw_bytes):
         else:
             sheets[sh] = pd.read_excel(io.BytesIO(raw_bytes), sheet_name=sh)
     return sheets
-
-
-def read_excel_all(uploaded_file):
-    raw_bytes, _ = file_bytes_and_sig(uploaded_file)
-    if raw_bytes is None:
-        return {}
-    return read_excel_all_from_bytes(raw_bytes)
 
 
 def pick_first_existing(columns_lower, preferred_names=(), contains_terms=()):
@@ -554,34 +538,8 @@ def compute_decision_row(row):
 
 
 @st.cache_data(show_spinner=False)
-def cached_prepare_compras_from_bytes(compras_bytes):
-    if compras_bytes is None:
-        return pd.DataFrame(), pd.DataFrame()
-    try:
-        c_sheets = read_excel_all_from_bytes(compras_bytes)
-        best_name = max(c_sheets, key=lambda k: len(c_sheets[k]))
-        compras, compras_summary, _ = prepare_compras_dataframe(c_sheets[best_name])
-        return compras, compras_summary
-    except Exception:
-        return pd.DataFrame(), pd.DataFrame()
-
-
-@st.cache_data(show_spinner=False)
-def cached_rebuild_from_frames(master_df, bridge_df, relampago_df, compras_bytes=None):
-    relampago = prep_relampago(relampago_df.copy())
-    promo_cards = build_master_promo_cards(master_df)
-    product, bridge = aggregate_product(master_df, bridge_df, promo_cards, relampago)
-    compras = pd.DataFrame()
-    if compras_bytes is not None:
-        compras, compras_summary = cached_prepare_compras_from_bytes(compras_bytes)
-        if not compras_summary.empty:
-            product = product.merge(compras_summary, on="SKU_norm", how="left")
-    return product, promo_cards, relampago, compras
-
-
-@st.cache_data(show_spinner=False)
 def build_model(master_bytes, compras_bytes=None):
-    sheets = read_excel_all_from_bytes(master_bytes)
+    sheets = read_excel_all(master_bytes)
     master = sheets.get("MAESTRA de precios", pd.DataFrame()).copy()
     bridge = sheets.get("MLC -SKU", pd.DataFrame()).copy()
     relampago_sheet = sheets.get("Relampago mi pagina") if "Relampago mi pagina" in sheets else sheets.get("Relámpago mi página", pd.DataFrame())
@@ -589,9 +547,16 @@ def build_model(master_bytes, compras_bytes=None):
     promo_cards = build_master_promo_cards(master)
     product, bridge = aggregate_product(master, bridge, promo_cards, relampago)
 
-    compras, compras_summary = cached_prepare_compras_from_bytes(compras_bytes)
-    if not compras_summary.empty:
-        product = product.merge(compras_summary, on="SKU_norm", how="left")
+    compras = pd.DataFrame()
+    if compras_bytes is not None:
+        try:
+            c_sheets = read_excel_all(compras_bytes)
+            best_name = max(c_sheets, key=lambda k: len(c_sheets[k]))
+            compras, compras_summary, _ = prepare_compras_dataframe(c_sheets[best_name])
+            if not compras_summary.empty:
+                product = product.merge(compras_summary, on="SKU_norm", how="left")
+        except Exception:
+            compras = pd.DataFrame()
 
     return {
         "sheets": sheets,
@@ -604,11 +569,26 @@ def build_model(master_bytes, compras_bytes=None):
     }
 
 
-def rebuild_from_session(compras_bytes, master_df, bridge_df, relampago_df):
-    return cached_rebuild_from_frames(master_df, bridge_df, relampago_df, compras_bytes)
+def rebuild_from_session(sheets, compras_file, master_df, bridge_df, relampago_df):
+    master = master_df.copy()
+    bridge = bridge_df.copy()
+    relampago = prep_relampago(relampago_df.copy())
+    promo_cards = build_master_promo_cards(master)
+    product, bridge = aggregate_product(master, bridge, promo_cards, relampago)
+
+    compras = pd.DataFrame()
+    if compras_file is not None:
+        try:
+            c_sheets = read_excel_all(compras_file)
+            best_name = max(c_sheets, key=lambda k: len(c_sheets[k]))
+            compras, compras_summary, _ = prepare_compras_dataframe(c_sheets[best_name])
+            if not compras_summary.empty:
+                product = product.merge(compras_summary, on="SKU_norm", how="left")
+        except Exception:
+            compras = pd.DataFrame()
+    return product, promo_cards, relampago, compras
 
 
-@st.cache_data(show_spinner=False)
 def make_download_workbook(all_sheets, master_df, bridge_df, relampago_df):
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -705,15 +685,11 @@ if master_file is None:
     st.info("Carga la maestra integrada para empezar.")
     st.stop()
 
-master_bytes, master_sig = file_bytes_and_sig(master_file)
-compras_bytes, compras_sig = file_bytes_and_sig(compras_file)
-model = build_model(master_bytes, compras_bytes)
+model = build_model(master_file, compras_file)
 all_sheets = model["sheets"]
 
-state_needs_refresh = (st.session_state.get("master_sig") != master_sig) or (st.session_state.get("compras_sig") != compras_sig)
+state_needs_refresh = st.session_state.get("source_name") != master_file.name
 if state_needs_refresh:
-    st.session_state.master_sig = master_sig
-    st.session_state.compras_sig = compras_sig
     st.session_state.source_name = master_file.name
 
 if state_needs_refresh or "master_df" not in st.session_state:
@@ -726,7 +702,7 @@ if "dialog_card" not in st.session_state:
     st.session_state.dialog_card = None
 
 product_df, promo_cards_df, relampago_view, compras_df = rebuild_from_session(
-    compras_bytes, st.session_state.master_df, st.session_state.bridge_df, st.session_state.relampago_df
+    all_sheets, compras_file, st.session_state.master_df, st.session_state.bridge_df, st.session_state.relampago_df
 )
 
 download_bytes = make_download_workbook(all_sheets, st.session_state.master_df, st.session_state.bridge_df, st.session_state.relampago_df)
@@ -776,105 +752,101 @@ if page == "Cockpit por producto":
     left, mid, right = st.columns([1.15, 1, 1])
 
     with left:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Identidad")
-        st.write(f"**SKU:** {normalize_sku(row.get('SKU')) or '—'}")
-        st.write(f"**Descripción:** {row.get('DESCRIPCIÓN', '—')}")
-        st.write(f"**Ubicación:** {row.get('UBIC', '—')}")
-        all_mlcs = row.get("MLC_norm")
-        if isinstance(all_mlcs, list) and all_mlcs:
-            st.write(f"**MLCs asociados:** {', '.join(all_mlcs)}")
-        elif pd.notna(all_mlcs):
-            st.write(f"**MLCs asociados:** {all_mlcs}")
-        else:
-            st.write("**MLCs asociados:** —")
-        st.write(f"**Comentario maestra:** {first_nonempty(row.get('COMENTARIO'), row.get('COMENTARIO.1'), '—')}")
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.subheader("Identidad")
+            st.write(f"**SKU:** {normalize_sku(row.get('SKU')) or '—'}")
+            st.write(f"**Descripción:** {row.get('DESCRIPCIÓN', '—')}")
+            st.write(f"**Ubicación:** {row.get('UBIC', '—')}")
+            all_mlcs = row.get("MLC_norm")
+            if isinstance(all_mlcs, list) and all_mlcs:
+                st.write(f"**MLCs asociados:** {', '.join(all_mlcs)}")
+            elif pd.notna(all_mlcs):
+                st.write(f"**MLCs asociados:** {all_mlcs}")
+            else:
+                st.write("**MLCs asociados:** —")
+            st.write(f"**Comentario maestra:** {first_nonempty(row.get('COMENTARIO'), row.get('COMENTARIO.1'), '—')}")
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Compras")
-        compras_rows, compras_match_method, compras_match_score = compras_candidates_for_row(row, compras_df)
-        compras_info = compras_summary_from_rows(compras_rows)
-        if compras_rows.empty:
-            st.write("**Última compra:** —")
-            st.write("**Último precio compra:** —")
-            st.write("**Proveedor último:** —")
-            st.write("**Cantidad última compra:** —")
-            st.write("**Variación vs compra anterior:** —")
-            st.write("**Rango histórico:** — a —")
-        else:
-            render_badge("Compras por SKU exacto" if compras_match_method == "SKU exacto" else f"Compras por descripción ({compras_match_score:.2f})", "badge-green" if compras_match_method == "SKU exacto" else "badge-yellow")
-            st.write(f"**Última compra:** {display_date(compras_info.get('ultima_compra'))}")
-            st.write(f"**Último precio compra:** {money(compras_info.get('ultimo_precio_compra'))}")
-            st.write(f"**Proveedor último:** {compras_info.get('proveedor_ultimo', '—')}")
-            st.write(f"**Cantidad última compra:** {safe_int(compras_info.get('cantidad_ultima_compra'), 0) if pd.notna(compras_info.get('cantidad_ultima_compra')) else '—'}")
-            st.write(f"**Variación vs compra anterior:** {pct((compras_info.get('variacion_ultima_vs_anterior_pct') / 100.0) if pd.notna(compras_info.get('variacion_ultima_vs_anterior_pct')) else np.nan)}")
-            st.write(f"**Rango histórico:** {money(compras_info.get('precio_min_hist'))} a {money(compras_info.get('precio_max_hist'))}")
-            if compras_info.get("proveedores"):
-                st.write(f"**Proveedores históricos:** {compras_info.get('proveedores')}")
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.subheader("Compras")
+            compras_rows, compras_match_method, compras_match_score = compras_candidates_for_row(row, compras_df)
+            compras_info = compras_summary_from_rows(compras_rows)
+            if compras_rows.empty:
+                st.write("**Última compra:** —")
+                st.write("**Último precio compra:** —")
+                st.write("**Proveedor último:** —")
+                st.write("**Cantidad última compra:** —")
+                st.write("**Variación vs compra anterior:** —")
+                st.write("**Rango histórico:** — a —")
+            else:
+                render_badge("Compras por SKU exacto" if compras_match_method == "SKU exacto" else f"Compras por descripción ({compras_match_score:.2f})", "badge-green" if compras_match_method == "SKU exacto" else "badge-yellow")
+                st.write(f"**Última compra:** {display_date(compras_info.get('ultima_compra'))}")
+                st.write(f"**Último precio compra:** {money(compras_info.get('ultimo_precio_compra'))}")
+                st.write(f"**Proveedor último:** {compras_info.get('proveedor_ultimo', '—')}")
+                st.write(f"**Cantidad última compra:** {safe_int(compras_info.get('cantidad_ultima_compra'), 0) if pd.notna(compras_info.get('cantidad_ultima_compra')) else '—'}")
+                st.write(f"**Variación vs compra anterior:** {pct((compras_info.get('variacion_ultima_vs_anterior_pct') / 100.0) if pd.notna(compras_info.get('variacion_ultima_vs_anterior_pct')) else np.nan)}")
+                st.write(f"**Rango histórico:** {money(compras_info.get('precio_min_hist'))} a {money(compras_info.get('precio_max_hist'))}")
+                if compras_info.get("proveedores"):
+                    st.write(f"**Proveedores históricos:** {compras_info.get('proveedores')}")
 
     with mid:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Precio y rentabilidad")
-        m1, m2 = st.columns(2)
-        m1.metric("Precio neto", money(row.get("PRECIO NETO")))
-        m2.metric("Cambio precio", money(row.get("CAMBIO DE PRECIO")))
-        m1.metric("Margen local", pct(row.get("MARGEN LOCAL")))
-        m2.metric("Monto en simulación", money(row.get("MONTO EN SIMULACIÓN")))
-        st.write(f"**Neto Meli 1:** {money(row.get(' NETO MELI 1'))}")
-        st.write(f"**Precio promo mínimo:** {money(row.get('min_promo_price'))}")
-        st.write(f"**Precio promo máximo:** {money(row.get('max_promo_price'))}")
-        st.write(f"**Precio relámpago mínimo:** {money(row.get('relampago_min_price'))}")
-        st.write(f"**Precio relámpago máximo:** {money(row.get('relampago_max_price'))}")
-        st.write(f"**Comentario promo:** {row.get('promo_comments') or '—'}")
-        st.write(f"**Comentario relámpago:** {row.get('relampago_comment') or '—'}")
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.subheader("Precio y rentabilidad")
+            m1, m2 = st.columns(2)
+            m1.metric("Precio neto", money(row.get("PRECIO NETO")))
+            m2.metric("Cambio precio", money(row.get("CAMBIO DE PRECIO")))
+            m1.metric("Margen local", pct(row.get("MARGEN LOCAL")))
+            m2.metric("Monto en simulación", money(row.get("MONTO EN SIMULACIÓN")))
+            st.write(f"**Neto Meli 1:** {money(row.get(' NETO MELI 1'))}")
+            st.write(f"**Precio promo mínimo:** {money(row.get('min_promo_price'))}")
+            st.write(f"**Precio promo máximo:** {money(row.get('max_promo_price'))}")
+            st.write(f"**Precio relámpago mínimo:** {money(row.get('relampago_min_price'))}")
+            st.write(f"**Precio relámpago máximo:** {money(row.get('relampago_max_price'))}")
+            st.write(f"**Comentario promo:** {row.get('promo_comments') or '—'}")
+            st.write(f"**Comentario relámpago:** {row.get('relampago_comment') or '—'}")
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Lectura automática")
-        bullets = []
-        if safe_int(row.get("total_promos"), 0) == 0 and safe_int(row.get("relampago_count"), 0) == 0:
-            bullets.append("Producto sin promo activa registrada.")
-        if pd.notna(row.get("days_to_next")) and row.get("days_to_next") <= 1:
-            bullets.append("Urgente: una promo vence hoy o mañana.")
-        if pd.notna(row.get("MARGEN MELI 1")) and safe_float(row.get("MARGEN MELI 1")) < 0:
-            bullets.append("Margen Meli 1 negativo. Revisar precio o descuento.")
-        if safe_int(row.get("relampago_count"), 0) > 0:
-            bullets.append("Producto presente en relámpago mi página.")
-        if pd.notna(row.get("ultima_compra")) and (pd.Timestamp.today().normalize() - pd.to_datetime(row.get("ultima_compra")).normalize()).days > 180:
-            bullets.append("Última compra antigua. Confirmar costo vigente.")
-        if not bullets:
-            bullets.append("Producto bajo control. No veo alertas críticas inmediatas.")
-        for b in bullets:
-            st.markdown(f"- {b}")
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.subheader("Lectura automática")
+            bullets = []
+            if safe_int(row.get("total_promos"), 0) == 0 and safe_int(row.get("relampago_count"), 0) == 0:
+                bullets.append("Producto sin promo activa registrada.")
+            if pd.notna(row.get("days_to_next")) and row.get("days_to_next") <= 1:
+                bullets.append("Urgente: una promo vence hoy o mañana.")
+            if pd.notna(row.get("MARGEN MELI 1")) and safe_float(row.get("MARGEN MELI 1")) < 0:
+                bullets.append("Margen Meli 1 negativo. Revisar precio.")
+            if safe_int(row.get("relampago_count"), 0) > 0:
+                bullets.append("Producto presente en relámpago mi página.")
+            if pd.notna(row.get("ultima_compra")) and (pd.Timestamp.today().normalize() - pd.to_datetime(row.get("ultima_compra")).normalize()).days > 180:
+                bullets.append("Última compra antigua. Confirmar costo vigente.")
+            if not bullets:
+                bullets.append("Producto bajo control. No veo alertas críticas inmediatas.")
+            for b in bullets:
+                st.markdown(f"- {b}")
 
     with right:
         sku_promos = promo_cards_df[promo_cards_df["SKU_norm"] == sku].copy()
         sku_rel = relampago_view[relampago_view["SKU_norm"] == sku].copy()
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Promos maestra")
-        st.metric("Filas promo", len(sku_promos))
-        if not sku_promos.empty:
-            display_cols = [c for c in ["slot_label", "MLC_norm", "published_price", "Precio promocional", "FECHA VENCI", "COMENTARIO"] if c in sku_promos.columns]
-            tmp = sku_promos[display_cols].copy()
-            tmp = tmp.rename(columns={"slot_label": "Bloque", "published_price": "B2C publicado"})
-            st.dataframe(tmp, use_container_width=True, hide_index=True, height=220)
-        else:
-            st.info("Sin promos en maestra.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.subheader("Promos maestra")
+            st.metric("Filas promo", len(sku_promos))
+            if not sku_promos.empty:
+                display_cols = [c for c in ["slot_label", "MLC_norm", "published_price", "Precio promocional", "FECHA VENCI", "COMENTARIO"] if c in sku_promos.columns]
+                tmp = sku_promos[display_cols].copy()
+                if "FECHA VENCI" in tmp.columns:
+                    tmp["FECHA VENCI"] = tmp["FECHA VENCI"].apply(display_date)
+                tmp = tmp.rename(columns={"slot_label": "Bloque", "published_price": "B2C publicado"})
+                st.dataframe(tmp, use_container_width=True, hide_index=True, height=220)
+            else:
+                st.info("Sin promos en maestra.")
 
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Relámpago mi página")
-        st.metric("Filas relámpago", len(sku_rel))
-        if not sku_rel.empty:
-            display_cols = [c for c in ["Descripción", "Precio promocional", "COMENTARIO"] if c in sku_rel.columns]
-            st.dataframe(sku_rel[display_cols], use_container_width=True, hide_index=True, height=180)
-        else:
-            st.info("No está en relámpago mi página.")
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            st.subheader("Relámpago mi página")
+            st.metric("Filas relámpago", len(sku_rel))
+            if not sku_rel.empty:
+                display_cols = [c for c in ["Descripción", "Precio promocional", "COMENTARIO"] if c in sku_rel.columns]
+                st.dataframe(sku_rel[display_cols], use_container_width=True, hide_index=True, height=180)
+            else:
+                st.info("No está en relámpago mi página.")
 
 elif page == "Operador de promos":
     st.markdown('<div class="big-title">Operador de promos</div>', unsafe_allow_html=True)
@@ -976,34 +948,36 @@ elif page == "Alta de producto":
     st.markdown('<div class="big-title">Alta de producto nuevo</div>', unsafe_allow_html=True)
     st.markdown('<div class="subtle">Crea un SKU nuevo directamente sobre la maestra actual.</div>', unsafe_allow_html=True)
 
+elif page == "Alta de producto":
+    st.markdown('<div class="big-title">Alta de producto nuevo</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtle">Crea un SKU nuevo directamente sobre la maestra actual.</div>', unsafe_allow_html=True)
+
     c1, c2, c3 = st.columns(3)
-    sku = c1.text_input("SKU", key="alta_sku")
-    desc = c2.text_input("Descripción", key="alta_desc")
-    ubic = c3.text_input("Ubicación", key="alta_ubic")
-    costo = c1.number_input("Último costo", min_value=0.0, value=0.0, step=1.0, key="alta_costo")
-    bruto_tienda = c2.number_input("Precio bruto en tienda", min_value=0.0, value=0.0, step=1.0, key="alta_bruto")
-    monto_sim = c3.number_input("MONTO EN SIMULACIÓN", min_value=0.0, value=0.0, step=1.0, key="alta_monto")
+    sku = c1.text_input("SKU", key="new_sku")
+    desc = c2.text_input("Descripción", key="new_desc")
+    ubic = c3.text_input("Ubicación", key="new_ubic")
+    costo = c1.number_input("Último costo", min_value=0.0, value=0.0, step=1.0, key="new_costo")
+    bruto_tienda = c2.number_input("Precio bruto en tienda", min_value=0.0, value=0.0, step=1.0, key="new_bruto")
+    monto_sim = c3.number_input("MONTO EN SIMULACIÓN", min_value=0.0, value=0.0, step=1.0, key="new_monto_sim")
 
     st.markdown("#### Promo base")
     p1, p2, p3 = st.columns(3)
-    mlc = p1.text_input("MLC", key="alta_mlc")
-    b2c = p2.number_input("Precio B2C publicado", min_value=0.0, value=0.0, step=1.0, key="alta_b2c")
-    promo_date = p3.date_input("Fecha vencimiento", value=None, format="DD/MM/YYYY", key="alta_fecha")
-    promo_comment = p1.text_input("Comentario", key="alta_comentario")
-    add_relampago = p2.checkbox("Agregar a relámpago", key="alta_relampago")
+    mlc = p1.text_input("MLC", key="new_mlc")
+    b2c = p2.number_input("Precio B2C publicado", min_value=0.0, value=0.0, step=1.0, key="new_b2c")
+    promo_date = p3.date_input("Fecha vencimiento", value=None, format="DD/MM/YYYY", key="new_fecha_venci")
+    promo_comment = p1.text_input("Comentario", key="new_comment")
+    add_relampago = p2.checkbox("Agregar a relámpago", key="new_add_relampago")
 
-    precio_neto = bruto_tienda / 1.19 if bruto_tienda else np.nan
-    margen_local = ((precio_neto - costo) / precio_neto) if pd.notna(precio_neto) and precio_neto != 0 else np.nan
-    neto_meli_1 = monto_sim / 1.19 if monto_sim else np.nan
-    margen_meli_1 = ((neto_meli_1 - costo) / neto_meli_1) if pd.notna(neto_meli_1) and neto_meli_1 != 0 else np.nan
+    precio_neto = bruto_tienda / 1.19 if bruto_tienda > 0 else np.nan
+    margen_local = ((precio_neto - costo) / precio_neto) if pd.notna(precio_neto) and precio_neto > 0 else np.nan
+    neto_meli_1 = monto_sim / 1.19 if monto_sim > 0 else np.nan
+    margen_meli_1 = ((neto_meli_1 - costo) / neto_meli_1) if pd.notna(neto_meli_1) and neto_meli_1 > 0 else np.nan
 
     s1, s2 = st.columns(2)
     s1.metric("Margen local proyectado", pct(margen_local))
     s2.metric("Margen Meli 1 proyectado", pct(margen_meli_1))
 
-    create = st.button("Crear producto", type="primary", use_container_width=True)
-
-    if create:
+    if st.button("Crear producto", type="primary", use_container_width=True):
         if not normalize_sku(sku):
             st.error("Debes ingresar un SKU válido.")
         else:
@@ -1012,11 +986,11 @@ elif page == "Alta de producto":
             new_row["SKU"] = normalize_sku(sku)
             new_row["DESCRIPCIÓN"] = desc
             new_row["UBIC"] = ubic
-            new_row["ÚLTIMO COSTO"] = costo
-            new_row["PRECIO BRUTO"] = bruto_tienda
+            new_row["ÚLTIMO COSTO"] = costo if costo > 0 else np.nan
+            new_row["PRECIO BRUTO"] = bruto_tienda if bruto_tienda > 0 else np.nan
             new_row["PRECIO NETO"] = precio_neto
             new_row["MARGEN LOCAL"] = margen_local
-            new_row["MONTO EN SIMULACIÓN"] = monto_sim
+            new_row["MONTO EN SIMULACIÓN"] = monto_sim if monto_sim > 0 else np.nan
             new_row[" NETO MELI 1"] = neto_meli_1
             new_row["MARGEN MELI 1"] = margen_meli_1
             if mlc:
