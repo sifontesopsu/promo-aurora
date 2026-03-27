@@ -412,9 +412,27 @@ def update_single_promo(master_index: int, slot: int, price, dt, comment):
     master.at[master_index, comment_col] = comment
     refresh_promos_only()
 
+def rel_to_sheet_df(rel_df: pd.DataFrame) -> pd.DataFrame:
+    if rel_df is None or rel_df.empty:
+        return pd.DataFrame(columns=list(range(6)))
+    df = rel_df.copy()
+    for col in ["SKU_norm", "DESCRIPCION", "PRECIO_B2C", "TIPO", "ESTADO"]:
+        if col not in df.columns:
+            df[col] = np.nan
+    out = pd.DataFrame({
+        0: df["SKU_norm"],
+        1: df["DESCRIPCION"],
+        2: df["PRECIO_B2C"],
+        3: np.nan,
+        4: df["TIPO"],
+        5: df["ESTADO"],
+    })
+    return out
+
+
 
 @st.cache_data(show_spinner=False)
-def build_download_bytes(master_df: pd.DataFrame, original_bytes: bytes, maestra_name: str):
+def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, original_bytes: bytes, maestra_name: str, rel_name: str):
     buffer_in = io.BytesIO(original_bytes)
     xls = pd.ExcelFile(buffer_in)
     out = io.BytesIO()
@@ -422,6 +440,8 @@ def build_download_bytes(master_df: pd.DataFrame, original_bytes: bytes, maestra
         for sheet in xls.sheet_names:
             if sheet == maestra_name:
                 master_df.drop(columns=[c for c in ["SKU_norm", "DESC_norm", "MLC_slot1", "MLC_slot2"] if c in master_df.columns], errors="ignore").to_excel(writer, sheet_name=sheet, index=False)
+            elif rel_name and sheet == rel_name:
+                rel_to_sheet_df(rel_df).to_excel(writer, sheet_name=sheet, index=False, header=False)
             else:
                 pd.read_excel(io.BytesIO(original_bytes), sheet_name=sheet, header=None if "relampago" in sheet.lower() else 0).to_excel(writer, sheet_name=sheet, index=False, header=not ("relampago" in sheet.lower()))
     return out.getvalue()
@@ -448,6 +468,7 @@ except Exception as e:
     st.stop()
 
 model = st.session_state.model
+st.session_state.setdefault("promo_status_filter", ["Vencidas", "Vencen hoy"])
 product_options = [f"{sku} — {model['sku_desc'].get(sku, '')}" for sku in model["sku_options"]]
 selected_label = st.selectbox("Buscar producto", product_options, index=0 if product_options else None)
 selected_sku = selected_label.split(" — ")[0] if selected_label else ""
@@ -519,8 +540,8 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Operador de promos")
-    promos = model["promos"].copy()
-    if promos.empty:
+    promos_all = model["promos"].copy()
+    if promos_all.empty:
         st.info("No hay promos configuradas en la maestra.")
     else:
         left, right = st.columns([1, 2])
@@ -537,10 +558,15 @@ with tabs[1]:
             status_filter = st.multiselect(
                 "Estado",
                 status_options,
-                default=["Vencidas", "Vencen hoy"],
+                default=st.session_state.get("promo_status_filter", ["Vencidas", "Vencen hoy"]),
+                key="promo_status_filter",
             )
             text_filter = st.text_input("Buscar por SKU / descripción / MLC")
-            promos = promos[promos["STATUS"].isin(status_filter)] if status_filter else promos.iloc[0:0]
+            promos = promos_all.copy()
+            if status_filter:
+                promos = promos[promos["STATUS"].isin(status_filter)]
+            else:
+                promos = promos.iloc[0:0]
             if text_filter:
                 q = text_filter.lower().strip()
                 promos = promos[
@@ -548,6 +574,7 @@ with tabs[1]:
                     promos["DESCRIPCIÓN"].astype(str).str.lower().str.contains(q, na=False) |
                     promos["MLC"].astype(str).str.lower().str.contains(q, na=False)
                 ]
+            st.caption(f"Mostrando {len(promos)} promo(s) filtradas")
             mass_date = st.date_input("Cambio masivo de fecha", value=None, format="DD/MM/YYYY")
             if st.button("Aplicar fecha masiva a filtradas"):
                 if mass_date and not promos.empty:
@@ -557,17 +584,20 @@ with tabs[1]:
                     st.rerun()
 
         with right:
-            cols = st.columns(4)
-            for i, (_, p) in enumerate(promos.sort_values(["STATUS_ORDER", "SKU_norm"]).iterrows()):
-                with cols[i % 4]:
-                    with st.container(border=True):
-                        st.markdown(f"**{p['SKU_norm']}**")
-                        st.caption(str(p["DESCRIPCIÓN"])[:55])
-                        st.write(f"`{p['MLC'] or '—'}`")
-                        st.write(fmt_date(p["FECHA_VENCI"]))
-                        if st.button("Abrir", key=f"open_{p['master_index']}_{p['slot']}"):
-                            st.session_state.edit_target = (int(p["master_index"]), int(p["slot"]))
-                            st.rerun()
+            if promos.empty:
+                st.info("No hay promos para esos estados/filtros.")
+            else:
+                cols = st.columns(4)
+                for i, (_, p) in enumerate(promos.sort_values(["STATUS_ORDER", "SKU_norm", "slot"]).iterrows()):
+                    with cols[i % 4]:
+                        with st.container(border=True):
+                            st.markdown(f"**{p['SKU_norm']}**")
+                            st.caption(str(p["DESCRIPCIÓN"])[:55])
+                            st.write(f"`{p['MLC'] or '—'}`")
+                            st.write(fmt_date(p["FECHA_VENCI"]))
+                            if st.button("Abrir", key=f"open_{p['master_index']}_{p['slot']}"):
+                                st.session_state.edit_target = (int(p["master_index"]), int(p["slot"]))
+                                st.rerun()
 
         if "edit_target" in st.session_state:
             master_index, slot = st.session_state.edit_target
@@ -584,28 +614,59 @@ with tabs[1]:
                     st.write(f"**MLC:** {cp['MLC'] or '—'}")
                     new_date = st.date_input("Fecha venci", value=cp["FECHA_VENCI"].date() if pd.notna(cp["FECHA_VENCI"]) else None, format="DD/MM/YYYY")
                     with st.expander("Campos secundarios"):
-                        new_price = st.number_input("Precio B2C", value=float(cp["PRECIO_B2C"]) if pd.notna(cp["PRECIO_B2C"]) else 0.0, step=100.0)
-                        new_comment = st.text_area("Comentario", value="" if pd.isna(cp["COMENTARIO"]) else str(cp["COMENTARIO"]))
-                    c1, c2 = st.columns(2)
-                    if c1.button("Guardar", use_container_width=True):
+                        new_price = st.number_input("Precio B2C", min_value=0.0, value=float(safe_float(cp["PRECIO_B2C"], 0.0)), step=100.0)
+                        new_comment = st.text_input("Comentario", value=str(cp["COMENTARIO"]) if pd.notna(cp["COMENTARIO"]) else "")
+                    if st.button("Guardar cambios"):
                         update_single_promo(master_index, slot, new_price, new_date, new_comment)
-                        st.session_state.pop("edit_target", None)
+                        del st.session_state["edit_target"]
+                        st.success("Promo actualizada.")
                         st.rerun()
-                    if c2.button("Cerrar", use_container_width=True):
-                        st.session_state.pop("edit_target", None)
+                    if st.button("Cerrar"):
+                        del st.session_state["edit_target"]
                         st.rerun()
                 edit_promo_dialog()
 
 with tabs[2]:
     st.subheader("Relámpago mi página")
-    rel = model["rel"].copy()
-    if rel.empty:
-        st.info("No hay registros de relámpago.")
-    else:
-        rel_show = rel.copy()
-        rel_show["PRECIO_B2C"] = rel_show["PRECIO_B2C"].map(fmt_money)
-        rel_show.columns = ["SKU", "Descripción", "Precio B2C", "Tipo", "Estado"]
-        st.dataframe(rel_show, use_container_width=True, hide_index=True)
+    st.caption("Lista simple editable para agregar, sacar o modificar artículos.")
+    rel_base = model["rel"].copy()
+    if rel_base.empty:
+        rel_base = pd.DataFrame(columns=["SKU_norm", "DESCRIPCION", "PRECIO_B2C", "TIPO", "ESTADO"])
+    rel_editor = rel_base[["SKU_norm", "DESCRIPCION", "PRECIO_B2C", "TIPO", "ESTADO"]].rename(columns={
+        "SKU_norm": "SKU",
+        "DESCRIPCION": "Descripción",
+        "PRECIO_B2C": "Precio B2C",
+        "TIPO": "Tipo",
+        "ESTADO": "Estado",
+    })
+    edited_rel = st.data_editor(
+        rel_editor,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        key="relampago_editor",
+        column_config={
+            "SKU": st.column_config.TextColumn(required=True),
+            "Descripción": st.column_config.TextColumn(),
+            "Precio B2C": st.column_config.NumberColumn(step=100),
+            "Tipo": st.column_config.TextColumn(),
+            "Estado": st.column_config.TextColumn(),
+        },
+    )
+    if st.button("Guardar relámpago"):
+        new_rel = edited_rel.rename(columns={
+            "SKU": "SKU_norm",
+            "Descripción": "DESCRIPCION",
+            "Precio B2C": "PRECIO_B2C",
+            "Tipo": "TIPO",
+            "Estado": "ESTADO",
+        }).copy()
+        new_rel["SKU_norm"] = new_rel["SKU_norm"].map(norm_sku)
+        new_rel = new_rel[new_rel["SKU_norm"] != ""].copy()
+        model["rel"] = new_rel[["SKU_norm", "DESCRIPCION", "PRECIO_B2C", "TIPO", "ESTADO"]]
+        model["dirty"] = True
+        st.success("Relámpago actualizado.")
+        st.rerun()
 
 with tabs[3]:
     st.subheader("Alta de producto")
@@ -628,7 +689,6 @@ with tabs[3]:
     promo_b2c = e2.number_input("Precio B2C publicado", min_value=0.0, step=100.0)
     promo_fecha = e3.date_input("Fecha venci promo base", value=None, format="DD/MM/YYYY")
     promo_comment = st.text_input("Comentario promo base")
-    add_rel = st.checkbox("Agregar también a relámpago")
 
     if st.button("Crear producto"):
         if not new_sku or not new_desc:
