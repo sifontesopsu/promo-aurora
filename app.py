@@ -118,18 +118,22 @@ def calc_margin_meli1(cost, monto_sim):
 def promo_status(dt):
     dt = to_date_only(dt)
     if pd.isna(dt):
-        return "Sin fecha", 99
+        return "Vencen en 1 mes", 30
     today = pd.Timestamp(date.today())
     delta = (dt - today).days
     if delta < 0:
-        return "Vencida", -1
+        return "Vencidas", -1
     if delta == 0:
-        return "Hoy", 0
+        return "Vencen hoy", 0
     if delta == 1:
-        return "Mañana", 1
-    if delta == 3:
-        return "En 3 días", 3
-    return f"En {delta} días", delta
+        return "Vencen mañana", 1
+    if delta == 2:
+        return "Vencen pasado mañana", 2
+    if delta <= 7:
+        return "Vencen en 7 días", 7
+    if delta <= 15:
+        return "Vencen en 15 días", 15
+    return "Vencen en 1 mes", 30
 
 
 def _find_sheet(sheet_names, wanted):
@@ -468,6 +472,8 @@ with tabs[0]:
             st.write(f"**Ubicación:** {row.get('UBIC', '—')}")
             st.write(f"**Precio bruto tienda:** {fmt_money(row.get('PRECIO BRUTO'))}")
             st.write(f"**Monto en simulación:** {fmt_money(row.get('MONTO EN SIMULACIÓN'))}")
+            st.write(f"**Precio B2C publicado:** {fmt_money(row.get('PRECIO B2C PUBLICADO '))}")
+            st.write(f"**Campaña Ads:** {row.get('CAMPAÑA PADS', '—') if pd.notna(row.get('CAMPAÑA PADS', np.nan)) else '—'}")
             mlcs = model["mlc_map"].get(selected_sku, [])
             st.write(f"**MLC asociados:** {', '.join(mlcs) if mlcs else '—'}")
         with b:
@@ -519,10 +525,22 @@ with tabs[1]:
     else:
         left, right = st.columns([1, 2])
         with left:
-            status_filter = st.multiselect("Estado", sorted(promos["STATUS"].dropna().unique().tolist()), default=sorted(promos["STATUS"].dropna().unique().tolist()))
+            status_options = [
+                "Vencidas",
+                "Vencen hoy",
+                "Vencen mañana",
+                "Vencen pasado mañana",
+                "Vencen en 7 días",
+                "Vencen en 15 días",
+                "Vencen en 1 mes",
+            ]
+            status_filter = st.multiselect(
+                "Estado",
+                status_options,
+                default=["Vencidas", "Vencen hoy"],
+            )
             text_filter = st.text_input("Buscar por SKU / descripción / MLC")
-            if status_filter:
-                promos = promos[promos["STATUS"].isin(status_filter)]
+            promos = promos[promos["STATUS"].isin(status_filter)] if status_filter else promos.iloc[0:0]
             if text_filter:
                 q = text_filter.lower().strip()
                 promos = promos[
@@ -532,7 +550,7 @@ with tabs[1]:
                 ]
             mass_date = st.date_input("Cambio masivo de fecha", value=None, format="DD/MM/YYYY")
             if st.button("Aplicar fecha masiva a filtradas"):
-                if mass_date:
+                if mass_date and not promos.empty:
                     for _, p in promos.iterrows():
                         update_single_promo(int(p["master_index"]), int(p["slot"]), p["PRECIO_B2C"], mass_date, p["COMENTARIO"])
                     st.success("Fecha actualizada.")
