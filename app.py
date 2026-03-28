@@ -290,13 +290,14 @@ def import_master_to_db(conn, uploaded_file):
         conn.execute("DELETE FROM promo_slots")
         conn.execute("DELETE FROM relampago")
 
-        product_rows = []
-        promo_rows = []
+        product_map = {}
+        promo_map = {}
         for idx, row in master.iterrows():
             sku = norm_sku(row.get("SKU"))
             if not sku:
                 continue
-            product_rows.append((
+            # keep the last occurrence if the master has duplicate SKUs
+            product_map[sku] = (
                 sku,
                 norm_text(row.get("DESCRIPCIÓN")),
                 norm_text(row.get("UBIC")),
@@ -313,30 +314,41 @@ def import_master_to_db(conn, uploaded_file):
                 norm_text(row.get("COMENTARIO")),
                 int(idx),
                 now
-            ))
+            )
             slot1_mlc = norm_mlc(row.get("MLC"))
-            if slot1_mlc or as_number(row.get("PRECIO B2C PUBLICADO ")) is not None or parse_date_any(row.get("FECHA VENCI")):
-                promo_rows.append((sku, 1, slot1_mlc, as_number(row.get("PRECIO B2C PUBLICADO ")), 
-                                   parse_date_any(row.get("FECHA VENCI")).isoformat() if parse_date_any(row.get("FECHA VENCI")) else None,
-                                   norm_text(row.get("COMENTARIO"))))
+            slot1_date = parse_date_any(row.get("FECHA VENCI"))
+            slot1_price = as_number(row.get("PRECIO B2C PUBLICADO "))
+            if slot1_mlc or slot1_price is not None or slot1_date:
+                promo_map[(sku, 1)] = (
+                    sku, 1, slot1_mlc, slot1_price,
+                    slot1_date.isoformat() if slot1_date else None,
+                    norm_text(row.get("COMENTARIO"))
+                )
             slot2_mlc = norm_mlc(row.get("MLC.1"))
-            if slot2_mlc or as_number(row.get("PRECIO B2C")) is not None or parse_date_any(row.get("FECHA VENCI.1")):
-                promo_rows.append((sku, 2, slot2_mlc, as_number(row.get("PRECIO B2C")),
-                                   parse_date_any(row.get("FECHA VENCI.1")).isoformat() if parse_date_any(row.get("FECHA VENCI.1")) else None,
-                                   norm_text(row.get("COMENTARIO.1"))))
+            slot2_date = parse_date_any(row.get("FECHA VENCI.1"))
+            slot2_price = as_number(row.get("PRECIO B2C"))
+            if slot2_mlc or slot2_price is not None or slot2_date:
+                promo_map[(sku, 2)] = (
+                    sku, 2, slot2_mlc, slot2_price,
+                    slot2_date.isoformat() if slot2_date else None,
+                    norm_text(row.get("COMENTARIO.1"))
+                )
+
+        product_rows = list(product_map.values())
+        promo_rows = list(promo_map.values())
 
         conn.executemany("""
-            INSERT INTO products (
+            INSERT OR REPLACE INTO products (
                 sku, descripcion, ubicacion, cambio_precio, ultimo_costo, margen_local, precio_neto,
                 precio_bruto, margen_meli_1, neto_meli_1, monto_simulacion, mlc_ads, campana_ads,
                 comentario_maestra, row_idx, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, product_rows)
 
-        conn.executemany("INSERT INTO mlc_map(sku, mlc) VALUES(?, ?)", bridge[["sku", "mlc"]].itertuples(index=False, name=None))
+        conn.executemany("INSERT OR IGNORE INTO mlc_map(sku, mlc) VALUES(?, ?)", bridge[["sku", "mlc"]].itertuples(index=False, name=None))
         if promo_rows:
             conn.executemany(
-                "INSERT INTO promo_slots(sku, slot, mlc, precio_b2c, fecha_venci, comentario) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO promo_slots(sku, slot, mlc, precio_b2c, fecha_venci, comentario) VALUES (?, ?, ?, ?, ?, ?)",
                 promo_rows
             )
         conn.executemany(
