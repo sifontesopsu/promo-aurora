@@ -441,6 +441,32 @@ def normalize_master(master_df, bridge_df):
     return df[df["sku"] != ""].copy(), promos_df
 
 
+
+def ensure_promos_schema(promos_df: pd.DataFrame) -> pd.DataFrame:
+    if promos_df is None or not isinstance(promos_df, pd.DataFrame):
+        return pd.DataFrame(columns=["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
+    df = promos_df.copy()
+    rename_map = {
+        "STATUS": "status",
+        "STATUS_ORDER": "status_order",
+        "SKU_norm": "sku",
+        "DESCRIPCIÓN": "descripcion",
+        "MLC": "mlc",
+        "PRECIO_B2C": "precio_b2c",
+        "FECHA_VENCI": "fecha_venci",
+        "COMENTARIO": "comentario",
+    }
+    df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns and v not in df.columns})
+    required = ["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario"]
+    for col in required:
+        if col not in df.columns:
+            df[col] = np.nan if col not in ["descripcion","mlc","campana_ads","comentario"] else ""
+    if "status" not in df.columns or "status_order" not in df.columns:
+        status_info = df["fecha_venci"].apply(lambda x: pd.Series(promo_status(x), index=["status","status_order"]))
+        for col in ["status","status_order"]:
+            df[col] = status_info[col]
+    return df
+
 def promo_status(dt):
     dt = to_date_only(dt)
     if pd.isna(dt):
@@ -1384,7 +1410,7 @@ with tabs[2]:
 # =========================================================
 with tabs[3]:
     st.subheader("Operador de promociones")
-    promos_all = model["promos"].copy()
+    promos_all = ensure_promos_schema(model.get("promos", pd.DataFrame()))
     if promos_all.empty:
         st.info("No encontré promos en la maestra.")
     else:
