@@ -26,6 +26,16 @@ def file_signature(uploaded_file) -> str:
     return hashlib.md5(data).hexdigest()
 
 
+def payload_signature(df: pd.DataFrame, extra: str = "") -> str:
+    base = df.copy()
+    for col in base.columns:
+        if pd.api.types.is_datetime64_any_dtype(base[col]):
+            base[col] = base[col].astype("string")
+    base = base.replace([np.inf, -np.inf], np.nan).fillna("")
+    csv_bytes = base.sort_values(list(base.columns[:1])).to_csv(index=False).encode("utf-8")
+    return hashlib.md5(csv_bytes + extra.encode("utf-8")).hexdigest()
+
+
 def safe_float(value, default=np.nan):
     try:
         if value is None:
@@ -125,7 +135,11 @@ def detect_channel(vendedor: str) -> str:
 
 def detect_buyer_type(documento: str) -> str:
     s = str(documento).strip().upper()
-    return "EMPRESA" if "FACTURA" in s else "PERSONA"
+    if "FACTURA" in s:
+        return "EMPRESA"
+    if "BOLETA" in s:
+        return "PERSONA"
+    return "OTRO"
 
 
 def classify_cost_gap_pct(pct):
@@ -272,11 +286,18 @@ def save_snapshot_to_db(payload_df, sigs):
             sigs.get("pubs_sig", ""),
             sigs.get("ads_sig", ""),
             sigs.get("keywords_sig", ""),
-            "snapshot manual",
+            "snapshot automático",
         ),
     )
     run_id = cur.lastrowid
     insert_df = payload_df.copy()
+    insert_df["sku"] = insert_df["sku"].map(norm_sku)
+    insert_df = insert_df[insert_df["sku"] != ""].copy()
+    if "ventas_ml_30d" in insert_df.columns:
+        insert_df = insert_df.sort_values(["sku", "ventas_ml_30d"], ascending=[True, False])
+    insert_df = insert_df.drop_duplicates(subset=["sku"], keep="first")
+    insert_df = insert_df.replace([np.inf, -np.inf], np.nan)
+    insert_df = insert_df.where(pd.notnull(insert_df), None)
     insert_df["run_id"] = run_id
     cols = [
         "run_id", "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct",
@@ -289,6 +310,7 @@ def save_snapshot_to_db(payload_df, sigs):
     conn.commit()
     conn.close()
     return run_id
+
 
 
 def list_runs():
@@ -411,7 +433,77 @@ def normalize_master(master_df, bridge_df):
                     "comentario": comment if pd.notna(comment) else "",
                 })
     promos_df = pd.DataFrame(promos)
+    if not promos_df.empty:
+        status_info = promos_df["fecha_venci"].apply(lambda x: pd.Series(promo_status(x), index=["status","status_order"]))
+        promos_df = pd.concat([promos_df, status_info], axis=1)
+    else:
+        promos_df = pd.DataFrame(columns=["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
     return df[df["sku"] != ""].copy(), promos_df
+
+
+def promo_status(dt):
+    dt = to_date_only(dt)
+    if pd.isna(dt):
+        return "Vencen en 1 mes", 30
+    today = pd.Timestamp(date.today())
+    delta = (dt - today).days
+    if delta < 0:
+        return "Vencidas", -1
+    if delta == 0:
+        return "Vencen hoy", 0
+    if delta == 1:
+        return "Vencen mañana", 1
+    if delta == 2:
+        return "Vencen pasado mañana", 2
+    if delta <= 7:
+        return "Vencen en 7 días", 7
+    if delta <= 15:
+        return "Vencen en 15 días", 15
+    return "Vencen en 1 mes", 30
+
+
+def rebuild_promos_from_master(master: pd.DataFrame) -> pd.DataFrame:
+    promos = []
+    if master is None or master.empty:
+        return pd.DataFrame(columns=["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
+    for idx, row in master.iterrows():
+        for slot, mlc_col, pads_col, price_col, date_col, comment_col in [
+            (1, "mlc_1", "CAMPAÑA PADS", "PRECIO B2C PUBLICADO ", "FECHA VENCI", "COMENTARIO"),
+            (2, "mlc_2", "CAMPAÑA PADS.1", "PRECIO B2C", "FECHA VENCI.1", "COMENTARIO.1"),
+        ]:
+            mlc = row.get(mlc_col, "")
+            pads = row.get(pads_col, "")
+            price = safe_float(row.get(price_col), np.nan)
+            dt = row.get(date_col, pd.NaT)
+            comment = row.get(comment_col, "")
+            if mlc or not pd.isna(price) or not pd.isna(dt) or (pd.notna(pads) and str(pads).strip()):
+                status, order = promo_status(dt)
+                promos.append({
+                    "master_index": idx,
+                    "sku": row.get("sku",""),
+                    "descripcion": row.get("descripcion",""),
+                    "slot": slot,
+                    "mlc": mlc,
+                    "campana_ads": pads if pd.notna(pads) else "",
+                    "precio_b2c": price,
+                    "fecha_venci": dt,
+                    "comentario": comment if pd.notna(comment) else "",
+                    "status": status,
+                    "status_order": order,
+                })
+    return pd.DataFrame(promos)
+
+
+def update_single_promo(model: dict, master_index: int, slot: int, price, dt, comment):
+    master = model["master"]
+    if slot == 1:
+        price_col, date_col, comment_col = "PRECIO B2C PUBLICADO ", "FECHA VENCI", "COMENTARIO"
+    else:
+        price_col, date_col, comment_col = "PRECIO B2C", "FECHA VENCI.1", "COMENTARIO.1"
+    master.at[master_index, price_col] = safe_float(price, np.nan)
+    master.at[master_index, date_col] = pd.to_datetime(dt).normalize() if dt else pd.NaT
+    master.at[master_index, comment_col] = comment
+    model["promos"] = rebuild_promos_from_master(master)
 
 
 def normalize_rel(rel_df):
@@ -647,8 +739,10 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
         base = pd.DataFrame(rows)
 
         # buyer split and purchase pattern
-        if not sw.empty:
-            bt = sw.groupby(["sku", "tipo_cliente"]).agg(
+        sw_pos = sw[(sw["cantidad"] > 0) & (sw["total_linea"] > 0)].copy()
+        sw_pos = sw_pos[sw_pos["tipo_cliente"].isin(["EMPRESA", "PERSONA"])].copy()
+        if not sw_pos.empty:
+            bt = sw_pos.groupby(["sku", "tipo_cliente"]).agg(
                 ingresos=("total_linea", "sum"),
                 unidades=("cantidad", "sum"),
                 ventas=("sku", "size"),
@@ -963,6 +1057,31 @@ if st.session_state.get("app_sig") != combined_sig:
 model = st.session_state.model
 action_table = model["action_table"].copy()
 
+# Auto snapshot deduplicado por estado consolidado
+if master_up and ventas_up and pubs_up and not action_table.empty:
+    sigs = {
+        "master_sig": file_signature(master_up) if master_up else "",
+        "ventas_sig": file_signature(ventas_up) if ventas_up else "",
+        "compras_sig": file_signature(compras_up) if compras_up else "",
+        "pubs_sig": file_signature(pubs_up) if pubs_up else "",
+        "ads_sig": file_signature(ads_up) if ads_up else "",
+        "keywords_sig": file_signature(keywords_up) if keywords_up else "",
+    }
+    payload_df = action_table[[
+        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct",
+        "precio_bruto", "monto_sim", "precio_ml_actual", "ingreso_estimado_ml", "brecha_precio_pct",
+        "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
+        "delta_margen_30d_pp", "ingresos_ml_30d", "ingresos_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
+    ]].rename(columns={"ingresos_ml_30d": "ventas_ml_30d", "ingresos_tienda_30d": "ventas_tienda_30d"})
+    current_payload_sig = payload_signature(payload_df, extra=json.dumps(sigs, sort_keys=True))
+    if st.session_state.get("last_saved_payload_sig") != current_payload_sig:
+        try:
+            run_id = save_snapshot_to_db(payload_df, sigs)
+            st.session_state["last_saved_payload_sig"] = current_payload_sig
+            st.session_state["last_run_id"] = run_id
+        except Exception as e:
+            st.warning(f"No pude guardar snapshot automático: {e}")
+
 tabs = st.tabs([
     "Centro de Control Comercial",
     "Ficha de Producto",
@@ -1185,11 +1304,16 @@ with tabs[1]:
         if pr is None:
             st.info("No encontré publicación principal para este SKU.")
         else:
-            d1, d2, d3 = st.columns(3)
+            d1, d2, d3, d4 = st.columns(4)
             d1.metric("Dimensiones", pr["dimensiones"])
-            d2.metric("Peso volumétrico", f"{safe_float(pr['peso_volumetrico_kg'], np.nan):.2f} kg" if pd.notna(pr["peso_volumetrico_kg"]) else "—")
-            d3.metric("Días publicado", fmt_int(pr["dias_publicado"]))
-            st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']} | Stock real: {fmt_int(pr['stock_real'])}")
+            peso_real = "—"
+            if pd.notna(pr.get("peso_grs", np.nan)):
+                peso_g = safe_float(pr.get("peso_grs"), np.nan)
+                peso_real = f"{peso_g/1000:.2f} kg" if peso_g >= 1000 else f"{peso_g:.0f} g"
+            d2.metric("Peso", peso_real)
+            d3.metric("Peso volumétrico", f"{safe_float(pr['peso_volumetrico_kg'], np.nan):.2f} kg" if pd.notna(pr["peso_volumetrico_kg"]) else "—")
+            d4.metric("Días publicado", fmt_int(pr["dias_publicado"]))
+            st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
 
         st.markdown("### Timeline del producto")
         timeline_parts = []
@@ -1259,116 +1383,102 @@ with tabs[2]:
 # Tab 4 - Promotions
 # =========================================================
 with tabs[3]:
-    st.subheader("Promociones desde maestra")
-    promos = model["promos"].copy()
-    if promos.empty:
+    st.subheader("Operador de promociones")
+    promos_all = model["promos"].copy()
+    if promos_all.empty:
         st.info("No encontré promos en la maestra.")
     else:
-        search = st.text_input("Buscar promo por SKU / descripción / MLC", key="promo_search")
-        if search:
-            q = search.lower()
-            promos = promos[
-                promos["sku"].astype(str).str.contains(q, na=False) |
-                promos["descripcion"].astype(str).str.lower().str.contains(q, na=False) |
-                promos["mlc"].astype(str).str.lower().str.contains(q, na=False)
+        left, right = st.columns([1, 2])
+        with left:
+            status_options = [
+                "Vencidas",
+                "Vencen hoy",
+                "Vencen mañana",
+                "Vencen pasado mañana",
+                "Vencen en 7 días",
+                "Vencen en 15 días",
+                "Vencen en 1 mes",
             ]
-        show = promos[["sku", "descripcion", "slot", "mlc", "campana_ads", "precio_b2c", "fecha_venci", "comentario"]].copy()
-        show.columns = ["SKU", "Descripción", "Slot", "MLC", "Campaña", "Precio B2C", "Fecha venci", "Comentario"]
-        show["Precio B2C"] = show["Precio B2C"].map(fmt_money)
-        show["Fecha venci"] = show["Fecha venci"].map(fmt_date)
-        st.dataframe(show, use_container_width=True, hide_index=True, height=420)
-        st.caption("Esta vista es de control. La edición avanzada de promociones queda mejor hacerla sobre la maestra una vez validado el análisis.")
+            status_filter = st.multiselect(
+                "Estado",
+                status_options,
+                default=st.session_state.get("promo_status_filter_v3", ["Vencidas", "Vencen hoy"]),
+                key="promo_status_filter_v3",
+            )
+            text_filter = st.text_input("Buscar por SKU / descripción / MLC", key="promo_search_v3")
+            promos = promos_all.copy()
+            if status_filter:
+                promos = promos[promos["status"].isin(status_filter)]
+            else:
+                promos = promos.iloc[0:0]
+            if text_filter:
+                q = text_filter.lower().strip()
+                promos = promos[
+                    promos["sku"].astype(str).str.lower().str.contains(q, na=False) |
+                    promos["descripcion"].astype(str).str.lower().str.contains(q, na=False) |
+                    promos["mlc"].astype(str).str.lower().str.contains(q, na=False)
+                ]
+            st.caption(f"Mostrando {len(promos)} promo(s) filtradas")
+            mass_date = st.date_input("Cambio masivo de fecha", value=None, format="DD/MM/YYYY", key="promo_mass_date_v3")
+            if st.button("Aplicar fecha masiva a filtradas", key="promo_mass_apply_v3"):
+                if mass_date and not promos.empty:
+                    for _, p in promos.iterrows():
+                        update_single_promo(model, int(p["master_index"]), int(p["slot"]), p["precio_b2c"], mass_date, p["comentario"])
+                    st.success("Fecha actualizada.")
+                    st.rerun()
 
-# =========================================================
-# Tab 5 - Relámpago
-# =========================================================
-with tabs[4]:
-    st.subheader("Relámpago mi página")
-    rel_base = model["rel"].copy()
-    if rel_base.empty:
-        rel_base = pd.DataFrame(columns=["sku", "descripcion", "precio_b2c", "tipo", "estado"])
-    rel_editor = rel_base.rename(columns={
-        "sku": "SKU",
-        "descripcion": "Descripción",
-        "precio_b2c": "Precio B2C",
-        "tipo": "Tipo",
-        "estado": "Estado",
-    })
-    edited_rel = st.data_editor(
-        rel_editor,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        key="relampago_editor_v3",
-        column_config={
-            "SKU": st.column_config.TextColumn(required=True),
-            "Descripción": st.column_config.TextColumn(),
-            "Precio B2C": st.column_config.NumberColumn(step=100),
-            "Tipo": st.column_config.TextColumn(),
-            "Estado": st.column_config.TextColumn(),
-        },
-    )
-    if st.button("Actualizar relámpago en memoria"):
-        new_rel = edited_rel.rename(columns={
-            "SKU": "sku",
-            "Descripción": "descripcion",
-            "Precio B2C": "precio_b2c",
-            "Tipo": "tipo",
-            "Estado": "estado",
-        }).copy()
-        new_rel["sku"] = new_rel["sku"].map(norm_sku)
-        new_rel["precio_b2c"] = new_rel["precio_b2c"].map(safe_float)
-        st.session_state.model["rel"] = new_rel[new_rel["sku"] != ""].copy()
-        st.success("Relámpago actualizado en memoria para esta sesión.")
+        with right:
+            if promos.empty:
+                st.info("No hay promos para esos estados/filtros.")
+            else:
+                cols = st.columns(4)
+                for i, (_, p) in enumerate(promos.sort_values(["status_order", "sku", "slot"]).iterrows()):
+                    with cols[i % 4]:
+                        with st.container(border=True):
+                            st.markdown(f"**{p['sku']}**")
+                            st.caption(str(p["descripcion"])[:55])
+                            st.write(f"`{p['mlc'] or '—'}`")
+                            st.write(fmt_date(p["fecha_venci"]))
+                            st.write(p["status"])
+                            if st.button("Abrir", key=f"open_promo_{p['master_index']}_{p['slot']}"):
+                                st.session_state.edit_target_v3 = (int(p["master_index"]), int(p["slot"]))
+                                st.rerun()
 
-# =========================================================
-# Tab 6 - History
-# =========================================================
+        if "edit_target_v3" in st.session_state:
+            master_index, slot = st.session_state.edit_target_v3
+            current = model["promos"][
+                (model["promos"]["master_index"] == master_index) &
+                (model["promos"]["slot"] == slot)
+            ]
+            if not current.empty:
+                cp = current.iloc[0]
+                @st.dialog("Editar promoción")
+                def edit_promo_dialog():
+                    st.write(f"**SKU:** {cp['sku']}")
+                    st.write(f"**Descripción:** {cp['descripcion']}")
+                    st.write(f"**MLC:** {cp['mlc'] or '—'}")
+                    current_date = cp["fecha_venci"].date() if pd.notna(cp["fecha_venci"]) else None
+                    new_date = st.date_input("Fecha venci", value=current_date, format="DD/MM/YYYY", key="promo_edit_date_v3")
+                    with st.expander("Campos secundarios"):
+                        new_price = st.number_input("Precio B2C", min_value=0.0, value=float(safe_float(cp["precio_b2c"], 0.0)), step=100.0, key="promo_edit_price_v3")
+                        new_comment = st.text_input("Comentario", value=str(cp["comentario"]) if pd.notna(cp["comentario"]) else "", key="promo_edit_comment_v3")
+                    if st.button("Guardar cambios", key="promo_edit_save_v3"):
+                        update_single_promo(model, master_index, slot, new_price, new_date, new_comment)
+                        del st.session_state["edit_target_v3"]
+                        st.success("Promoción actualizada.")
+                        st.rerun()
+                    if st.button("Cerrar", key="promo_edit_close_v3"):
+                        del st.session_state["edit_target_v3"]
+                        st.rerun()
+                edit_promo_dialog()
+
 with tabs[5]:
     st.subheader("Historial / snapshots")
-    st.write("Cada snapshot guarda el estado consolidado del sistema para mantener trazabilidad.")
-    sigs = {
-        "master_sig": file_signature(master_up) if master_up else "",
-        "ventas_sig": file_signature(ventas_up) if ventas_up else "",
-        "compras_sig": file_signature(compras_up) if compras_up else "",
-        "pubs_sig": file_signature(pubs_up) if pubs_up else "",
-        "ads_sig": file_signature(ads_up) if ads_up else "",
-        "keywords_sig": file_signature(keywords_up) if keywords_up else "",
-    }
-    payload_df = action_table[[
-        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct",
-        "precio_bruto", "monto_sim", "precio_ml_actual", "ingreso_estimado_ml", "brecha_precio_pct",
-        "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
-        "delta_margen_30d_pp", "ingresos_ml_30d", "ingresos_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
-    ]].rename(columns={"ingresos_ml_30d": "ventas_ml_30d", "ingresos_tienda_30d": "ventas_tienda_30d"})
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        if st.button("Guardar snapshot actual"):
-            run_id = save_snapshot_to_db(payload_df, sigs)
-            st.success(f"Snapshot guardado. Run ID: {run_id}")
-    with c2:
-        st.caption("La primera corrida dispara alertas como brecha inicial entre maestra y realidad actual.")
-
+    st.write("Los snapshots se guardan automáticamente cuando cambia la carga o cambia el estado consolidado del sistema.")
     runs = list_runs()
     if runs.empty:
         st.info("Aún no hay snapshots guardados.")
     else:
         st.dataframe(runs, use_container_width=True, hide_index=True, height=240)
+        st.caption("La primera corrida se interpreta como brecha inicial entre maestra y realidad actual; las siguientes permiten trazabilidad y comparación.")
 
-# =========================================================
-# Tab 7 - Download
-# =========================================================
-with tabs[6]:
-    st.subheader("Descargar maestra actualizada")
-    if st.button("Preparar Excel"):
-        wb = model["wb"]
-        payload = build_download_bytes(st.session_state.model["master"], st.session_state.model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
-        st.session_state.download_bytes_v3 = payload
-
-    if st.session_state.get("download_bytes_v3"):
-        st.download_button(
-            "Descargar Excel actualizado",
-            data=st.session_state.download_bytes_v3,
-            file_name="MAESTRA_PRECIOS_ACTUALIZADA_V3.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
