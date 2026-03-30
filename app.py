@@ -12,7 +12,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide")
@@ -1318,17 +1317,9 @@ with st.sidebar:
     st.caption("Ventas, patrones y margen histórico se priorizan con este periodo.")
 
     st.markdown("---")
-    auto_refresh = st.checkbox("Auto refresh compartido", value=True)
-    refresh_seconds = st.selectbox("Cada cuántos segundos", [5, 10, 15, 30], index=1)
-    if auto_refresh:
-        components.html(
-            f"""
-            <script>
-            setTimeout(function() {{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});
-            </script>
-            """,
-            height=0,
-        )
+    st.caption("Modo compartido sin recarga automática agresiva. Para ver cambios hechos desde otra ventana, usa el botón de actualizar.")
+    if st.button("Actualizar datos compartidos", use_container_width=True):
+        st.rerun()
 
 master_up = resolved_files["master"]
 ventas_up = resolved_files["ventas"]
@@ -1336,6 +1327,22 @@ compras_up = resolved_files["compras"]
 pubs_up = resolved_files["pubs"]
 ads_up = resolved_files["ads"]
 keywords_up = resolved_files["keywords"]
+
+current_shared_status = get_shared_status()
+current_shared_version = int(current_shared_status.get("version", 0) or 0)
+previous_shared_version = st.session_state.get("seen_shared_version")
+st.session_state["seen_shared_version"] = current_shared_version
+
+if previous_shared_version is not None and current_shared_version != previous_shared_version:
+    st.info(
+        f"Se detectó una actualización compartida (versión {current_shared_version}). "
+        f"Motivo: {current_shared_status.get('reason', 'actualización')}."
+    )
+
+status_cols = st.columns([1.2, 2.2, 1.8])
+status_cols[0].metric("Versión compartida", current_shared_version)
+status_cols[1].caption(f"Última actualización compartida: {current_shared_status.get('updated_at') or '—'}")
+status_cols[2].caption(f"Motivo: {current_shared_status.get('reason') or '—'}")
 
 required_missing = [
     FILE_SPECS[file_key]["label"]
