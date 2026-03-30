@@ -523,6 +523,185 @@ def list_runs():
     return df
 
 
+
+def load_snapshot_history_for_skus(skus):
+    skus = [norm_sku(s) for s in (skus or []) if norm_sku(s)]
+    if not skus:
+        return pd.DataFrame()
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        placeholders = ",".join(["?"] * len(skus))
+        query = f"""
+            SELECT sp.*, r.created_at
+            FROM snapshot_producto sp
+            JOIN runs r ON r.id = sp.run_id
+            WHERE sp.sku IN ({placeholders})
+            ORDER BY sp.sku, sp.run_id
+        """
+        return pd.read_sql_query(query, conn, params=skus)
+    finally:
+        conn.close()
+
+
+def load_snapshot_history_for_sku(sku):
+    sku = norm_sku(sku)
+    if not sku:
+        return pd.DataFrame()
+    return load_snapshot_history_for_skus([sku])
+
+
+def enrich_action_table_with_snapshot_history(action_table: pd.DataFrame) -> pd.DataFrame:
+    if action_table is None or action_table.empty:
+        return action_table
+    hist = load_snapshot_history_for_skus(action_table["sku"].dropna().unique().tolist())
+    if hist.empty:
+        out = action_table.copy()
+        for col in [
+            "brecha_costo_inicial_pct", "brecha_costo_previa_pct", "delta_brecha_costo_vs_inicial_pp", "delta_brecha_costo_vs_previa_pp",
+            "brecha_precio_inicial_pct", "brecha_precio_previa_pct", "delta_brecha_precio_vs_inicial_pp", "delta_brecha_precio_vs_previa_pp",
+            "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "delta_brecha_ingreso_vs_inicial_pp", "delta_brecha_ingreso_vs_previa_pp",
+            "runs_count", "primera_corrida", "ultima_corrida_previa"
+        ]:
+            out[col] = np.nan
+        return out
+
+    rows = []
+    for sku, grp in hist.groupby("sku", sort=False):
+        grp = grp.sort_values("run_id")
+        first = grp.iloc[0]
+        prev = grp.iloc[-2] if len(grp) >= 2 else grp.iloc[-1]
+        rows.append({
+            "sku": sku,
+            "brecha_costo_inicial_pct": first.get("brecha_costo_pct"),
+            "brecha_costo_previa_pct": prev.get("brecha_costo_pct"),
+            "brecha_precio_inicial_pct": first.get("brecha_precio_pct"),
+            "brecha_precio_previa_pct": prev.get("brecha_precio_pct"),
+            "brecha_ingreso_inicial_pct": first.get("brecha_monto_sim_pct"),
+            "brecha_ingreso_previa_pct": prev.get("brecha_monto_sim_pct"),
+            "runs_count": len(grp),
+            "primera_corrida": first.get("created_at"),
+            "ultima_corrida_previa": prev.get("created_at"),
+        })
+    base = pd.DataFrame(rows)
+    out = action_table.merge(base, on="sku", how="left")
+    out["delta_brecha_costo_vs_inicial_pp"] = out["brecha_costo_pct"] - out["brecha_costo_inicial_pct"]
+    out["delta_brecha_costo_vs_previa_pp"] = out["brecha_costo_pct"] - out["brecha_costo_previa_pct"]
+    out["delta_brecha_precio_vs_inicial_pp"] = out["brecha_precio_pct"] - out["brecha_precio_inicial_pct"]
+    out["delta_brecha_precio_vs_previa_pp"] = out["brecha_precio_pct"] - out["brecha_precio_previa_pct"]
+    out["delta_brecha_ingreso_vs_inicial_pp"] = out["brecha_monto_sim_pct"] - out["brecha_ingreso_inicial_pct"]
+    out["delta_brecha_ingreso_vs_previa_pp"] = out["brecha_monto_sim_pct"] - out["brecha_ingreso_previa_pct"]
+    return out
+
+
+def build_validation_layers(master, ventas, compras, pubs, product_ads, promos):
+    details = {}
+    summary_rows = []
+
+    def register(name, severity, df, detail):
+        df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        details[name] = df
+        summary_rows.append({
+            "Capa": name,
+            "Severidad": severity,
+            "Hallazgos": len(df),
+            "Detalle": detail,
+        })
+
+    master = master.copy() if isinstance(master, pd.DataFrame) else pd.DataFrame()
+    ventas = ventas.copy() if isinstance(ventas, pd.DataFrame) else pd.DataFrame()
+    compras = compras.copy() if isinstance(compras, pd.DataFrame) else pd.DataFrame()
+    pubs = pubs.copy() if isinstance(pubs, pd.DataFrame) else pd.DataFrame()
+    product_ads = product_ads.copy() if isinstance(product_ads, pd.DataFrame) else pd.DataFrame()
+    promos = promos.copy() if isinstance(promos, pd.DataFrame) else pd.DataFrame()
+
+    master_skus = set(master.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    sales_skus = set(ventas.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    purchase_skus = set(compras.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    pub_skus = set(pubs.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    pub_mlcs = set(pubs.get("mlc", pd.Series(dtype=str)).dropna().astype(str))
+
+    dup_master = master[master.get("sku", pd.Series(dtype=str)).duplicated(keep=False)].sort_values("sku") if not master.empty else pd.DataFrame()
+    register("Maestra duplicada por SKU", "CRÍTICO" if not dup_master.empty else "OK", dup_master[[c for c in ["sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim"] if c in dup_master.columns]], "Un SKU no debería repetirse en la maestra consolidada.")
+
+    missing_core = master[(master.get("costo_maestra").isna()) | (master.get("precio_bruto").isna()) | (master.get("monto_sim").isna())] if not master.empty else pd.DataFrame()
+    register("Maestra incompleta", "ALERTA" if not missing_core.empty else "OK", missing_core[[c for c in ["sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim"] if c in missing_core.columns]], "La maestra debería quedar alimentada por reportes con costo, precio tienda y monto simulación.")
+
+    sales_out = ventas[~ventas.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values(["sku", "fecha"], ascending=[True, False]) if not ventas.empty else pd.DataFrame()
+    register("Ventas fuera de maestra", "CRÍTICO" if not sales_out.empty else "OK", sales_out[[c for c in ["sku", "fecha", "producto", "total_linea", "canal"] if c in sales_out.columns]].drop_duplicates(), "El reporte de ventas está trayendo SKUs que no quedaron absorbidos por la maestra.")
+
+    purchase_out = compras[~compras.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values(["sku", "fecha"], ascending=[True, False]) if not compras.empty else pd.DataFrame()
+    register("Compras fuera de maestra", "ALERTA" if not purchase_out.empty else "OK", purchase_out[[c for c in ["sku", "fecha", "proveedor", "precio_unitario"] if c in purchase_out.columns]].drop_duplicates(), "Hay costos del reporte de compras que no están cayendo a la maestra.")
+
+    pubs_out = pubs[~pubs.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values("sku") if not pubs.empty else pd.DataFrame()
+    register("Publicaciones fuera de maestra", "CRÍTICO" if not pubs_out.empty else "OK", pubs_out[[c for c in ["sku", "mlc", "titulo", "precio_final", "status"] if c in pubs_out.columns]].drop_duplicates(), "Mercado Libre reporta publicaciones cuyo SKU no quedó consolidado en la maestra.")
+
+    master_without_pub = master[~master.get("sku", pd.Series(dtype=str)).isin(pub_skus)].sort_values("sku") if not master.empty else pd.DataFrame()
+    register("Maestra sin publicación ML", "ALERTA" if not master_without_pub.empty else "OK", master_without_pub[[c for c in ["sku", "descripcion", "precio_bruto", "monto_sim"] if c in master_without_pub.columns]], "Hay productos consolidados sin contraparte en el reporte de publicaciones.")
+
+    dup_mlc = pubs[pubs.get("mlc", pd.Series(dtype=str)).duplicated(keep=False)].sort_values("mlc") if not pubs.empty else pd.DataFrame()
+    register("MLC duplicado en reporte", "CRÍTICO" if not dup_mlc.empty else "OK", dup_mlc[[c for c in ["mlc", "sku", "titulo", "status"] if c in dup_mlc.columns]], "Un mismo MLC no debería repetirse en el reporte base.")
+
+    multi_active = pubs[pubs.get("status", pd.Series(dtype=str)).astype(str).str.upper().eq("ACTIVA")].copy() if not pubs.empty else pd.DataFrame()
+    multi_active = multi_active.groupby("sku").filter(lambda g: len(g) > 1) if not multi_active.empty else pd.DataFrame()
+    register("Múltiples publicaciones activas por SKU", "ALERTA" if not multi_active.empty else "OK", multi_active[[c for c in ["sku", "mlc", "titulo", "precio_final", "ventas_hist_pub"] if c in multi_active.columns]], "Puede existir estrategia multilistado, pero se debe revisar porque afecta la publicación principal y el pricing.")
+
+    promo_issues = promos[(promos.get("mlc", pd.Series(dtype=str)).astype(str).str.strip().eq("")) | (pd.isna(promos.get("fecha_venci")))] if not promos.empty else pd.DataFrame()
+    register("Promociones incompletas", "ALERTA" if not promo_issues.empty else "OK", promo_issues[[c for c in ["sku", "slot", "mlc", "precio_b2c", "fecha_venci", "comentario"] if c in promo_issues.columns]], "Las promos deben tener MLC y fecha de vencimiento para ser operables.")
+
+    ads_orphan = product_ads[~product_ads.get("mlc", pd.Series(dtype=str)).isin(pub_mlcs)].sort_values("mlc") if not product_ads.empty else pd.DataFrame()
+    register("Ads sin publicación asociada", "ALERTA" if not ads_orphan.empty else "OK", ads_orphan[[c for c in ["mlc", "campana", "titulo", "inversion_ads", "ingresos_ads"] if c in ads_orphan.columns]], "Product Ads trae publicaciones que hoy no están en el reporte maestro ML.")
+
+    future_purchases = compras[compras.get("fecha", pd.Series(dtype='datetime64[ns]')) > pd.Timestamp(date.today())] if not compras.empty else pd.DataFrame()
+    register("Compras con fecha futura", "ALERTA" if not future_purchases.empty else "OK", future_purchases[[c for c in ["sku", "fecha", "proveedor", "precio_unitario"] if c in future_purchases.columns]], "Hay registros de compras con fecha posterior a hoy.")
+
+    summary = pd.DataFrame(summary_rows)
+    severity_rank = {"CRÍTICO": 3, "ALERTA": 2, "OK": 1}
+    if not summary.empty:
+        summary["_rank"] = summary["Severidad"].map(severity_rank).fillna(0)
+        summary = summary.sort_values(["_rank", "Hallazgos", "Capa"], ascending=[False, False, True]).drop(columns=["_rank"])
+    return {"summary": summary, "details": details}
+
+
+def calc_ml_net_revenue(price, fee_pct, fixed_charge=0.0, ads_pct=0.0):
+    price = safe_float(price, np.nan)
+    fee_pct = safe_float(fee_pct, 0.0)
+    fixed_charge = safe_float(fixed_charge, 0.0)
+    ads_pct = safe_float(ads_pct, 0.0)
+    if np.isnan(price) or price <= 0:
+        return np.nan
+    variable_rate = max(0.0, min(0.95, (fee_pct + ads_pct) / 100.0))
+    revenue_gross = price * (1 - variable_rate) - fixed_charge
+    if revenue_gross <= 0:
+        return np.nan
+    return revenue_gross / 1.19
+
+
+def calc_margin_from_ml_price(cost, price, fee_pct, fixed_charge=0.0, ads_pct=0.0):
+    cost = safe_float(cost, np.nan)
+    net_rev = calc_ml_net_revenue(price, fee_pct, fixed_charge, ads_pct)
+    if np.isnan(cost) or np.isnan(net_rev) or net_rev <= 0:
+        return np.nan
+    return ((net_rev - cost) / net_rev) * 100
+
+
+def calc_price_for_target_ml_margin(cost, fee_pct, fixed_charge=0.0, target_margin_pct=15.0, ads_pct=0.0):
+    cost = safe_float(cost, np.nan)
+    fee_pct = safe_float(fee_pct, 0.0)
+    fixed_charge = safe_float(fixed_charge, 0.0)
+    target_margin_pct = safe_float(target_margin_pct, np.nan)
+    ads_pct = safe_float(ads_pct, 0.0)
+    if np.isnan(cost) or np.isnan(target_margin_pct):
+        return np.nan
+    target = target_margin_pct / 100.0
+    variable_rate = max(0.0, min(0.95, (fee_pct + ads_pct) / 100.0))
+    denominator = 1 - variable_rate
+    if denominator <= 0 or target >= 1:
+        return np.nan
+    required_net_rev = cost / (1 - target)
+    return ((required_net_rev * 1.19) + fixed_charge) / denominator
+
+
 # =========================================================
 # Loaders
 # =========================================================
@@ -1094,11 +1273,23 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
                     "status_publicacion": pr["status"],
                     "dimensiones": pr["dimensiones"],
                     "peso_volumetrico_kg": safe_float(pr["peso_volumetrico_kg"]),
+                    "comision_pct_ml": safe_float(pr.get("comision_pct", np.nan)),
+                    "cargo_cuotas_pct_ml": safe_float(pr.get("cargo_cuotas_pct", np.nan)),
+                    "total_cargo_pct_ml": safe_float(pr.get("total_cargo_pct", np.nan)),
+                    "total_cargo_monto_ml": safe_float(pr.get("total_cargo_monto", np.nan)),
+                    "costo_fijo_ml": safe_float(pr.get("costo_fijo", np.nan)),
                 })
     pub_primary = pd.DataFrame(pub_primary_rows)
     base = base.merge(pub_primary, on="sku", how="left")
 
+    base["ads_share_ml_pct"] = np.where(
+        base["ingresos_ml_30d"].fillna(0) > 0,
+        (base["ads_inversion"].fillna(0) / base["ingresos_ml_30d"].fillna(0)) * 100,
+        0.0
+    )
     base["margen_ml_actual"] = base.apply(lambda r: calc_margin_from_monto_sim(r["costo_maestra"], r["monto_sim"]), axis=1)
+    base["margen_ml_reportado"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0), axis=1)
+    base["margen_ml_con_ads"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), r.get("ads_share_ml_pct", 0.0)), axis=1)
     base["margen_tienda_actual"] = base.apply(lambda r: calc_margin_from_bruto(r["costo_maestra"], r["precio_bruto"]), axis=1)
     base["brecha_costo_pct"] = np.where(
         base["costo_maestra"].notna() & base["ultimo_costo_compra"].notna() & (base["costo_maestra"] != 0),
@@ -1214,6 +1405,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
     action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
+    validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos)
 
     product_options = action_table["sku"].dropna().tolist()
     sku_desc = action_table.set_index("sku")["descripcion"].to_dict()
@@ -1238,6 +1430,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
         "pub_map": pub_map,
         "product_options": product_options,
         "sku_desc": sku_desc,
+        "validations": validations,
     }
 
 
@@ -1392,6 +1585,10 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
         except Exception as e:
             st.warning(f"No pude guardar snapshot automático: {e}")
 
+action_table = enrich_action_table_with_snapshot_history(action_table)
+model["action_table"] = action_table
+model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"])
+
 tabs = st.tabs([
     "Centro de Control Comercial",
     "Ficha de Producto",
@@ -1463,25 +1660,77 @@ with tabs[0]:
     else:
         st.info("No hay productos con esos filtros.")
 
+    st.subheader("Capas de validación")
+    validations = model.get("validations", {"summary": pd.DataFrame(), "details": {}})
+    summary_df = validations.get("summary", pd.DataFrame())
+    if summary_df.empty:
+        st.info("No encontré hallazgos de validación para la carga actual.")
+    else:
+        st.dataframe(summary_df, use_container_width=True, hide_index=True, height=240)
+        with st.expander("Ver detalle por capa"):
+            for name, detail_df in validations.get("details", {}).items():
+                if detail_df is not None and not detail_df.empty:
+                    st.markdown(f"**{name}**")
+                    st.dataframe(detail_df, use_container_width=True, hide_index=True, height=min(260, 60 + 35 * len(detail_df.head(10))))
+
     st.subheader("Brechas iniciales / actuales entre maestra y última compra")
-    brechas = action_table[action_table["brecha_costo_pct"].notna()][["sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"]].copy()
-    brechas.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha %", "Estado", "Acción"]
-    brechas["Costo maestra"] = brechas["Costo maestra"].map(fmt_money)
-    brechas["Última compra"] = brechas["Última compra"].map(fmt_money)
-    brechas["Brecha %"] = brechas["Brecha %"].map(fmt_pct)
-    st.dataframe(brechas.head(50), use_container_width=True, hide_index=True, height=250)
+    b1, b2, b3 = st.columns([1.1, 1.1, 1.4])
+    cost_state_filter = b1.multiselect("Estado brecha costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"], key="cost_gap_state_filter")
+    cost_sort = b2.selectbox("Orden costo", ["Mayor brecha actual", "Mayor cambio vs inicial", "Mayor cambio vs previa"], key="cost_gap_sort")
+    cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=5000, value=200, step=20, key="cost_gap_limit"))
+
+    brechas = action_table[action_table["brecha_costo_pct"].notna()].copy()
+    if cost_state_filter:
+        brechas = brechas[brechas["estado_brecha_costo"].isin(cost_state_filter)]
+    sort_col = {
+        "Mayor brecha actual": "brecha_costo_pct",
+        "Mayor cambio vs inicial": "delta_brecha_costo_vs_inicial_pp",
+        "Mayor cambio vs previa": "delta_brecha_costo_vs_previa_pp",
+    }[cost_sort]
+    brechas = brechas.sort_values(sort_col, ascending=False)
+    brechas_show = brechas[[
+        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_inicial_pct", "brecha_costo_previa_pct",
+        "brecha_costo_pct", "delta_brecha_costo_vs_inicial_pp", "delta_brecha_costo_vs_previa_pp", "estado_brecha_costo", "accion_sugerida"
+    ]].copy()
+    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha inicial %", "Brecha previa %", "Brecha actual %", "Δ vs inicial pp", "Δ vs previa pp", "Estado", "Acción"]
+    for c in ["Costo maestra", "Última compra"]:
+        brechas_show[c] = brechas_show[c].map(fmt_money)
+    for c in ["Brecha inicial %", "Brecha previa %", "Brecha actual %"]:
+        brechas_show[c] = brechas_show[c].map(fmt_pct)
+    for c in ["Δ vs inicial pp", "Δ vs previa pp"]:
+        brechas_show[c] = brechas_show[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
+    st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
 
     st.subheader("Brechas comerciales contra Mercado Libre")
-    commercial = action_table[action_table["precio_ml_actual"].notna()][[
-        "sku", "descripcion", "precio_bruto", "precio_ml_actual", "brecha_precio_pct",
-        "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct"
+    c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
+    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha ingreso actual", "Mayor brecha precio actual", "Mayor deterioro margen"], key="commercial_sort")
+    only_with_pub = c2.selectbox("Cobertura ML", ["Solo con publicación", "Todos"], key="commercial_pub_filter")
+    commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=5000, value=200, step=20, key="commercial_limit"))
+
+    commercial = action_table.copy()
+    if only_with_pub == "Solo con publicación":
+        commercial = commercial[commercial["precio_ml_actual"].notna()]
+    commercial = commercial.sort_values({
+        "Mayor brecha ingreso actual": "brecha_monto_sim_pct",
+        "Mayor brecha precio actual": "brecha_precio_pct",
+        "Mayor deterioro margen": "delta_margen_30d_pp",
+    }[commercial_sort], ascending=False)
+    commercial_show = commercial[[
+        "sku", "descripcion", "precio_bruto", "precio_ml_base", "precio_ml_oferta", "precio_ml_actual", "brecha_precio_inicial_pct", "brecha_precio_previa_pct", "brecha_precio_pct",
+        "monto_sim", "ingreso_estimado_ml", "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "brecha_monto_sim_pct",
+        "total_cargo_pct_ml", "costo_fijo_ml", "margen_ml_reportado", "margen_ml_con_ads", "margen_hist_30d", "delta_margen_30d_pp"
     ]].copy()
-    commercial.columns = ["SKU", "Descripción", "Precio maestra", "Precio ML", "Brecha precio %", "Monto simulación", "Ingreso est. ML", "Brecha ingreso %"]
-    for c in ["Precio maestra", "Precio ML", "Monto simulación", "Ingreso est. ML"]:
-        commercial[c] = commercial[c].map(fmt_money)
-    commercial["Brecha precio %"] = commercial["Brecha precio %"].map(fmt_pct)
-    commercial["Brecha ingreso %"] = commercial["Brecha ingreso %"].map(fmt_pct)
-    st.dataframe(commercial.head(50), use_container_width=True, hide_index=True, height=250)
+    commercial_show.columns = [
+        "SKU", "Descripción", "Precio tienda", "Precio base ML", "Precio oferta ML", "Precio final ML", "Brecha precio inicial %", "Brecha precio previa %", "Brecha precio actual %",
+        "Monto simulación", "Ingreso est. ML", "Brecha ingreso inicial %", "Brecha ingreso previa %", "Brecha ingreso actual %",
+        "Fee ML %", "Costo fijo ML", "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d", "Δ margen 30d pp"
+    ]
+    for c in ["Precio tienda", "Precio base ML", "Precio oferta ML", "Precio final ML", "Monto simulación", "Ingreso est. ML", "Costo fijo ML"]:
+        commercial_show[c] = commercial_show[c].map(fmt_money)
+    for c in ["Brecha precio inicial %", "Brecha precio previa %", "Brecha precio actual %", "Brecha ingreso inicial %", "Brecha ingreso previa %", "Brecha ingreso actual %", "Fee ML %", "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d"]:
+        commercial_show[c] = commercial_show[c].map(fmt_pct)
+    commercial_show["Δ margen 30d pp"] = commercial_show["Δ margen 30d pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
+    st.dataframe(commercial_show.head(commercial_limit), use_container_width=True, hide_index=True, height=360)
 
 # =========================================================
 # Tab 2 - Product sheet
@@ -1625,6 +1874,30 @@ with tabs[1]:
             d4.metric("Días publicado", fmt_int(pr["dias_publicado"]))
             st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
 
+        st.markdown("### Historial ampliado del producto")
+        hist_snap = load_snapshot_history_for_sku(sku)
+        if hist_snap.empty:
+            st.info("Aún no hay snapshots suficientes para este SKU.")
+        else:
+            hist_snap = hist_snap.sort_values("run_id", ascending=False).copy()
+            latest_hist = hist_snap.iloc[0]
+            first_hist = hist_snap.iloc[-1]
+            prev_hist = hist_snap.iloc[1] if len(hist_snap) >= 2 else hist_snap.iloc[0]
+            h1, h2, h3, h4 = st.columns(4)
+            h1.metric("Corridas guardadas", fmt_int(len(hist_snap)))
+            h2.metric("Brecha costo inicial", fmt_pct(first_hist.get("brecha_costo_pct")))
+            h3.metric("Brecha costo actual", fmt_pct(row.get("brecha_costo_pct")), "—" if pd.isna(row.get("delta_brecha_costo_vs_inicial_pp")) else f"{row.get('delta_brecha_costo_vs_inicial_pp'):.1f} pp vs inicial")
+            h4.metric("Brecha ingreso actual", fmt_pct(row.get("brecha_monto_sim_pct")), "—" if pd.isna(row.get("delta_brecha_ingreso_vs_inicial_pp")) else f"{row.get('delta_brecha_ingreso_vs_inicial_pp'):.1f} pp vs inicial")
+
+            snap_show = hist_snap[["created_at", "run_id", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "precio_ml_actual", "brecha_precio_pct", "ingreso_estimado_ml", "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "delta_margen_30d_pp", "ventas_ml_30d"]].copy()
+            snap_show.columns = ["Fecha", "Run", "Costo maestra", "Última compra", "Brecha costo %", "Precio ML", "Brecha precio %", "Ingreso est. ML", "Brecha ingreso %", "Margen ML actual", "Margen hist. 30d", "Δ margen pp", "Ventas ML 30d"]
+            for c in ["Costo maestra", "Última compra", "Precio ML", "Ingreso est. ML", "Ventas ML 30d"]:
+                snap_show[c] = snap_show[c].map(fmt_money)
+            for c in ["Brecha costo %", "Brecha precio %", "Brecha ingreso %", "Margen ML actual", "Margen hist. 30d"]:
+                snap_show[c] = snap_show[c].map(fmt_pct)
+            snap_show["Δ margen pp"] = snap_show["Δ margen pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
+            st.dataframe(snap_show, use_container_width=True, hide_index=True, height=260)
+
         st.markdown("### Timeline del producto")
         timeline_parts = []
         if sku in model["purchase_map"]:
@@ -1645,12 +1918,18 @@ with tabs[1]:
             pp["tipo_evento"] = "Promo"
             pp["detalle"] = pp.apply(lambda r: f"Slot {int(r['slot'])} · {r['mlc']} · vence {fmt_date(r['fecha'])} · {fmt_money(r['precio_b2c'])}", axis=1)
             timeline_parts.append(pp[["fecha", "tipo_evento", "detalle"]])
+        if not hist_snap.empty:
+            snap_tl = hist_snap[["created_at", "brecha_costo_pct", "brecha_monto_sim_pct", "delta_margen_30d_pp"]].copy()
+            snap_tl["fecha"] = pd.to_datetime(snap_tl["created_at"], errors="coerce")
+            snap_tl["tipo_evento"] = "Snapshot"
+            snap_tl["detalle"] = snap_tl.apply(lambda r: f"Brecha costo {fmt_pct(r['brecha_costo_pct'])} · Brecha ingreso {fmt_pct(r['brecha_monto_sim_pct'])} · Δ margen {('—' if pd.isna(r['delta_margen_30d_pp']) else str(round(r['delta_margen_30d_pp'],1)) + ' pp')}", axis=1)
+            timeline_parts.append(snap_tl[["fecha", "tipo_evento", "detalle"]])
 
         if timeline_parts:
             tl = pd.concat(timeline_parts, ignore_index=True).sort_values("fecha", ascending=False)
-            tl["fecha"] = tl["fecha"].map(fmt_date)
+            tl["fecha"] = pd.to_datetime(tl["fecha"], errors="coerce").map(fmt_date)
             tl.columns = ["Fecha", "Tipo", "Detalle"]
-            st.dataframe(tl, use_container_width=True, hide_index=True, height=320)
+            st.dataframe(tl, use_container_width=True, hide_index=True, height=340)
         else:
             st.info("No encontré eventos para armar el timeline.")
 
@@ -1658,36 +1937,61 @@ with tabs[1]:
 # Tab 3 - Mass repricing
 # =========================================================
 with tabs[2]:
-    st.subheader("Reprecio masivo")
-    x1, x2, x3 = st.columns(3)
+    st.subheader("Repricing técnico basado en reportes")
+    st.caption("La fuente de verdad para precio, cargos y comisión es el reporte de publicaciones ML. La maestra queda como consolidado de trabajo.")
+    x1, x2, x3, x4 = st.columns(4)
     proveedor_alza_pct = x1.number_input("Simular alza proveedor %", min_value=-30.0, max_value=200.0, value=0.0, step=1.0)
-    comision_extra_pct = x2.number_input("Simular cambio comisión ML (pp)", min_value=-20.0, max_value=20.0, value=0.0, step=0.5)
-    margen_obj_ml = x3.number_input("Margen técnico ML objetivo %", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
+    comision_extra_pct = x2.number_input("Cambio fee ML (pp)", min_value=-20.0, max_value=20.0, value=0.0, step=0.5)
+    margen_obj_ml = x3.number_input("Margen objetivo ML %", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
+    incluir_ads = x4.selectbox("Considerar ads en cálculo", ["Sí", "No"], index=0)
 
     sim = action_table.copy()
+    sim = sim[sim["precio_ml_actual"].notna()].copy()
     sim["costo_simulado"] = sim["costo_maestra"] * (1 + proveedor_alza_pct / 100.0)
-    sim["ingreso_simulado_ml"] = sim["ingreso_estimado_ml"] * (1 - comision_extra_pct / 100.0)
-    neto_obj_factor = 1 - (margen_obj_ml / 100.0)
-    sim["precio_sugerido_ml"] = np.where(
-        sim["ingreso_simulado_ml"].notna() & (sim["ingreso_simulado_ml"] > 0),
-        ((sim["costo_simulado"] / neto_obj_factor) * 1.19),
-        np.nan
-    )
+    sim["fee_total_sim_pct"] = sim["total_cargo_pct_ml"].fillna(0) + comision_extra_pct
+    sim["ads_pct_sim"] = sim["ads_share_ml_pct"].fillna(0) if incluir_ads == "Sí" else 0.0
+    sim["precio_sugerido_ml"] = sim.apply(lambda r: calc_price_for_target_ml_margin(r["costo_simulado"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), margen_obj_ml, r.get("ads_pct_sim", 0.0)), axis=1)
+    sim["margen_proyectado_actual"] = sim.apply(lambda r: calc_margin_from_ml_price(r["costo_simulado"], r["precio_ml_actual"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), r.get("ads_pct_sim", 0.0)), axis=1)
+    sim["margen_proyectado_sugerido"] = sim.apply(lambda r: calc_margin_from_ml_price(r["costo_simulado"], r["precio_sugerido_ml"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), r.get("ads_pct_sim", 0.0)), axis=1)
     sim["delta_precio_sugerido_pct"] = np.where(
         sim["precio_ml_actual"].notna() & (sim["precio_ml_actual"] != 0) & sim["precio_sugerido_ml"].notna(),
         ((sim["precio_sugerido_ml"] - sim["precio_ml_actual"]) / sim["precio_ml_actual"]) * 100,
         np.nan
     )
+    sim["gap_margen_obj_pp"] = sim["margen_proyectado_actual"] - margen_obj_ml
+    sim["decision_repricing"] = np.select(
+        [
+            sim["margen_proyectado_actual"].isna(),
+            sim["gap_margen_obj_pp"] <= -5,
+            sim["gap_margen_obj_pp"].between(-5, -1, inclusive="left"),
+            sim["gap_margen_obj_pp"] >= 3,
+        ],
+        [
+            "Sin base suficiente",
+            "Subir precio urgente",
+            "Subir precio / revisar costo",
+            "Hay holgura",
+        ],
+        default="Mantener / monitorear",
+    )
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("SKUs con base ML", fmt_int(len(sim)))
+    k2.metric("Subir urgente", fmt_int((sim["decision_repricing"] == "Subir precio urgente").sum()))
+    k3.metric("Gap margen promedio", "—" if sim["gap_margen_obj_pp"].dropna().empty else f"{sim['gap_margen_obj_pp'].mean():.1f} pp")
+    k4.metric("Δ precio sugerido promedio", "—" if sim["delta_precio_sugerido_pct"].dropna().empty else f"{sim['delta_precio_sugerido_pct'].mean():.1f}%")
 
     sim_show = sim[[
         "sku", "descripcion", "costo_maestra", "costo_simulado", "precio_ml_actual", "precio_sugerido_ml",
-        "delta_precio_sugerido_pct", "accion_sugerida"
+        "fee_total_sim_pct", "ads_pct_sim", "costo_fijo_ml", "margen_proyectado_actual", "margen_proyectado_sugerido",
+        "delta_precio_sugerido_pct", "decision_repricing", "accion_sugerida"
     ]].copy()
-    sim_show.columns = ["SKU", "Descripción", "Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Δ precio sugerido %", "Acción base"]
-    for c in ["Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML"]:
+    sim_show.columns = ["SKU", "Descripción", "Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Fee ML sim %", "Ads sim %", "Costo fijo ML", "Margen proyectado actual", "Margen proyectado sugerido", "Δ precio sugerido %", "Decisión repricing", "Acción base"]
+    for c in ["Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Costo fijo ML"]:
         sim_show[c] = sim_show[c].map(fmt_money)
-    sim_show["Δ precio sugerido %"] = sim_show["Δ precio sugerido %"].map(fmt_pct)
-    st.dataframe(sim_show, use_container_width=True, hide_index=True, height=520)
+    for c in ["Fee ML sim %", "Ads sim %", "Margen proyectado actual", "Margen proyectado sugerido", "Δ precio sugerido %"]:
+        sim_show[c] = sim_show[c].map(fmt_pct)
+    st.dataframe(sim_show.sort_values(["Decisión repricing", "Δ precio sugerido %"], ascending=[True, False]), use_container_width=True, hide_index=True, height=540)
 
 # =========================================================
 # Tab 4 - Promotions
