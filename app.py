@@ -5,7 +5,9 @@ import re
 import json
 import sqlite3
 import hashlib
-from datetime import date, timedelta
+import shutil
+from datetime import date, timedelta, datetime
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -19,6 +21,142 @@ st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide
 # Helpers
 # =========================================================
 DB_PATH = "aurora_control_history.sqlite3"
+BASE_DATA_DIR = Path("data")
+ACTIVE_FILES_DIR = BASE_DATA_DIR / "activos"
+ARCHIVE_FILES_DIR = BASE_DATA_DIR / "historico_archivos"
+
+FILE_SPECS = {
+    "master": {"label": "Maestra de precios", "filename": "maestra.xlsx", "required": True},
+    "ventas": {"label": "Reporte de ventas", "filename": "ventas.xlsx", "required": True},
+    "compras": {"label": "Reporte de compras", "filename": "compras.xlsx", "required": False},
+    "pubs": {"label": "Maestro publicaciones ML", "filename": "publicaciones_ml.xlsx", "required": True},
+    "ads": {"label": "Product Ads", "filename": "product_ads.xlsx", "required": False},
+    "keywords": {"label": "Keywords / Brand Ads", "filename": "keywords.xlsx", "required": False},
+}
+
+
+class StoredUploadedFile:
+    def __init__(self, path: Path, data: bytes, original_name: str | None = None):
+        self.path = Path(path)
+        self._data = data
+        self.name = original_name or self.path.name
+        self.size = len(data)
+
+    def getvalue(self):
+        return self._data
+
+
+def ensure_storage_dirs():
+    ACTIVE_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    for file_key in FILE_SPECS:
+        (ARCHIVE_FILES_DIR / file_key).mkdir(parents=True, exist_ok=True)
+
+
+def active_file_path(file_key: str) -> Path:
+    return ACTIVE_FILES_DIR / FILE_SPECS[file_key]["filename"]
+
+
+def load_active_file(file_key: str):
+    path = active_file_path(file_key)
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    return StoredUploadedFile(path=path, data=data, original_name=path.name)
+
+
+def archive_existing_active_file(file_key: str):
+    active_path = active_file_path(file_key)
+    if not active_path.exists():
+        return None
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    archive_name = f"{active_path.stem}_{ts}{active_path.suffix}"
+    archive_path = ARCHIVE_FILES_DIR / file_key / archive_name
+    shutil.copy2(active_path, archive_path)
+    return archive_path
+
+
+def ensure_source_files_table():
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS source_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            file_key TEXT NOT NULL,
+            active_filename TEXT NOT NULL,
+            archived_filename TEXT,
+            original_filename TEXT,
+            file_sig TEXT,
+            file_size INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def log_source_file_event(file_key: str, active_filename: str, archived_filename=None, original_filename=None, file_sig: str = "", file_size: int = 0):
+    ensure_source_files_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO source_files (created_at, file_key, active_filename, archived_filename, original_filename, file_sig, file_size)
+        VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)
+        """,
+        (file_key, active_filename, archived_filename or "", original_filename or active_filename, file_sig, int(file_size or 0)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_source_file_events():
+    ensure_source_files_table()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return pd.read_sql_query("SELECT * FROM source_files ORDER BY id DESC", conn)
+    finally:
+        conn.close()
+
+
+def persist_uploaded_file(file_key: str, uploaded_file):
+    ensure_storage_dirs()
+    data = uploaded_file.getvalue()
+    active_path = active_file_path(file_key)
+    archived_path = archive_existing_active_file(file_key)
+    active_path.write_bytes(data)
+    stored = StoredUploadedFile(path=active_path, data=data, original_name=getattr(uploaded_file, "name", active_path.name))
+    log_source_file_event(
+        file_key=file_key,
+        active_filename=active_path.name,
+        archived_filename=archived_path.name if archived_path else "",
+        original_filename=getattr(uploaded_file, "name", active_path.name),
+        file_sig=file_signature(stored),
+        file_size=len(data),
+    )
+    return stored
+
+
+def resolve_input_file(file_key: str, uploaded_file=None):
+    if uploaded_file is not None:
+        return persist_uploaded_file(file_key, uploaded_file), "nuevo"
+    active = load_active_file(file_key)
+    if active is not None:
+        return active, "activo"
+    return None, "faltante"
+
+
+def storage_status_df():
+    rows = []
+    for file_key, spec in FILE_SPECS.items():
+        active = load_active_file(file_key)
+        rows.append({
+            "Archivo": spec["label"],
+            "Estado": "Activo" if active is not None else "Faltante",
+            "Nombre": active.path.name if active is not None else "—",
+            "Última versión": datetime.fromtimestamp(active.path.stat().st_mtime).strftime("%d/%m/%Y %H:%M") if active is not None else "—",
+        })
+    return pd.DataFrame(rows)
+
 
 
 def file_signature(uploaded_file) -> str:
@@ -1044,31 +1182,49 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
 # =========================================================
 # UI bootstrap
 # =========================================================
+ensure_storage_dirs()
+ensure_source_files_table()
+
 st.title("Centro de Control Comercial Aurora")
 
+resolved_files = {}
+resolved_sources = {}
+
 with st.sidebar:
-    st.subheader("Archivos")
-    master_up = st.file_uploader("Maestra de precios", type=["xlsx"], key="master")
-    ventas_up = st.file_uploader("Reporte de ventas", type=["xlsx"], key="ventas")
-    compras_up = st.file_uploader("Reporte de compras", type=["xlsx"], key="compras")
-    pubs_up = st.file_uploader("Maestro publicaciones ML", type=["xlsx"], key="pubs")
-    ads_up = st.file_uploader("Product Ads", type=["xlsx"], key="ads")
-    keywords_up = st.file_uploader("Keywords / Brand Ads", type=["xlsx"], key="keywords")
+    st.subheader("Archivos activos")
+    uploaders = {}
+    for file_key, spec in FILE_SPECS.items():
+        uploaders[file_key] = st.file_uploader(spec["label"], type=["xlsx"], key=f"upload_{file_key}")
+
+    if st.button("Recargar desde archivos activos", use_container_width=True):
+        st.rerun()
+
+    for file_key in FILE_SPECS:
+        resolved_files[file_key], resolved_sources[file_key] = resolve_input_file(file_key, uploaders[file_key])
+
+    status_df = storage_status_df()
+    st.caption("La app usa primero el archivo nuevo subido; si no subes nada, reutiliza el archivo activo guardado.")
+    st.dataframe(status_df, use_container_width=True, hide_index=True, height=250)
 
     st.markdown("---")
     default_period = st.selectbox("Periodo de análisis", [30, 90], index=0)
     st.caption("Ventas, patrones y margen histórico se priorizan con este periodo.")
 
-required_missing = []
-if not master_up:
-    required_missing.append("maestra")
-if not ventas_up:
-    required_missing.append("ventas")
-if not pubs_up:
-    required_missing.append("publicaciones ML")
+master_up = resolved_files["master"]
+ventas_up = resolved_files["ventas"]
+compras_up = resolved_files["compras"]
+pubs_up = resolved_files["pubs"]
+ads_up = resolved_files["ads"]
+keywords_up = resolved_files["keywords"]
+
+required_missing = [
+    FILE_SPECS[file_key]["label"]
+    for file_key, spec in FILE_SPECS.items()
+    if spec["required"] and resolved_files[file_key] is None
+]
 
 if required_missing:
-    st.info("Para comenzar sube al menos: maestra, ventas y publicaciones ML.")
+    st.info("Para comenzar deja activos o sube al menos: maestra, ventas y publicaciones ML.")
     st.stop()
 
 combined_sig = "|".join([
@@ -1507,4 +1663,36 @@ with tabs[5]:
     else:
         st.dataframe(runs, use_container_width=True, hide_index=True, height=240)
         st.caption("La primera corrida se interpreta como brecha inicial entre maestra y realidad actual; las siguientes permiten trazabilidad y comparación.")
+
+    st.markdown("### Historial de archivos fuente")
+    source_events = list_source_file_events()
+    if source_events.empty:
+        st.info("Aún no hay reemplazos de archivos registrados.")
+    else:
+        show = source_events.copy()
+        rename_map = {
+            "created_at": "Fecha",
+            "file_key": "Tipo",
+            "active_filename": "Activo",
+            "archived_filename": "Archivado",
+            "original_filename": "Nombre original",
+            "file_sig": "Firma",
+            "file_size": "Tamaño",
+        }
+        show = show.rename(columns=rename_map)
+        show["Tipo"] = show["Tipo"].map(lambda x: FILE_SPECS.get(x, {}).get("label", x))
+        st.dataframe(show[["Fecha", "Tipo", "Activo", "Archivado", "Nombre original", "Tamaño"]], use_container_width=True, hide_index=True, height=260)
+
+with tabs[6]:
+    st.subheader("Descargar maestra actualizada")
+    wb = model["wb"]
+    download_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
+    st.download_button(
+        "Descargar workbook actualizado",
+        data=download_bytes,
+        file_name=f"maestra_actualizada_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    st.caption("Este archivo conserva las hojas originales y reemplaza la maestra / relámpago con el estado actual en memoria.")
 
