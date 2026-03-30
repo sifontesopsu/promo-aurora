@@ -1715,11 +1715,15 @@ with tabs[0]:
         "Mayor brecha precio actual": "brecha_precio_pct",
         "Mayor deterioro margen": "delta_margen_30d_pp",
     }[commercial_sort], ascending=False)
-    commercial_show = commercial[[
+    commercial_required_cols = [
         "sku", "descripcion", "precio_bruto", "precio_ml_base", "precio_ml_oferta", "precio_ml_actual", "brecha_precio_inicial_pct", "brecha_precio_previa_pct", "brecha_precio_pct",
         "monto_sim", "ingreso_estimado_ml", "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "brecha_monto_sim_pct",
         "total_cargo_pct_ml", "costo_fijo_ml", "margen_ml_reportado", "margen_ml_con_ads", "margen_hist_30d", "delta_margen_30d_pp"
-    ]].copy()
+    ]
+    for col in commercial_required_cols:
+        if col not in commercial.columns:
+            commercial[col] = np.nan
+    commercial_show = commercial[commercial_required_cols].copy()
     commercial_show.columns = [
         "SKU", "Descripción", "Precio tienda", "Precio base ML", "Precio oferta ML", "Precio final ML", "Brecha precio inicial %", "Brecha precio previa %", "Brecha precio actual %",
         "Monto simulación", "Ingreso est. ML", "Brecha ingreso inicial %", "Brecha ingreso previa %", "Brecha ingreso actual %",
