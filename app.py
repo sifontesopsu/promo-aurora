@@ -1592,11 +1592,6 @@ model["validations"] = build_validation_layers(model["master"], model["ventas"],
 tabs = st.tabs([
     "Centro de Control Comercial",
     "Ficha de Producto",
-    "Reprecio Masivo",
-    "Promociones",
-    "Relámpago",
-    "Historial",
-    "Descargar",
 ])
 
 # =========================================================
@@ -1948,7 +1943,7 @@ with tabs[1]:
 # =========================================================
 # Tab 3 - Mass repricing
 # =========================================================
-with tabs[2]:
+if False:
     st.subheader("Repricing técnico basado en reportes")
     st.caption("La fuente de verdad para precio, cargos y comisión es el reporte de publicaciones ML. La maestra queda como consolidado de trabajo.")
     x1, x2, x3, x4 = st.columns(4)
@@ -2011,7 +2006,7 @@ with tabs[2]:
 # =========================================================
 # Tab 4 - Promotions
 # =========================================================
-with tabs[3]:
+if False:
     st.subheader("Operador de promociones")
     promos_all = ensure_promos_schema(model.get("promos", pd.DataFrame()))
     if promos_all.empty:
@@ -2103,7 +2098,7 @@ with tabs[3]:
                         st.rerun()
                 edit_promo_dialog()
 
-with tabs[5]:
+if False:
     st.subheader("Historial / snapshots")
     st.write("Los snapshots se guardan automáticamente cuando cambia la carga o cambia el estado consolidado del sistema.")
     runs = list_runs()
@@ -2132,7 +2127,7 @@ with tabs[5]:
         show["Tipo"] = show["Tipo"].map(lambda x: FILE_SPECS.get(x, {}).get("label", x))
         st.dataframe(show[["Fecha", "Tipo", "Activo", "Archivado", "Nombre original", "Tamaño"]], use_container_width=True, hide_index=True, height=260)
 
-with tabs[6]:
+if False:
     st.subheader("Descargar maestra actualizada")
     wb = model["wb"]
     download_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
