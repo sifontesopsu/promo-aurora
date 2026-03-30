@@ -1951,6 +1951,9 @@ with tabs[2]:
 
     sim = action_table.copy()
     sim = sim[sim["precio_ml_actual"].notna()].copy()
+    for col in ["total_cargo_pct_ml", "ads_share_ml_pct", "costo_fijo_ml", "costo_maestra", "precio_ml_actual"]:
+        if col not in sim.columns:
+            sim[col] = np.nan
     sim["costo_simulado"] = sim["costo_maestra"] * (1 + proveedor_alza_pct / 100.0)
     sim["fee_total_sim_pct"] = sim["total_cargo_pct_ml"].fillna(0) + comision_extra_pct
     sim["ads_pct_sim"] = sim["ads_share_ml_pct"].fillna(0) if incluir_ads == "Sí" else 0.0
