@@ -1526,17 +1526,6 @@ current_shared_version = int(current_shared_status.get("version", 0) or 0)
 previous_shared_version = st.session_state.get("seen_shared_version")
 st.session_state["seen_shared_version"] = current_shared_version
 
-if previous_shared_version is not None and current_shared_version != previous_shared_version:
-    st.info(
-        f"Se detectó una actualización compartida (versión {current_shared_version}). "
-        f"Motivo: {current_shared_status.get('reason', 'actualización')}."
-    )
-
-status_cols = st.columns([1.2, 2.2, 1.8])
-status_cols[0].metric("Versión compartida", current_shared_version)
-status_cols[1].caption(f"Última actualización compartida: {current_shared_status.get('updated_at') or '—'}")
-status_cols[2].caption(f"Motivo: {current_shared_status.get('reason') or '—'}")
-
 required_missing = [
     FILE_SPECS[file_key]["label"]
     for file_key, spec in FILE_SPECS.items()
@@ -1556,9 +1545,6 @@ current_state_sig = f"v{shared_status['version']}|{combined_sig}"
 model = build_shared_model(resolved_files)
 action_table = model["action_table"].copy()
 
-st.caption(
-    f"Modo compartido · versión {shared_status['version']} · última actualización: {shared_status['updated_at'] or '—'} · motivo: {shared_status['reason'] or '—'}"
-)
 
 # Auto snapshot deduplicado por estado consolidado
 if master_up and ventas_up and pubs_up and not action_table.empty:
