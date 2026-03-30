@@ -1867,64 +1867,47 @@ with tabs[1]:
             d4.metric("Días publicado", fmt_int(pr["dias_publicado"]))
             st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
 
-        st.markdown("### Historial ampliado del producto")
-        hist_snap = load_snapshot_history_for_sku(sku)
-        if hist_snap.empty:
-            st.info("Aún no hay snapshots suficientes para este SKU.")
-        else:
-            hist_snap = hist_snap.sort_values("run_id", ascending=False).copy()
-            latest_hist = hist_snap.iloc[0]
-            first_hist = hist_snap.iloc[-1]
-            prev_hist = hist_snap.iloc[1] if len(hist_snap) >= 2 else hist_snap.iloc[0]
-            h1, h2, h3, h4 = st.columns(4)
-            h1.metric("Corridas guardadas", fmt_int(len(hist_snap)))
-            h2.metric("Brecha costo inicial", fmt_pct(first_hist.get("brecha_costo_pct")))
-            h3.metric("Brecha costo actual", fmt_pct(row.get("brecha_costo_pct")), "—" if pd.isna(row.get("delta_brecha_costo_vs_inicial_pp")) else f"{row.get('delta_brecha_costo_vs_inicial_pp'):.1f} pp vs inicial")
-            h4.metric("Brecha ingreso actual", fmt_pct(row.get("brecha_monto_sim_pct")), "—" if pd.isna(row.get("delta_brecha_ingreso_vs_inicial_pp")) else f"{row.get('delta_brecha_ingreso_vs_inicial_pp'):.1f} pp vs inicial")
-
-            snap_show = hist_snap[["created_at", "run_id", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "precio_ml_actual", "brecha_precio_pct", "ingreso_estimado_ml", "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "delta_margen_30d_pp", "ventas_ml_30d"]].copy()
-            snap_show.columns = ["Fecha", "Run", "Costo maestra", "Última compra", "Brecha costo %", "Precio ML", "Brecha precio %", "Ingreso est. ML", "Brecha ingreso %", "Margen ML actual", "Margen hist. 30d", "Δ margen pp", "Ventas ML 30d"]
-            for c in ["Costo maestra", "Última compra", "Precio ML", "Ingreso est. ML", "Ventas ML 30d"]:
-                snap_show[c] = snap_show[c].map(fmt_money)
-            for c in ["Brecha costo %", "Brecha precio %", "Brecha ingreso %", "Margen ML actual", "Margen hist. 30d"]:
-                snap_show[c] = snap_show[c].map(fmt_pct)
-            snap_show["Δ margen pp"] = snap_show["Δ margen pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
-            st.dataframe(snap_show, use_container_width=True, hide_index=True, height=260)
-
-        st.markdown("### Timeline del producto")
-        timeline_parts = []
-        if sku in model["purchase_map"]:
-            tmp = model["purchase_map"][sku][["fecha", "proveedor", "cantidad", "precio_unitario"]].copy()
-            tmp["tipo_evento"] = "Compra"
-            tmp["detalle"] = tmp.apply(lambda r: f"{r['proveedor']} · {fmt_int(r['cantidad'])} un · {fmt_money(r['precio_unitario'])}", axis=1)
-            timeline_parts.append(tmp[["fecha", "tipo_evento", "detalle"]])
+        st.markdown("### Historial de ventas")
         sales_sku = model["ventas"][model["ventas"]["sku"] == sku].copy()
-        if not sales_sku.empty:
-            sv = sales_sku[["fecha", "canal", "cantidad", "total_linea", "tipo_cliente"]].copy()
-            sv["tipo_evento"] = "Venta"
-            sv["detalle"] = sv.apply(lambda r: f"{r['canal']} · {r['tipo_cliente']} · {fmt_int(r['cantidad'])} un · {fmt_money(r['total_linea'])}", axis=1)
-            timeline_parts.append(sv[["fecha", "tipo_evento", "detalle"]])
-        promos_sku = model["promos"][model["promos"]["sku"] == sku].copy()
-        if not promos_sku.empty:
-            pp = promos_sku[["fecha_venci", "slot", "precio_b2c", "mlc"]].copy()
-            pp["fecha"] = pp["fecha_venci"]
-            pp["tipo_evento"] = "Promo"
-            pp["detalle"] = pp.apply(lambda r: f"Slot {int(r['slot'])} · {r['mlc']} · vence {fmt_date(r['fecha'])} · {fmt_money(r['precio_b2c'])}", axis=1)
-            timeline_parts.append(pp[["fecha", "tipo_evento", "detalle"]])
-        if not hist_snap.empty:
-            snap_tl = hist_snap[["created_at", "brecha_costo_pct", "brecha_monto_sim_pct", "delta_margen_30d_pp"]].copy()
-            snap_tl["fecha"] = pd.to_datetime(snap_tl["created_at"], errors="coerce")
-            snap_tl["tipo_evento"] = "Snapshot"
-            snap_tl["detalle"] = snap_tl.apply(lambda r: f"Brecha costo {fmt_pct(r['brecha_costo_pct'])} · Brecha ingreso {fmt_pct(r['brecha_monto_sim_pct'])} · Δ margen {('—' if pd.isna(r['delta_margen_30d_pp']) else str(round(r['delta_margen_30d_pp'],1)) + ' pp')}", axis=1)
-            timeline_parts.append(snap_tl[["fecha", "tipo_evento", "detalle"]])
-
-        if timeline_parts:
-            tl = pd.concat(timeline_parts, ignore_index=True).sort_values("fecha", ascending=False)
-            tl["fecha"] = pd.to_datetime(tl["fecha"], errors="coerce").map(fmt_date)
-            tl.columns = ["Fecha", "Tipo", "Detalle"]
-            st.dataframe(tl, use_container_width=True, hide_index=True, height=340)
+        if sales_sku.empty:
+            st.info("No encontré ventas para este SKU.")
         else:
-            st.info("No encontré eventos para armar el timeline.")
+            sales_sku["fecha"] = pd.to_datetime(sales_sku["fecha"], errors="coerce")
+            sales_sku = sales_sku.sort_values("fecha", ascending=False)
+
+            sales_ml = sales_sku[sales_sku["canal"] == "ML"].copy()
+            sales_tienda = sales_sku[sales_sku["canal"] == "TIENDA"].copy()
+
+            hm1, hm2, hm3, hm4 = st.columns(4)
+            hm1.metric("Ventas ML totales", fmt_money(sales_ml["total_linea"].sum()))
+            hm2.metric("Unidades ML", fmt_int(sales_ml["cantidad"].sum()))
+            hm3.metric("Ventas tienda totales", fmt_money(sales_tienda["total_linea"].sum()))
+            hm4.metric("Unidades tienda", fmt_int(sales_tienda["cantidad"].sum()))
+
+            vv1, vv2 = st.columns(2)
+            with vv1:
+                st.markdown("#### Ventas Mercado Libre")
+                if sales_ml.empty:
+                    st.info("No encontré ventas ML para este SKU.")
+                else:
+                    ml_show = sales_ml[["fecha", "tipo_cliente", "cantidad", "precio_unitario", "total_linea", "cliente", "rut"]].copy()
+                    ml_show.columns = ["Fecha", "Tipo cliente", "Cantidad", "Precio unitario", "Total línea", "Cliente", "RUT"]
+                    ml_show["Fecha"] = ml_show["Fecha"].map(fmt_date)
+                    ml_show["Precio unitario"] = ml_show["Precio unitario"].map(fmt_money)
+                    ml_show["Total línea"] = ml_show["Total línea"].map(fmt_money)
+                    st.dataframe(ml_show, use_container_width=True, hide_index=True, height=320)
+
+            with vv2:
+                st.markdown("#### Ventas Tienda")
+                if sales_tienda.empty:
+                    st.info("No encontré ventas tienda para este SKU.")
+                else:
+                    tienda_show = sales_tienda[["fecha", "tipo_cliente", "cantidad", "precio_unitario", "total_linea", "cliente", "rut"]].copy()
+                    tienda_show.columns = ["Fecha", "Tipo cliente", "Cantidad", "Precio unitario", "Total línea", "Cliente", "RUT"]
+                    tienda_show["Fecha"] = tienda_show["Fecha"].map(fmt_date)
+                    tienda_show["Precio unitario"] = tienda_show["Precio unitario"].map(fmt_money)
+                    tienda_show["Total línea"] = tienda_show["Total línea"].map(fmt_money)
+                    st.dataframe(tienda_show, use_container_width=True, hide_index=True, height=320)
 
 # =========================================================
 # Tab 3 - Mass repricing
