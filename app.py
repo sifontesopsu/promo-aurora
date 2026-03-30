@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide")
@@ -118,6 +119,67 @@ def list_source_file_events():
         conn.close()
 
 
+def ensure_app_meta_table():
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def get_app_meta(key: str, default: str = "") -> str:
+    ensure_app_meta_table()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def set_app_meta(key: str, value: str):
+    ensure_app_meta_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO app_meta (key, value, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+        """,
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def bump_shared_version(reason: str = ""):
+    current = int(get_app_meta("shared_version", "0") or "0")
+    new_version = current + 1
+    set_app_meta("shared_version", str(new_version))
+    set_app_meta("shared_reason", reason or "actualización")
+    set_app_meta("shared_updated_at", datetime.now().isoformat(timespec="seconds"))
+    return new_version
+
+
+def get_shared_version() -> int:
+    return int(get_app_meta("shared_version", "0") or "0")
+
+
+def get_shared_status():
+    return {
+        "version": get_shared_version(),
+        "reason": get_app_meta("shared_reason", "inicio"),
+        "updated_at": get_app_meta("shared_updated_at", ""),
+        "last_snapshot_sig": get_app_meta("last_snapshot_sig", ""),
+    }
+
+
 def persist_uploaded_file(file_key: str, uploaded_file):
     ensure_storage_dirs()
     data = uploaded_file.getvalue()
@@ -133,6 +195,7 @@ def persist_uploaded_file(file_key: str, uploaded_file):
         file_sig=file_signature(stored),
         file_size=len(data),
     )
+    bump_shared_version(f"archivo {FILE_SPECS[file_key]['label']} actualizado")
     return stored
 
 
@@ -1179,6 +1242,50 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     }
 
 
+@st.cache_data(show_spinner=False)
+def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None):
+    master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
+    ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ventas_bytes)
+    compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), compras_bytes) if compras_bytes else None
+    pubs_up = StoredUploadedFile(Path(FILE_SPECS["pubs"]["filename"]), pubs_bytes) if pubs_bytes else None
+    ads_up = StoredUploadedFile(Path(FILE_SPECS["ads"]["filename"]), ads_bytes) if ads_bytes else None
+    keywords_up = StoredUploadedFile(Path(FILE_SPECS["keywords"]["filename"]), keywords_bytes) if keywords_bytes else None
+    return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
+
+
+def build_shared_model(resolved_files: dict):
+    return build_model_cached(
+        resolved_files["master"].getvalue() if resolved_files.get("master") else None,
+        resolved_files["ventas"].getvalue() if resolved_files.get("ventas") else None,
+        resolved_files["compras"].getvalue() if resolved_files.get("compras") else None,
+        resolved_files["pubs"].getvalue() if resolved_files.get("pubs") else None,
+        resolved_files["ads"].getvalue() if resolved_files.get("ads") else None,
+        resolved_files["keywords"].getvalue() if resolved_files.get("keywords") else None,
+    )
+
+
+def persist_current_master_workbook(model: dict, note: str = "maestra actualizada desde app"):
+    ensure_storage_dirs()
+    wb = model["wb"]
+    output_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
+    active_path = active_file_path("master")
+    archived_path = archive_existing_active_file("master")
+    active_path.write_bytes(output_bytes)
+    stored = StoredUploadedFile(path=active_path, data=output_bytes, original_name=active_path.name)
+    log_source_file_event(
+        file_key="master",
+        active_filename=active_path.name,
+        archived_filename=archived_path.name if archived_path else "",
+        original_filename=note,
+        file_sig=file_signature(stored),
+        file_size=len(output_bytes),
+    )
+    build_model_cached.clear()
+    load_master_workbook.clear()
+    bump_shared_version(note)
+    return stored
+
+
 # =========================================================
 # UI bootstrap
 # =========================================================
@@ -1210,6 +1317,19 @@ with st.sidebar:
     default_period = st.selectbox("Periodo de análisis", [30, 90], index=0)
     st.caption("Ventas, patrones y margen histórico se priorizan con este periodo.")
 
+    st.markdown("---")
+    auto_refresh = st.checkbox("Auto refresh compartido", value=True)
+    refresh_seconds = st.selectbox("Cada cuántos segundos", [5, 10, 15, 30], index=1)
+    if auto_refresh:
+        components.html(
+            f"""
+            <script>
+            setTimeout(function() {{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});
+            </script>
+            """,
+            height=0,
+        )
+
 master_up = resolved_files["master"]
 ventas_up = resolved_files["ventas"]
 compras_up = resolved_files["compras"]
@@ -1227,17 +1347,18 @@ if required_missing:
     st.info("Para comenzar deja activos o sube al menos: maestra, ventas y publicaciones ML.")
     st.stop()
 
+shared_status = get_shared_status()
 combined_sig = "|".join([
     file_signature(x) if x is not None else ""
     for x in [master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up]
 ])
-
-if st.session_state.get("app_sig") != combined_sig:
-    st.session_state.model = build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
-    st.session_state.app_sig = combined_sig
-
-model = st.session_state.model
+current_state_sig = f"v{shared_status['version']}|{combined_sig}"
+model = build_shared_model(resolved_files)
 action_table = model["action_table"].copy()
+
+st.caption(
+    f"Modo compartido · versión {shared_status['version']} · última actualización: {shared_status['updated_at'] or '—'} · motivo: {shared_status['reason'] or '—'}"
+)
 
 # Auto snapshot deduplicado por estado consolidado
 if master_up and ventas_up and pubs_up and not action_table.empty:
@@ -1255,12 +1376,12 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
         "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
         "delta_margen_30d_pp", "ingresos_ml_30d", "ingresos_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
     ]].rename(columns={"ingresos_ml_30d": "ventas_ml_30d", "ingresos_tienda_30d": "ventas_tienda_30d"})
-    current_payload_sig = payload_signature(payload_df, extra=json.dumps(sigs, sort_keys=True))
-    if st.session_state.get("last_saved_payload_sig") != current_payload_sig:
+    current_payload_sig = payload_signature(payload_df, extra=json.dumps({"sigs": sigs, "state": current_state_sig}, sort_keys=True))
+    if get_app_meta("last_snapshot_sig", "") != current_payload_sig:
         try:
             run_id = save_snapshot_to_db(payload_df, sigs)
-            st.session_state["last_saved_payload_sig"] = current_payload_sig
-            st.session_state["last_run_id"] = run_id
+            set_app_meta("last_snapshot_sig", current_payload_sig)
+            set_app_meta("last_run_id", str(run_id))
         except Exception as e:
             st.warning(f"No pude guardar snapshot automático: {e}")
 
@@ -1606,7 +1727,8 @@ with tabs[3]:
                 if mass_date and not promos.empty:
                     for _, p in promos.iterrows():
                         update_single_promo(model, int(p["master_index"]), int(p["slot"]), p["precio_b2c"], mass_date, p["comentario"])
-                    st.success("Fecha actualizada.")
+                    persist_current_master_workbook(model, "promociones actualizadas masivamente")
+                    st.success("Fecha actualizada y compartida en vivo.")
                     st.rerun()
 
         with right:
@@ -1646,8 +1768,9 @@ with tabs[3]:
                         new_comment = st.text_input("Comentario", value=str(cp["comentario"]) if pd.notna(cp["comentario"]) else "", key="promo_edit_comment_v3")
                     if st.button("Guardar cambios", key="promo_edit_save_v3"):
                         update_single_promo(model, master_index, slot, new_price, new_date, new_comment)
+                        persist_current_master_workbook(model, f"promo {cp['sku']} slot {slot} actualizada")
                         del st.session_state["edit_target_v3"]
-                        st.success("Promoción actualizada.")
+                        st.success("Promoción actualizada y compartida en vivo.")
                         st.rerun()
                     if st.button("Cerrar", key="promo_edit_close_v3"):
                         del st.session_state["edit_target_v3"]
