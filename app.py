@@ -5,14 +5,11 @@ import re
 import json
 import sqlite3
 import hashlib
-import shutil
-from datetime import date, timedelta, datetime
-from pathlib import Path
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 
 st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide")
@@ -22,204 +19,6 @@ st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide
 # Helpers
 # =========================================================
 DB_PATH = "aurora_control_history.sqlite3"
-BASE_DATA_DIR = Path("data")
-ACTIVE_FILES_DIR = BASE_DATA_DIR / "activos"
-ARCHIVE_FILES_DIR = BASE_DATA_DIR / "historico_archivos"
-
-FILE_SPECS = {
-    "master": {"label": "Maestra de precios", "filename": "maestra.xlsx", "required": True},
-    "ventas": {"label": "Reporte de ventas", "filename": "ventas.xlsx", "required": True},
-    "compras": {"label": "Reporte de compras", "filename": "compras.xlsx", "required": False},
-    "pubs": {"label": "Maestro publicaciones ML", "filename": "publicaciones_ml.xlsx", "required": True},
-    "ads": {"label": "Product Ads", "filename": "product_ads.xlsx", "required": False},
-    "keywords": {"label": "Keywords / Brand Ads", "filename": "keywords.xlsx", "required": False},
-}
-
-
-class StoredUploadedFile:
-    def __init__(self, path: Path, data: bytes, original_name: str | None = None):
-        self.path = Path(path)
-        self._data = data
-        self.name = original_name or self.path.name
-        self.size = len(data)
-
-    def getvalue(self):
-        return self._data
-
-
-def ensure_storage_dirs():
-    ACTIVE_FILES_DIR.mkdir(parents=True, exist_ok=True)
-    ARCHIVE_FILES_DIR.mkdir(parents=True, exist_ok=True)
-    for file_key in FILE_SPECS:
-        (ARCHIVE_FILES_DIR / file_key).mkdir(parents=True, exist_ok=True)
-
-
-def active_file_path(file_key: str) -> Path:
-    return ACTIVE_FILES_DIR / FILE_SPECS[file_key]["filename"]
-
-
-def load_active_file(file_key: str):
-    path = active_file_path(file_key)
-    if not path.exists():
-        return None
-    data = path.read_bytes()
-    return StoredUploadedFile(path=path, data=data, original_name=path.name)
-
-
-def archive_existing_active_file(file_key: str):
-    active_path = active_file_path(file_key)
-    if not active_path.exists():
-        return None
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    archive_name = f"{active_path.stem}_{ts}{active_path.suffix}"
-    archive_path = ARCHIVE_FILES_DIR / file_key / archive_name
-    shutil.copy2(active_path, archive_path)
-    return archive_path
-
-
-def ensure_source_files_table():
-    ensure_history_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS source_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            file_key TEXT NOT NULL,
-            active_filename TEXT NOT NULL,
-            archived_filename TEXT,
-            original_filename TEXT,
-            file_sig TEXT,
-            file_size INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def log_source_file_event(file_key: str, active_filename: str, archived_filename=None, original_filename=None, file_sig: str = "", file_size: int = 0):
-    ensure_source_files_table()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT INTO source_files (created_at, file_key, active_filename, archived_filename, original_filename, file_sig, file_size)
-        VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)
-        """,
-        (file_key, active_filename, archived_filename or "", original_filename or active_filename, file_sig, int(file_size or 0)),
-    )
-    conn.commit()
-    conn.close()
-
-
-def list_source_file_events():
-    ensure_source_files_table()
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        return pd.read_sql_query("SELECT * FROM source_files ORDER BY id DESC", conn)
-    finally:
-        conn.close()
-
-
-def ensure_app_meta_table():
-    ensure_history_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def get_app_meta(key: str, default: str = "") -> str:
-    ensure_app_meta_table()
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else default
-    finally:
-        conn.close()
-
-
-def set_app_meta(key: str, value: str):
-    ensure_app_meta_table()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT INTO app_meta (key, value, updated_at)
-        VALUES (?, ?, datetime('now'))
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-        """,
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
-
-def bump_shared_version(reason: str = ""):
-    current = int(get_app_meta("shared_version", "0") or "0")
-    new_version = current + 1
-    set_app_meta("shared_version", str(new_version))
-    set_app_meta("shared_reason", reason or "actualización")
-    set_app_meta("shared_updated_at", datetime.now().isoformat(timespec="seconds"))
-    return new_version
-
-
-def get_shared_version() -> int:
-    return int(get_app_meta("shared_version", "0") or "0")
-
-
-def get_shared_status():
-    return {
-        "version": get_shared_version(),
-        "reason": get_app_meta("shared_reason", "inicio"),
-        "updated_at": get_app_meta("shared_updated_at", ""),
-        "last_snapshot_sig": get_app_meta("last_snapshot_sig", ""),
-    }
-
-
-def persist_uploaded_file(file_key: str, uploaded_file):
-    ensure_storage_dirs()
-    data = uploaded_file.getvalue()
-    active_path = active_file_path(file_key)
-    archived_path = archive_existing_active_file(file_key)
-    active_path.write_bytes(data)
-    stored = StoredUploadedFile(path=active_path, data=data, original_name=getattr(uploaded_file, "name", active_path.name))
-    log_source_file_event(
-        file_key=file_key,
-        active_filename=active_path.name,
-        archived_filename=archived_path.name if archived_path else "",
-        original_filename=getattr(uploaded_file, "name", active_path.name),
-        file_sig=file_signature(stored),
-        file_size=len(data),
-    )
-    bump_shared_version(f"archivo {FILE_SPECS[file_key]['label']} actualizado")
-    return stored
-
-
-def resolve_input_file(file_key: str, uploaded_file=None):
-    if uploaded_file is not None:
-        return persist_uploaded_file(file_key, uploaded_file), "nuevo"
-    active = load_active_file(file_key)
-    if active is not None:
-        return active, "activo"
-    return None, "faltante"
-
-
-def storage_status_df():
-    rows = []
-    for file_key, spec in FILE_SPECS.items():
-        active = load_active_file(file_key)
-        rows.append({
-            "Archivo": spec["label"],
-            "Estado": "Activo" if active is not None else "Faltante",
-            "Nombre": active.path.name if active is not None else "—",
-            "Última versión": datetime.fromtimestamp(active.path.stat().st_mtime).strftime("%d/%m/%Y %H:%M") if active is not None else "—",
-        })
-    return pd.DataFrame(rows)
-
 
 
 def file_signature(uploaded_file) -> str:
@@ -341,6 +140,17 @@ def detect_buyer_type(documento: str) -> str:
     if "BOLETA" in s:
         return "PERSONA"
     return "OTRO"
+
+
+def normalize_publication_status(value) -> str:
+    s = str(value).strip().upper()
+    if not s or s == "NAN":
+        return "SIN STATUS"
+    if "ACTIV" in s:
+        return "ACTIVA"
+    if any(x in s for x in ["PAUS", "INACT", "DESACT", "CERR", "FINALIZ", "SUSPEN"]):
+        return "DESACTIVADA"
+    return s
 
 
 def classify_cost_gap_pct(pct):
@@ -823,8 +633,15 @@ def load_publications(file_bytes: bytes):
         else:
             raw[dst] = np.nan
 
+    if raw["status"].isna().all():
+        for alt in ["status", "STATUS", "Estado", "ESTADO"]:
+            if alt in raw.columns:
+                raw["status"] = raw[alt]
+                break
+
     raw["sku"] = raw["sku"].map(norm_sku)
     raw["mlc"] = raw["mlc"].map(norm_mlc)
+    raw["status"] = raw["status"].apply(normalize_publication_status)
     raw["fecha_creacion"] = pd.to_datetime(raw["fecha_creacion"], errors="coerce", dayfirst=True).dt.normalize()
     for c in ["comision_pct", "cargo_cuotas_pct", "total_cargo_pct", "total_cargo_monto", "costo_fijo", "precio_final", "precio_base",
               "precio_oferta", "ventas_hist_pub", "cantidad_pub", "full_stock", "calidad", "dias_publicado", "ventas_por_dia_pub", "stock_real"]:
@@ -1092,7 +909,7 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
                     "dias_publicado": safe_float(pr["dias_publicado"]),
                     "stock_real": safe_float(pr["stock_real"]),
                     "ventas_por_dia_pub": safe_float(pr["ventas_por_dia_pub"]),
-                    "status_publicacion": pr["status"],
+                    "status_publicacion": normalize_publication_status(pr["status"]),
                     "dimensiones": pr["dimensiones"],
                     "peso_volumetrico_kg": safe_float(pr["peso_volumetrico_kg"]),
                 })
@@ -1242,123 +1059,47 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     }
 
 
-@st.cache_data(show_spinner=False)
-def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None):
-    master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
-    ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ventas_bytes)
-    compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), compras_bytes) if compras_bytes else None
-    pubs_up = StoredUploadedFile(Path(FILE_SPECS["pubs"]["filename"]), pubs_bytes) if pubs_bytes else None
-    ads_up = StoredUploadedFile(Path(FILE_SPECS["ads"]["filename"]), ads_bytes) if ads_bytes else None
-    keywords_up = StoredUploadedFile(Path(FILE_SPECS["keywords"]["filename"]), keywords_bytes) if keywords_bytes else None
-    return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
-
-
-def build_shared_model(resolved_files: dict):
-    return build_model_cached(
-        resolved_files["master"].getvalue() if resolved_files.get("master") else None,
-        resolved_files["ventas"].getvalue() if resolved_files.get("ventas") else None,
-        resolved_files["compras"].getvalue() if resolved_files.get("compras") else None,
-        resolved_files["pubs"].getvalue() if resolved_files.get("pubs") else None,
-        resolved_files["ads"].getvalue() if resolved_files.get("ads") else None,
-        resolved_files["keywords"].getvalue() if resolved_files.get("keywords") else None,
-    )
-
-
-def persist_current_master_workbook(model: dict, note: str = "maestra actualizada desde app"):
-    ensure_storage_dirs()
-    wb = model["wb"]
-    output_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
-    active_path = active_file_path("master")
-    archived_path = archive_existing_active_file("master")
-    active_path.write_bytes(output_bytes)
-    stored = StoredUploadedFile(path=active_path, data=output_bytes, original_name=active_path.name)
-    log_source_file_event(
-        file_key="master",
-        active_filename=active_path.name,
-        archived_filename=archived_path.name if archived_path else "",
-        original_filename=note,
-        file_sig=file_signature(stored),
-        file_size=len(output_bytes),
-    )
-    build_model_cached.clear()
-    load_master_workbook.clear()
-    bump_shared_version(note)
-    return stored
-
-
 # =========================================================
 # UI bootstrap
 # =========================================================
-ensure_storage_dirs()
-ensure_source_files_table()
-
 st.title("Centro de Control Comercial Aurora")
 
-resolved_files = {}
-resolved_sources = {}
-
 with st.sidebar:
-    st.subheader("Archivos activos")
-    uploaders = {}
-    for file_key, spec in FILE_SPECS.items():
-        uploaders[file_key] = st.file_uploader(spec["label"], type=["xlsx"], key=f"upload_{file_key}")
-
-    if st.button("Recargar desde archivos activos", use_container_width=True):
-        st.rerun()
-
-    for file_key in FILE_SPECS:
-        resolved_files[file_key], resolved_sources[file_key] = resolve_input_file(file_key, uploaders[file_key])
-
-    status_df = storage_status_df()
-    st.caption("La app usa primero el archivo nuevo subido; si no subes nada, reutiliza el archivo activo guardado.")
-    st.dataframe(status_df, use_container_width=True, hide_index=True, height=250)
+    st.subheader("Archivos")
+    master_up = st.file_uploader("Maestra de precios", type=["xlsx"], key="master")
+    ventas_up = st.file_uploader("Reporte de ventas", type=["xlsx"], key="ventas")
+    compras_up = st.file_uploader("Reporte de compras", type=["xlsx"], key="compras")
+    pubs_up = st.file_uploader("Maestro publicaciones ML", type=["xlsx"], key="pubs")
+    ads_up = st.file_uploader("Product Ads", type=["xlsx"], key="ads")
+    keywords_up = st.file_uploader("Keywords / Brand Ads", type=["xlsx"], key="keywords")
 
     st.markdown("---")
     default_period = st.selectbox("Periodo de análisis", [30, 90], index=0)
     st.caption("Ventas, patrones y margen histórico se priorizan con este periodo.")
 
-    st.markdown("---")
-    auto_refresh = st.checkbox("Auto refresh compartido", value=True)
-    refresh_seconds = st.selectbox("Cada cuántos segundos", [5, 10, 15, 30], index=1)
-    if auto_refresh:
-        components.html(
-            f"""
-            <script>
-            setTimeout(function() {{ window.parent.location.reload(); }}, {int(refresh_seconds) * 1000});
-            </script>
-            """,
-            height=0,
-        )
-
-master_up = resolved_files["master"]
-ventas_up = resolved_files["ventas"]
-compras_up = resolved_files["compras"]
-pubs_up = resolved_files["pubs"]
-ads_up = resolved_files["ads"]
-keywords_up = resolved_files["keywords"]
-
-required_missing = [
-    FILE_SPECS[file_key]["label"]
-    for file_key, spec in FILE_SPECS.items()
-    if spec["required"] and resolved_files[file_key] is None
-]
+required_missing = []
+if not master_up:
+    required_missing.append("maestra")
+if not ventas_up:
+    required_missing.append("ventas")
+if not pubs_up:
+    required_missing.append("publicaciones ML")
 
 if required_missing:
-    st.info("Para comenzar deja activos o sube al menos: maestra, ventas y publicaciones ML.")
+    st.info("Para comenzar sube al menos: maestra, ventas y publicaciones ML.")
     st.stop()
 
-shared_status = get_shared_status()
 combined_sig = "|".join([
     file_signature(x) if x is not None else ""
     for x in [master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up]
 ])
-current_state_sig = f"v{shared_status['version']}|{combined_sig}"
-model = build_shared_model(resolved_files)
-action_table = model["action_table"].copy()
 
-st.caption(
-    f"Modo compartido · versión {shared_status['version']} · última actualización: {shared_status['updated_at'] or '—'} · motivo: {shared_status['reason'] or '—'}"
-)
+if st.session_state.get("app_sig") != combined_sig:
+    st.session_state.model = build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
+    st.session_state.app_sig = combined_sig
+
+model = st.session_state.model
+action_table = model["action_table"].copy()
 
 # Auto snapshot deduplicado por estado consolidado
 if master_up and ventas_up and pubs_up and not action_table.empty:
@@ -1376,12 +1117,12 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
         "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
         "delta_margen_30d_pp", "ingresos_ml_30d", "ingresos_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
     ]].rename(columns={"ingresos_ml_30d": "ventas_ml_30d", "ingresos_tienda_30d": "ventas_tienda_30d"})
-    current_payload_sig = payload_signature(payload_df, extra=json.dumps({"sigs": sigs, "state": current_state_sig}, sort_keys=True))
-    if get_app_meta("last_snapshot_sig", "") != current_payload_sig:
+    current_payload_sig = payload_signature(payload_df, extra=json.dumps(sigs, sort_keys=True))
+    if st.session_state.get("last_saved_payload_sig") != current_payload_sig:
         try:
             run_id = save_snapshot_to_db(payload_df, sigs)
-            set_app_meta("last_snapshot_sig", current_payload_sig)
-            set_app_meta("last_run_id", str(run_id))
+            st.session_state["last_saved_payload_sig"] = current_payload_sig
+            st.session_state["last_run_id"] = run_id
         except Exception as e:
             st.warning(f"No pude guardar snapshot automático: {e}")
 
@@ -1456,24 +1197,25 @@ with tabs[0]:
     else:
         st.info("No hay productos con esos filtros.")
 
-    st.subheader("Brechas iniciales / actuales entre maestra y última compra")
+    st.subheader("Brecha de costo: maestra de precios vs última compra")
     brechas = action_table[action_table["brecha_costo_pct"].notna()][["sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"]].copy()
-    brechas.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha %", "Estado", "Acción"]
+    brechas.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo %", "Estado", "Acción"]
     brechas["Costo maestra"] = brechas["Costo maestra"].map(fmt_money)
     brechas["Última compra"] = brechas["Última compra"].map(fmt_money)
-    brechas["Brecha %"] = brechas["Brecha %"].map(fmt_pct)
+    brechas["Brecha costo %"] = brechas["Brecha costo %"].map(fmt_pct)
     st.dataframe(brechas.head(50), use_container_width=True, hide_index=True, height=250)
 
-    st.subheader("Brechas comerciales contra Mercado Libre")
-    commercial = action_table[action_table["precio_ml_actual"].notna()][[
-        "sku", "descripcion", "precio_bruto", "precio_ml_actual", "brecha_precio_pct",
-        "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct"
+    st.subheader("Brecha comercial: monto en simulación maestra vs ingreso estimado del reporte ML")
+    commercial = action_table[action_table["ingreso_estimado_ml"].notna()][[
+        "sku", "descripcion", "status_publicacion",
+        "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct",
+        "precio_ml_base", "precio_ml_oferta", "precio_ml_actual"
     ]].copy()
-    commercial.columns = ["SKU", "Descripción", "Precio maestra", "Precio ML", "Brecha precio %", "Monto simulación", "Ingreso est. ML", "Brecha ingreso %"]
-    for c in ["Precio maestra", "Precio ML", "Monto simulación", "Ingreso est. ML"]:
+    commercial.columns = ["SKU", "Descripción", "Status", "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha comercial %", "Precio base ML", "Precio oferta ML", "Precio final ML"]
+    for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Precio final ML"]:
         commercial[c] = commercial[c].map(fmt_money)
-    commercial["Brecha precio %"] = commercial["Brecha precio %"].map(fmt_pct)
-    commercial["Brecha ingreso %"] = commercial["Brecha ingreso %"].map(fmt_pct)
+    commercial["Brecha comercial %"] = commercial["Brecha comercial %"].map(fmt_pct)
+    commercial["Status"] = commercial["Status"].fillna("SIN STATUS").replace("", "SIN STATUS")
     st.dataframe(commercial.head(50), use_container_width=True, hide_index=True, height=250)
 
 # =========================================================
@@ -1524,7 +1266,7 @@ with tabs[1]:
             st.write(f"Margen histórico ML 90d: {fmt_pct(row.get('margen_hist_90d'))}")
             st.write(f"Margen histórico ML total: {fmt_pct(row.get('margen_hist_total'))}")
             st.write(f"Brecha precio ML: {fmt_pct(row.get('brecha_precio_pct'))}")
-            st.write(f"Brecha ingreso ML: {fmt_pct(row.get('brecha_monto_sim_pct'))}")
+            st.write(f"Brecha comercial maestra vs ML: {fmt_pct(row.get('brecha_monto_sim_pct'))}")
         with b:
             st.markdown("#### Tienda")
             st.write(f"Precio bruto tienda: {fmt_money(row.get('precio_bruto'))}")
@@ -1570,7 +1312,7 @@ with tabs[1]:
             c1.metric("Última compra", fmt_date(pr["ultima_fecha_compra"]))
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
-            c4.metric("Brecha inicial / actual", fmt_pct(row["brecha_costo_pct"]))
+            c4.metric("Brecha costo maestra vs última compra", fmt_pct(row["brecha_costo_pct"]))
             hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
@@ -1616,7 +1358,7 @@ with tabs[1]:
             d2.metric("Peso", peso_real)
             d3.metric("Peso volumétrico", f"{safe_float(pr['peso_volumetrico_kg'], np.nan):.2f} kg" if pd.notna(pr["peso_volumetrico_kg"]) else "—")
             d4.metric("Días publicado", fmt_int(pr["dias_publicado"]))
-            st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
+            st.caption(f"Status: {normalize_publication_status(pr['status'])} | Entrega: {pr['entrega']}")
 
         st.markdown("### Timeline del producto")
         timeline_parts = []
@@ -1727,8 +1469,7 @@ with tabs[3]:
                 if mass_date and not promos.empty:
                     for _, p in promos.iterrows():
                         update_single_promo(model, int(p["master_index"]), int(p["slot"]), p["precio_b2c"], mass_date, p["comentario"])
-                    persist_current_master_workbook(model, "promociones actualizadas masivamente")
-                    st.success("Fecha actualizada y compartida en vivo.")
+                    st.success("Fecha actualizada.")
                     st.rerun()
 
         with right:
@@ -1768,9 +1509,8 @@ with tabs[3]:
                         new_comment = st.text_input("Comentario", value=str(cp["comentario"]) if pd.notna(cp["comentario"]) else "", key="promo_edit_comment_v3")
                     if st.button("Guardar cambios", key="promo_edit_save_v3"):
                         update_single_promo(model, master_index, slot, new_price, new_date, new_comment)
-                        persist_current_master_workbook(model, f"promo {cp['sku']} slot {slot} actualizada")
                         del st.session_state["edit_target_v3"]
-                        st.success("Promoción actualizada y compartida en vivo.")
+                        st.success("Promoción actualizada.")
                         st.rerun()
                     if st.button("Cerrar", key="promo_edit_close_v3"):
                         del st.session_state["edit_target_v3"]
@@ -1786,36 +1526,4 @@ with tabs[5]:
     else:
         st.dataframe(runs, use_container_width=True, hide_index=True, height=240)
         st.caption("La primera corrida se interpreta como brecha inicial entre maestra y realidad actual; las siguientes permiten trazabilidad y comparación.")
-
-    st.markdown("### Historial de archivos fuente")
-    source_events = list_source_file_events()
-    if source_events.empty:
-        st.info("Aún no hay reemplazos de archivos registrados.")
-    else:
-        show = source_events.copy()
-        rename_map = {
-            "created_at": "Fecha",
-            "file_key": "Tipo",
-            "active_filename": "Activo",
-            "archived_filename": "Archivado",
-            "original_filename": "Nombre original",
-            "file_sig": "Firma",
-            "file_size": "Tamaño",
-        }
-        show = show.rename(columns=rename_map)
-        show["Tipo"] = show["Tipo"].map(lambda x: FILE_SPECS.get(x, {}).get("label", x))
-        st.dataframe(show[["Fecha", "Tipo", "Activo", "Archivado", "Nombre original", "Tamaño"]], use_container_width=True, hide_index=True, height=260)
-
-with tabs[6]:
-    st.subheader("Descargar maestra actualizada")
-    wb = model["wb"]
-    download_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
-    st.download_button(
-        "Descargar workbook actualizado",
-        data=download_bytes,
-        file_name=f"maestra_actualizada_{date.today().isoformat()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    st.caption("Este archivo conserva las hojas originales y reemplaza la maestra / relámpago con el estado actual en memoria.")
 
