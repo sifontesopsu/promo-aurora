@@ -1634,14 +1634,12 @@ with tabs[0]:
         ]
 
     display = work[[
-        "sku", "descripcion", "estado_general", "brecha_costo_pct", "delta_margen_30d_pp",
-        "ads_flag", "margen_ml_actual", "margen_hist_30d", "ingresos_ml_30d", "accion_sugerida"
+        "sku", "descripcion", "estado_general", "brecha_costo_pct",
+        "ads_flag", "margen_ml_actual", "ingresos_ml_30d", "accion_sugerida"
     ]].copy()
-    display.columns = ["SKU", "Descripción", "Estado", "Δ costo %", "Δ margen pp", "Ads", "Margen ML actual", "Margen hist. 30d", "Ventas ML 30d", "Acción sugerida"]
+    display.columns = ["SKU", "Descripción", "Estado", "Δ costo %", "Ads", "Margen ML actual", "Ventas ML 30d", "Acción sugerida"]
     display["Δ costo %"] = display["Δ costo %"].map(fmt_pct)
-    display["Δ margen pp"] = display["Δ margen pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
     display["Margen ML actual"] = display["Margen ML actual"].map(fmt_pct)
-    display["Margen hist. 30d"] = display["Margen hist. 30d"].map(fmt_pct)
     display["Ventas ML 30d"] = display["Ventas ML 30d"].map(fmt_money)
     display["Ads"] = display["Ads"].map(lambda x: "Sí" if bool(x) else "No")
     st.dataframe(display, use_container_width=True, hide_index=True, height=420)
@@ -1670,7 +1668,7 @@ with tabs[0]:
     b1, b2, b3 = st.columns([1.4, 1.1, 1.1])
     cost_state_filter = b1.multiselect("Estado costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"])
     cost_sort = b2.selectbox("Orden costo", ["Mayor brecha costo", "Menor brecha costo"], key="cost_gap_sort")
-    cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=5000, value=200, step=20, key="cost_gap_limit"))
+    cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=10000, value=200, step=20, key="cost_gap_limit"))
 
     brechas = action_table[action_table["brecha_costo_pct"].notna()].copy()
     if cost_state_filter:
@@ -1690,7 +1688,7 @@ with tabs[0]:
     c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
     commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial", "Menor brecha comercial", "Mayor deterioro margen"], key="commercial_sort")
     only_with_pub = c2.selectbox("Cobertura ML", ["Solo con publicación", "Todos"], key="commercial_pub_filter")
-    commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=5000, value=200, step=20, key="commercial_limit"))
+    commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=10000, value=200, step=20, key="commercial_limit"))
 
     commercial = action_table.copy()
     if only_with_pub == "Solo con publicación":
@@ -1704,8 +1702,8 @@ with tabs[0]:
     commercial = commercial.sort_values(sort_col, ascending=asc)
     commercial_required_cols = [
         "sku", "descripcion", "status_publicacion", "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct",
-        "precio_ml_base", "precio_ml_oferta", "precio_ml_actual", "total_cargo_pct_ml", "costo_fijo_ml",
-        "margen_ml_reportado", "margen_ml_con_ads", "margen_hist_30d", "delta_margen_30d_pp"
+        "precio_ml_base", "precio_ml_oferta", "costo_fijo_ml",
+        "margen_ml_reportado"
     ]
     for col in commercial_required_cols:
         if col not in commercial.columns:
@@ -1713,15 +1711,14 @@ with tabs[0]:
     commercial_show = commercial[commercial_required_cols].copy()
     commercial_show.columns = [
         "SKU", "Descripción", "Status", "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha comercial %",
-        "Precio base ML", "Precio oferta ML", "Precio final ML", "Fee total ML %", "Costo fijo ML",
-        "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d", "Δ margen 30d pp"
+        "Precio base ML", "Precio oferta ML", "Costo fijo ML",
+        "Margen ML reportado"
     ]
     commercial_show["Status"] = commercial_show["Status"].apply(normalize_publication_status)
-    for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Precio final ML", "Costo fijo ML"]:
+    for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Costo fijo ML"]:
         commercial_show[c] = commercial_show[c].map(fmt_money)
-    for c in ["Brecha comercial %", "Fee total ML %", "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d"]:
+    for c in ["Brecha comercial %", "Margen ML reportado"]:
         commercial_show[c] = commercial_show[c].map(fmt_pct)
-    commercial_show["Δ margen 30d pp"] = commercial_show["Δ margen 30d pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
     st.dataframe(commercial_show.head(commercial_limit), use_container_width=True, hide_index=True, height=360)
 
 # =========================================================
@@ -1750,25 +1747,21 @@ with tabs[1]:
             st.metric("Acción sugerida", row["accion_sugerida"])
 
         st.markdown("### Resumen rápido")
-        r1, r2, r3, r4, r5, r6 = st.columns(6)
+        r1, r2, r3, r4 = st.columns(4)
         r1.metric("Ventas ML 30d", fmt_money(row.get("ingresos_ml_30d")), fmt_int(row.get("unidades_ml_30d")) + " un")
         r2.metric("Ventas tienda 30d", fmt_money(row.get("ingresos_tienda_30d")), fmt_int(row.get("unidades_tienda_30d")) + " un")
         r3.metric("Margen ML actual", fmt_pct(row.get("margen_ml_actual")))
-        r4.metric("Margen hist. ML 30d", fmt_pct(row.get("margen_hist_30d")))
-        r5.metric("Δ margen", "—" if pd.isna(row.get("delta_margen_30d_pp")) else f"{row.get('delta_margen_30d_pp'):.1f} pp")
-        r6.metric("Δ costo", fmt_pct(row.get("brecha_costo_pct")))
+        r4.metric("Δ costo", fmt_pct(row.get("brecha_costo_pct")))
 
         st.markdown("### Precios y rentabilidad")
         a, b = st.columns(2)
         with a:
             st.markdown("#### Mercado Libre")
-            st.write(f"Precio ML actual: {fmt_money(row.get('precio_ml_actual'))}")
             st.write(f"Precio base ML: {fmt_money(row.get('precio_ml_base'))}")
             st.write(f"Precio oferta ML: {fmt_money(row.get('precio_ml_oferta'))}")
             st.write(f"Monto en simulación: {fmt_money(row.get('monto_sim'))}")
             st.write(f"Ingreso estimado ML: {fmt_money(row.get('ingreso_estimado_ml'))}")
             st.write(f"Margen ML actual: {fmt_pct(row.get('margen_ml_actual'))}")
-            st.write(f"Margen histórico ML 30d: {fmt_pct(row.get('margen_hist_30d'))}")
             st.write(f"Margen histórico ML 90d: {fmt_pct(row.get('margen_hist_90d'))}")
             st.write(f"Margen histórico ML total: {fmt_pct(row.get('margen_hist_total'))}")
             st.write(f"Brecha precio ML: {fmt_pct(row.get('brecha_precio_pct'))}")
