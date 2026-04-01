@@ -1702,7 +1702,7 @@ with tabs[0]:
     commercial = commercial.sort_values(sort_col, ascending=asc)
     commercial_required_cols = [
         "sku", "descripcion", "status_publicacion", "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct",
-        "precio_ml_base", "precio_ml_oferta", "total_cargo_pct_ml", "costo_fijo_ml",
+        "precio_ml_base", "precio_ml_oferta", "costo_fijo_ml",
         "margen_ml_reportado"
     ]
     for col in commercial_required_cols:
@@ -1711,13 +1711,13 @@ with tabs[0]:
     commercial_show = commercial[commercial_required_cols].copy()
     commercial_show.columns = [
         "SKU", "Descripción", "Status", "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha comercial %",
-        "Precio base ML", "Precio oferta ML", "Fee total ML %", "Costo fijo ML",
+        "Precio base ML", "Precio oferta ML", "Costo fijo ML",
         "Margen ML reportado"
     ]
     commercial_show["Status"] = commercial_show["Status"].apply(normalize_publication_status)
     for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Costo fijo ML"]:
         commercial_show[c] = commercial_show[c].map(fmt_money)
-    for c in ["Brecha comercial %", "Fee total ML %", "Margen ML reportado"]:
+    for c in ["Brecha comercial %", "Margen ML reportado"]:
         commercial_show[c] = commercial_show[c].map(fmt_pct)
     st.dataframe(commercial_show.head(commercial_limit), use_container_width=True, hide_index=True, height=360)
 
