@@ -5,9 +5,7 @@ import re
 import json
 import sqlite3
 import hashlib
-import shutil
-from datetime import date, timedelta, datetime
-from pathlib import Path
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -21,204 +19,6 @@ st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide
 # Helpers
 # =========================================================
 DB_PATH = "aurora_control_history.sqlite3"
-BASE_DATA_DIR = Path("data")
-ACTIVE_FILES_DIR = BASE_DATA_DIR / "activos"
-ARCHIVE_FILES_DIR = BASE_DATA_DIR / "historico_archivos"
-
-FILE_SPECS = {
-    "master": {"label": "Maestra de precios", "filename": "maestra.xlsx", "required": True},
-    "ventas": {"label": "Reporte de ventas", "filename": "ventas.xlsx", "required": True},
-    "compras": {"label": "Reporte de compras", "filename": "compras.xlsx", "required": False},
-    "pubs": {"label": "Maestro publicaciones ML", "filename": "publicaciones_ml.xlsx", "required": True},
-    "ads": {"label": "Product Ads", "filename": "product_ads.xlsx", "required": False},
-    "keywords": {"label": "Keywords / Brand Ads", "filename": "keywords.xlsx", "required": False},
-}
-
-
-class StoredUploadedFile:
-    def __init__(self, path: Path, data: bytes, original_name: str | None = None):
-        self.path = Path(path)
-        self._data = data
-        self.name = original_name or self.path.name
-        self.size = len(data)
-
-    def getvalue(self):
-        return self._data
-
-
-def ensure_storage_dirs():
-    ACTIVE_FILES_DIR.mkdir(parents=True, exist_ok=True)
-    ARCHIVE_FILES_DIR.mkdir(parents=True, exist_ok=True)
-    for file_key in FILE_SPECS:
-        (ARCHIVE_FILES_DIR / file_key).mkdir(parents=True, exist_ok=True)
-
-
-def active_file_path(file_key: str) -> Path:
-    return ACTIVE_FILES_DIR / FILE_SPECS[file_key]["filename"]
-
-
-def load_active_file(file_key: str):
-    path = active_file_path(file_key)
-    if not path.exists():
-        return None
-    data = path.read_bytes()
-    return StoredUploadedFile(path=path, data=data, original_name=path.name)
-
-
-def archive_existing_active_file(file_key: str):
-    active_path = active_file_path(file_key)
-    if not active_path.exists():
-        return None
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    archive_name = f"{active_path.stem}_{ts}{active_path.suffix}"
-    archive_path = ARCHIVE_FILES_DIR / file_key / archive_name
-    shutil.copy2(active_path, archive_path)
-    return archive_path
-
-
-def ensure_source_files_table():
-    ensure_history_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS source_files (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            file_key TEXT NOT NULL,
-            active_filename TEXT NOT NULL,
-            archived_filename TEXT,
-            original_filename TEXT,
-            file_sig TEXT,
-            file_size INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def log_source_file_event(file_key: str, active_filename: str, archived_filename=None, original_filename=None, file_sig: str = "", file_size: int = 0):
-    ensure_source_files_table()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT INTO source_files (created_at, file_key, active_filename, archived_filename, original_filename, file_sig, file_size)
-        VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)
-        """,
-        (file_key, active_filename, archived_filename or "", original_filename or active_filename, file_sig, int(file_size or 0)),
-    )
-    conn.commit()
-    conn.close()
-
-
-def list_source_file_events():
-    ensure_source_files_table()
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        return pd.read_sql_query("SELECT * FROM source_files ORDER BY id DESC", conn)
-    finally:
-        conn.close()
-
-
-def ensure_app_meta_table():
-    ensure_history_db()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT,
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-def get_app_meta(key: str, default: str = "") -> str:
-    ensure_app_meta_table()
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else default
-    finally:
-        conn.close()
-
-
-def set_app_meta(key: str, value: str):
-    ensure_app_meta_table()
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        INSERT INTO app_meta (key, value, updated_at)
-        VALUES (?, ?, datetime('now'))
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
-        """,
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
-
-def bump_shared_version(reason: str = ""):
-    current = int(get_app_meta("shared_version", "0") or "0")
-    new_version = current + 1
-    set_app_meta("shared_version", str(new_version))
-    set_app_meta("shared_reason", reason or "actualización")
-    set_app_meta("shared_updated_at", datetime.now().isoformat(timespec="seconds"))
-    return new_version
-
-
-def get_shared_version() -> int:
-    return int(get_app_meta("shared_version", "0") or "0")
-
-
-def get_shared_status():
-    return {
-        "version": get_shared_version(),
-        "reason": get_app_meta("shared_reason", "inicio"),
-        "updated_at": get_app_meta("shared_updated_at", ""),
-        "last_snapshot_sig": get_app_meta("last_snapshot_sig", ""),
-    }
-
-
-def persist_uploaded_file(file_key: str, uploaded_file):
-    ensure_storage_dirs()
-    data = uploaded_file.getvalue()
-    active_path = active_file_path(file_key)
-    archived_path = archive_existing_active_file(file_key)
-    active_path.write_bytes(data)
-    stored = StoredUploadedFile(path=active_path, data=data, original_name=getattr(uploaded_file, "name", active_path.name))
-    log_source_file_event(
-        file_key=file_key,
-        active_filename=active_path.name,
-        archived_filename=archived_path.name if archived_path else "",
-        original_filename=getattr(uploaded_file, "name", active_path.name),
-        file_sig=file_signature(stored),
-        file_size=len(data),
-    )
-    bump_shared_version(f"archivo {FILE_SPECS[file_key]['label']} actualizado")
-    return stored
-
-
-def resolve_input_file(file_key: str, uploaded_file=None):
-    if uploaded_file is not None:
-        return persist_uploaded_file(file_key, uploaded_file), "nuevo"
-    active = load_active_file(file_key)
-    if active is not None:
-        return active, "activo"
-    return None, "faltante"
-
-
-def storage_status_df():
-    rows = []
-    for file_key, spec in FILE_SPECS.items():
-        active = load_active_file(file_key)
-        rows.append({
-            "Archivo": spec["label"],
-            "Estado": "Activo" if active is not None else "Faltante",
-            "Nombre": active.path.name if active is not None else "—",
-            "Última versión": datetime.fromtimestamp(active.path.stat().st_mtime).strftime("%d/%m/%Y %H:%M") if active is not None else "—",
-        })
-    return pd.DataFrame(rows)
-
 
 
 def file_signature(uploaded_file) -> str:
@@ -340,6 +140,16 @@ def detect_buyer_type(documento: str) -> str:
     if "BOLETA" in s:
         return "PERSONA"
     return "OTRO"
+
+def normalize_publication_status(value) -> str:
+    s = str(value).strip().upper()
+    if not s or s == 'NAN':
+        return 'SIN STATUS'
+    if 'ACTIV' in s or s == 'ACTIVE':
+        return 'ACTIVA'
+    if any(tok in s for tok in ['PAUS', 'INACT', 'DESACT', 'CERR', 'CLOSED', 'FINALIZ', 'SUSPEN']):
+        return 'DESACTIVADA'
+    return s
 
 
 def classify_cost_gap_pct(pct):
@@ -521,185 +331,6 @@ def list_runs():
     finally:
         conn.close()
     return df
-
-
-
-def load_snapshot_history_for_skus(skus):
-    skus = [norm_sku(s) for s in (skus or []) if norm_sku(s)]
-    if not skus:
-        return pd.DataFrame()
-    ensure_history_db()
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        placeholders = ",".join(["?"] * len(skus))
-        query = f"""
-            SELECT sp.*, r.created_at
-            FROM snapshot_producto sp
-            JOIN runs r ON r.id = sp.run_id
-            WHERE sp.sku IN ({placeholders})
-            ORDER BY sp.sku, sp.run_id
-        """
-        return pd.read_sql_query(query, conn, params=skus)
-    finally:
-        conn.close()
-
-
-def load_snapshot_history_for_sku(sku):
-    sku = norm_sku(sku)
-    if not sku:
-        return pd.DataFrame()
-    return load_snapshot_history_for_skus([sku])
-
-
-def enrich_action_table_with_snapshot_history(action_table: pd.DataFrame) -> pd.DataFrame:
-    if action_table is None or action_table.empty:
-        return action_table
-    hist = load_snapshot_history_for_skus(action_table["sku"].dropna().unique().tolist())
-    if hist.empty:
-        out = action_table.copy()
-        for col in [
-            "brecha_costo_inicial_pct", "brecha_costo_previa_pct", "delta_brecha_costo_vs_inicial_pp", "delta_brecha_costo_vs_previa_pp",
-            "brecha_precio_inicial_pct", "brecha_precio_previa_pct", "delta_brecha_precio_vs_inicial_pp", "delta_brecha_precio_vs_previa_pp",
-            "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "delta_brecha_ingreso_vs_inicial_pp", "delta_brecha_ingreso_vs_previa_pp",
-            "runs_count", "primera_corrida", "ultima_corrida_previa"
-        ]:
-            out[col] = np.nan
-        return out
-
-    rows = []
-    for sku, grp in hist.groupby("sku", sort=False):
-        grp = grp.sort_values("run_id")
-        first = grp.iloc[0]
-        prev = grp.iloc[-2] if len(grp) >= 2 else grp.iloc[-1]
-        rows.append({
-            "sku": sku,
-            "brecha_costo_inicial_pct": first.get("brecha_costo_pct"),
-            "brecha_costo_previa_pct": prev.get("brecha_costo_pct"),
-            "brecha_precio_inicial_pct": first.get("brecha_precio_pct"),
-            "brecha_precio_previa_pct": prev.get("brecha_precio_pct"),
-            "brecha_ingreso_inicial_pct": first.get("brecha_monto_sim_pct"),
-            "brecha_ingreso_previa_pct": prev.get("brecha_monto_sim_pct"),
-            "runs_count": len(grp),
-            "primera_corrida": first.get("created_at"),
-            "ultima_corrida_previa": prev.get("created_at"),
-        })
-    base = pd.DataFrame(rows)
-    out = action_table.merge(base, on="sku", how="left")
-    out["delta_brecha_costo_vs_inicial_pp"] = out["brecha_costo_pct"] - out["brecha_costo_inicial_pct"]
-    out["delta_brecha_costo_vs_previa_pp"] = out["brecha_costo_pct"] - out["brecha_costo_previa_pct"]
-    out["delta_brecha_precio_vs_inicial_pp"] = out["brecha_precio_pct"] - out["brecha_precio_inicial_pct"]
-    out["delta_brecha_precio_vs_previa_pp"] = out["brecha_precio_pct"] - out["brecha_precio_previa_pct"]
-    out["delta_brecha_ingreso_vs_inicial_pp"] = out["brecha_monto_sim_pct"] - out["brecha_ingreso_inicial_pct"]
-    out["delta_brecha_ingreso_vs_previa_pp"] = out["brecha_monto_sim_pct"] - out["brecha_ingreso_previa_pct"]
-    return out
-
-
-def build_validation_layers(master, ventas, compras, pubs, product_ads, promos):
-    details = {}
-    summary_rows = []
-
-    def register(name, severity, df, detail):
-        df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
-        details[name] = df
-        summary_rows.append({
-            "Capa": name,
-            "Severidad": severity,
-            "Hallazgos": len(df),
-            "Detalle": detail,
-        })
-
-    master = master.copy() if isinstance(master, pd.DataFrame) else pd.DataFrame()
-    ventas = ventas.copy() if isinstance(ventas, pd.DataFrame) else pd.DataFrame()
-    compras = compras.copy() if isinstance(compras, pd.DataFrame) else pd.DataFrame()
-    pubs = pubs.copy() if isinstance(pubs, pd.DataFrame) else pd.DataFrame()
-    product_ads = product_ads.copy() if isinstance(product_ads, pd.DataFrame) else pd.DataFrame()
-    promos = promos.copy() if isinstance(promos, pd.DataFrame) else pd.DataFrame()
-
-    master_skus = set(master.get("sku", pd.Series(dtype=str)).dropna().astype(str))
-    sales_skus = set(ventas.get("sku", pd.Series(dtype=str)).dropna().astype(str))
-    purchase_skus = set(compras.get("sku", pd.Series(dtype=str)).dropna().astype(str))
-    pub_skus = set(pubs.get("sku", pd.Series(dtype=str)).dropna().astype(str))
-    pub_mlcs = set(pubs.get("mlc", pd.Series(dtype=str)).dropna().astype(str))
-
-    dup_master = master[master.get("sku", pd.Series(dtype=str)).duplicated(keep=False)].sort_values("sku") if not master.empty else pd.DataFrame()
-    register("Maestra duplicada por SKU", "CRÍTICO" if not dup_master.empty else "OK", dup_master[[c for c in ["sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim"] if c in dup_master.columns]], "Un SKU no debería repetirse en la maestra consolidada.")
-
-    missing_core = master[(master.get("costo_maestra").isna()) | (master.get("precio_bruto").isna()) | (master.get("monto_sim").isna())] if not master.empty else pd.DataFrame()
-    register("Maestra incompleta", "ALERTA" if not missing_core.empty else "OK", missing_core[[c for c in ["sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim"] if c in missing_core.columns]], "La maestra debería quedar alimentada por reportes con costo, precio tienda y monto simulación.")
-
-    sales_out = ventas[~ventas.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values(["sku", "fecha"], ascending=[True, False]) if not ventas.empty else pd.DataFrame()
-    register("Ventas fuera de maestra", "CRÍTICO" if not sales_out.empty else "OK", sales_out[[c for c in ["sku", "fecha", "producto", "total_linea", "canal"] if c in sales_out.columns]].drop_duplicates(), "El reporte de ventas está trayendo SKUs que no quedaron absorbidos por la maestra.")
-
-    purchase_out = compras[~compras.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values(["sku", "fecha"], ascending=[True, False]) if not compras.empty else pd.DataFrame()
-    register("Compras fuera de maestra", "ALERTA" if not purchase_out.empty else "OK", purchase_out[[c for c in ["sku", "fecha", "proveedor", "precio_unitario"] if c in purchase_out.columns]].drop_duplicates(), "Hay costos del reporte de compras que no están cayendo a la maestra.")
-
-    pubs_out = pubs[~pubs.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values("sku") if not pubs.empty else pd.DataFrame()
-    register("Publicaciones fuera de maestra", "CRÍTICO" if not pubs_out.empty else "OK", pubs_out[[c for c in ["sku", "mlc", "titulo", "precio_final", "status"] if c in pubs_out.columns]].drop_duplicates(), "Mercado Libre reporta publicaciones cuyo SKU no quedó consolidado en la maestra.")
-
-    master_without_pub = master[~master.get("sku", pd.Series(dtype=str)).isin(pub_skus)].sort_values("sku") if not master.empty else pd.DataFrame()
-    register("Maestra sin publicación ML", "ALERTA" if not master_without_pub.empty else "OK", master_without_pub[[c for c in ["sku", "descripcion", "precio_bruto", "monto_sim"] if c in master_without_pub.columns]], "Hay productos consolidados sin contraparte en el reporte de publicaciones.")
-
-    dup_mlc = pubs[pubs.get("mlc", pd.Series(dtype=str)).duplicated(keep=False)].sort_values("mlc") if not pubs.empty else pd.DataFrame()
-    register("MLC duplicado en reporte", "CRÍTICO" if not dup_mlc.empty else "OK", dup_mlc[[c for c in ["mlc", "sku", "titulo", "status"] if c in dup_mlc.columns]], "Un mismo MLC no debería repetirse en el reporte base.")
-
-    multi_active = pubs[pubs.get("status", pd.Series(dtype=str)).astype(str).str.upper().eq("ACTIVA")].copy() if not pubs.empty else pd.DataFrame()
-    multi_active = multi_active.groupby("sku").filter(lambda g: len(g) > 1) if not multi_active.empty else pd.DataFrame()
-    register("Múltiples publicaciones activas por SKU", "ALERTA" if not multi_active.empty else "OK", multi_active[[c for c in ["sku", "mlc", "titulo", "precio_final", "ventas_hist_pub"] if c in multi_active.columns]], "Puede existir estrategia multilistado, pero se debe revisar porque afecta la publicación principal y el pricing.")
-
-    promo_issues = promos[(promos.get("mlc", pd.Series(dtype=str)).astype(str).str.strip().eq("")) | (pd.isna(promos.get("fecha_venci")))] if not promos.empty else pd.DataFrame()
-    register("Promociones incompletas", "ALERTA" if not promo_issues.empty else "OK", promo_issues[[c for c in ["sku", "slot", "mlc", "precio_b2c", "fecha_venci", "comentario"] if c in promo_issues.columns]], "Las promos deben tener MLC y fecha de vencimiento para ser operables.")
-
-    ads_orphan = product_ads[~product_ads.get("mlc", pd.Series(dtype=str)).isin(pub_mlcs)].sort_values("mlc") if not product_ads.empty else pd.DataFrame()
-    register("Ads sin publicación asociada", "ALERTA" if not ads_orphan.empty else "OK", ads_orphan[[c for c in ["mlc", "campana", "titulo", "inversion_ads", "ingresos_ads"] if c in ads_orphan.columns]], "Product Ads trae publicaciones que hoy no están en el reporte maestro ML.")
-
-    future_purchases = compras[compras.get("fecha", pd.Series(dtype='datetime64[ns]')) > pd.Timestamp(date.today())] if not compras.empty else pd.DataFrame()
-    register("Compras con fecha futura", "ALERTA" if not future_purchases.empty else "OK", future_purchases[[c for c in ["sku", "fecha", "proveedor", "precio_unitario"] if c in future_purchases.columns]], "Hay registros de compras con fecha posterior a hoy.")
-
-    summary = pd.DataFrame(summary_rows)
-    severity_rank = {"CRÍTICO": 3, "ALERTA": 2, "OK": 1}
-    if not summary.empty:
-        summary["_rank"] = summary["Severidad"].map(severity_rank).fillna(0)
-        summary = summary.sort_values(["_rank", "Hallazgos", "Capa"], ascending=[False, False, True]).drop(columns=["_rank"])
-    return {"summary": summary, "details": details}
-
-
-def calc_ml_net_revenue(price, fee_pct, fixed_charge=0.0, ads_pct=0.0):
-    price = safe_float(price, np.nan)
-    fee_pct = safe_float(fee_pct, 0.0)
-    fixed_charge = safe_float(fixed_charge, 0.0)
-    ads_pct = safe_float(ads_pct, 0.0)
-    if np.isnan(price) or price <= 0:
-        return np.nan
-    variable_rate = max(0.0, min(0.95, (fee_pct + ads_pct) / 100.0))
-    revenue_gross = price * (1 - variable_rate) - fixed_charge
-    if revenue_gross <= 0:
-        return np.nan
-    return revenue_gross / 1.19
-
-
-def calc_margin_from_ml_price(cost, price, fee_pct, fixed_charge=0.0, ads_pct=0.0):
-    cost = safe_float(cost, np.nan)
-    net_rev = calc_ml_net_revenue(price, fee_pct, fixed_charge, ads_pct)
-    if np.isnan(cost) or np.isnan(net_rev) or net_rev <= 0:
-        return np.nan
-    return ((net_rev - cost) / net_rev) * 100
-
-
-def calc_price_for_target_ml_margin(cost, fee_pct, fixed_charge=0.0, target_margin_pct=15.0, ads_pct=0.0):
-    cost = safe_float(cost, np.nan)
-    fee_pct = safe_float(fee_pct, 0.0)
-    fixed_charge = safe_float(fixed_charge, 0.0)
-    target_margin_pct = safe_float(target_margin_pct, np.nan)
-    ads_pct = safe_float(ads_pct, 0.0)
-    if np.isnan(cost) or np.isnan(target_margin_pct):
-        return np.nan
-    target = target_margin_pct / 100.0
-    variable_rate = max(0.0, min(0.95, (fee_pct + ads_pct) / 100.0))
-    denominator = 1 - variable_rate
-    if denominator <= 0 or target >= 1:
-        return np.nan
-    required_net_rev = cost / (1 - target)
-    return ((required_net_rev * 1.19) + fixed_charge) / denominator
 
 
 # =========================================================
@@ -1004,6 +635,7 @@ def load_publications(file_bytes: bytes):
     raw["sku"] = raw["sku"].map(norm_sku)
     raw["mlc"] = raw["mlc"].map(norm_mlc)
     raw["fecha_creacion"] = pd.to_datetime(raw["fecha_creacion"], errors="coerce", dayfirst=True).dt.normalize()
+    raw["status"] = raw["status"].apply(normalize_publication_status)
     for c in ["comision_pct", "cargo_cuotas_pct", "total_cargo_pct", "total_cargo_monto", "costo_fijo", "precio_final", "precio_base",
               "precio_oferta", "ventas_hist_pub", "cantidad_pub", "full_stock", "calidad", "dias_publicado", "ventas_por_dia_pub", "stock_real"]:
         raw[c] = raw[c].map(safe_float)
@@ -1273,23 +905,11 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
                     "status_publicacion": pr["status"],
                     "dimensiones": pr["dimensiones"],
                     "peso_volumetrico_kg": safe_float(pr["peso_volumetrico_kg"]),
-                    "comision_pct_ml": safe_float(pr.get("comision_pct", np.nan)),
-                    "cargo_cuotas_pct_ml": safe_float(pr.get("cargo_cuotas_pct", np.nan)),
-                    "total_cargo_pct_ml": safe_float(pr.get("total_cargo_pct", np.nan)),
-                    "total_cargo_monto_ml": safe_float(pr.get("total_cargo_monto", np.nan)),
-                    "costo_fijo_ml": safe_float(pr.get("costo_fijo", np.nan)),
                 })
     pub_primary = pd.DataFrame(pub_primary_rows)
     base = base.merge(pub_primary, on="sku", how="left")
 
-    base["ads_share_ml_pct"] = np.where(
-        base["ingresos_ml_30d"].fillna(0) > 0,
-        (base["ads_inversion"].fillna(0) / base["ingresos_ml_30d"].fillna(0)) * 100,
-        0.0
-    )
     base["margen_ml_actual"] = base.apply(lambda r: calc_margin_from_monto_sim(r["costo_maestra"], r["monto_sim"]), axis=1)
-    base["margen_ml_reportado"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0), axis=1)
-    base["margen_ml_con_ads"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), r.get("ads_share_ml_pct", 0.0)), axis=1)
     base["margen_tienda_actual"] = base.apply(lambda r: calc_margin_from_bruto(r["costo_maestra"], r["precio_bruto"]), axis=1)
     base["brecha_costo_pct"] = np.where(
         base["costo_maestra"].notna() & base["ultimo_costo_compra"].notna() & (base["costo_maestra"] != 0),
@@ -1405,7 +1025,6 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
     action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
-    validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos)
 
     product_options = action_table["sku"].dropna().tolist()
     sku_desc = action_table.set_index("sku")["descripcion"].to_dict()
@@ -1430,121 +1049,50 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
         "pub_map": pub_map,
         "product_options": product_options,
         "sku_desc": sku_desc,
-        "validations": validations,
     }
-
-
-@st.cache_data(show_spinner=False)
-def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None):
-    master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
-    ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ventas_bytes)
-    compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), compras_bytes) if compras_bytes else None
-    pubs_up = StoredUploadedFile(Path(FILE_SPECS["pubs"]["filename"]), pubs_bytes) if pubs_bytes else None
-    ads_up = StoredUploadedFile(Path(FILE_SPECS["ads"]["filename"]), ads_bytes) if ads_bytes else None
-    keywords_up = StoredUploadedFile(Path(FILE_SPECS["keywords"]["filename"]), keywords_bytes) if keywords_bytes else None
-    return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
-
-
-def build_shared_model(resolved_files: dict):
-    return build_model_cached(
-        resolved_files["master"].getvalue() if resolved_files.get("master") else None,
-        resolved_files["ventas"].getvalue() if resolved_files.get("ventas") else None,
-        resolved_files["compras"].getvalue() if resolved_files.get("compras") else None,
-        resolved_files["pubs"].getvalue() if resolved_files.get("pubs") else None,
-        resolved_files["ads"].getvalue() if resolved_files.get("ads") else None,
-        resolved_files["keywords"].getvalue() if resolved_files.get("keywords") else None,
-    )
-
-
-def persist_current_master_workbook(model: dict, note: str = "maestra actualizada desde app"):
-    ensure_storage_dirs()
-    wb = model["wb"]
-    output_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
-    active_path = active_file_path("master")
-    archived_path = archive_existing_active_file("master")
-    active_path.write_bytes(output_bytes)
-    stored = StoredUploadedFile(path=active_path, data=output_bytes, original_name=active_path.name)
-    log_source_file_event(
-        file_key="master",
-        active_filename=active_path.name,
-        archived_filename=archived_path.name if archived_path else "",
-        original_filename=note,
-        file_sig=file_signature(stored),
-        file_size=len(output_bytes),
-    )
-    build_model_cached.clear()
-    load_master_workbook.clear()
-    bump_shared_version(note)
-    return stored
 
 
 # =========================================================
 # UI bootstrap
 # =========================================================
-ensure_storage_dirs()
-ensure_source_files_table()
-
 st.title("Centro de Control Comercial Aurora")
 
-resolved_files = {}
-resolved_sources = {}
-
 with st.sidebar:
-    st.subheader("Archivos activos")
-    uploaders = {}
-    for file_key, spec in FILE_SPECS.items():
-        uploaders[file_key] = st.file_uploader(spec["label"], type=["xlsx"], key=f"upload_{file_key}")
-
-    if st.button("Recargar desde archivos activos", use_container_width=True):
-        st.rerun()
-
-    for file_key in FILE_SPECS:
-        resolved_files[file_key], resolved_sources[file_key] = resolve_input_file(file_key, uploaders[file_key])
-
-    status_df = storage_status_df()
-    st.caption("La app usa primero el archivo nuevo subido; si no subes nada, reutiliza el archivo activo guardado.")
-    st.dataframe(status_df, use_container_width=True, hide_index=True, height=250)
+    st.subheader("Archivos")
+    master_up = st.file_uploader("Maestra de precios", type=["xlsx"], key="master")
+    ventas_up = st.file_uploader("Reporte de ventas", type=["xlsx"], key="ventas")
+    compras_up = st.file_uploader("Reporte de compras", type=["xlsx"], key="compras")
+    pubs_up = st.file_uploader("Maestro publicaciones ML", type=["xlsx"], key="pubs")
+    ads_up = st.file_uploader("Product Ads", type=["xlsx"], key="ads")
+    keywords_up = st.file_uploader("Keywords / Brand Ads", type=["xlsx"], key="keywords")
 
     st.markdown("---")
     default_period = st.selectbox("Periodo de análisis", [30, 90], index=0)
     st.caption("Ventas, patrones y margen histórico se priorizan con este periodo.")
 
-    st.markdown("---")
-    st.caption("Modo compartido sin recarga automática agresiva. Para ver cambios hechos desde otra ventana, usa el botón de actualizar.")
-    if st.button("Actualizar datos compartidos", use_container_width=True):
-        st.rerun()
-
-master_up = resolved_files["master"]
-ventas_up = resolved_files["ventas"]
-compras_up = resolved_files["compras"]
-pubs_up = resolved_files["pubs"]
-ads_up = resolved_files["ads"]
-keywords_up = resolved_files["keywords"]
-
-current_shared_status = get_shared_status()
-current_shared_version = int(current_shared_status.get("version", 0) or 0)
-previous_shared_version = st.session_state.get("seen_shared_version")
-st.session_state["seen_shared_version"] = current_shared_version
-
-required_missing = [
-    FILE_SPECS[file_key]["label"]
-    for file_key, spec in FILE_SPECS.items()
-    if spec["required"] and resolved_files[file_key] is None
-]
+required_missing = []
+if not master_up:
+    required_missing.append("maestra")
+if not ventas_up:
+    required_missing.append("ventas")
+if not pubs_up:
+    required_missing.append("publicaciones ML")
 
 if required_missing:
-    st.info("Para comenzar deja activos o sube al menos: maestra, ventas y publicaciones ML.")
+    st.info("Para comenzar sube al menos: maestra, ventas y publicaciones ML.")
     st.stop()
 
-shared_status = get_shared_status()
 combined_sig = "|".join([
     file_signature(x) if x is not None else ""
     for x in [master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up]
 ])
-current_state_sig = f"v{shared_status['version']}|{combined_sig}"
-model = build_shared_model(resolved_files)
-action_table = model["action_table"].copy()
 
+if st.session_state.get("app_sig") != combined_sig:
+    st.session_state.model = build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
+    st.session_state.app_sig = combined_sig
+
+model = st.session_state.model
+action_table = model["action_table"].copy()
 
 # Auto snapshot deduplicado por estado consolidado
 if master_up and ventas_up and pubs_up and not action_table.empty:
@@ -1562,22 +1110,23 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
         "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
         "delta_margen_30d_pp", "ingresos_ml_30d", "ingresos_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
     ]].rename(columns={"ingresos_ml_30d": "ventas_ml_30d", "ingresos_tienda_30d": "ventas_tienda_30d"})
-    current_payload_sig = payload_signature(payload_df, extra=json.dumps({"sigs": sigs, "state": current_state_sig}, sort_keys=True))
-    if get_app_meta("last_snapshot_sig", "") != current_payload_sig:
+    current_payload_sig = payload_signature(payload_df, extra=json.dumps(sigs, sort_keys=True))
+    if st.session_state.get("last_saved_payload_sig") != current_payload_sig:
         try:
             run_id = save_snapshot_to_db(payload_df, sigs)
-            set_app_meta("last_snapshot_sig", current_payload_sig)
-            set_app_meta("last_run_id", str(run_id))
+            st.session_state["last_saved_payload_sig"] = current_payload_sig
+            st.session_state["last_run_id"] = run_id
         except Exception as e:
             st.warning(f"No pude guardar snapshot automático: {e}")
-
-action_table = enrich_action_table_with_snapshot_history(action_table)
-model["action_table"] = action_table
-model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"])
 
 tabs = st.tabs([
     "Centro de Control Comercial",
     "Ficha de Producto",
+    "Reprecio Masivo",
+    "Promociones",
+    "Relámpago",
+    "Historial",
+    "Descargar",
 ])
 
 # =========================================================
@@ -1641,89 +1190,31 @@ with tabs[0]:
     else:
         st.info("No hay productos con esos filtros.")
 
-    st.subheader("Capas de validación")
-    validations = model.get("validations", {"summary": pd.DataFrame(), "details": {}})
-    summary_df = validations.get("summary", pd.DataFrame())
-    if summary_df.empty:
-        st.info("No encontré hallazgos de validación para la carga actual.")
-    else:
-        st.dataframe(summary_df, use_container_width=True, hide_index=True, height=240)
-        with st.expander("Ver detalle por capa"):
-            for name, detail_df in validations.get("details", {}).items():
-                if detail_df is not None and not detail_df.empty:
-                    st.markdown(f"**{name}**")
-                    st.dataframe(detail_df, use_container_width=True, hide_index=True, height=min(260, 60 + 35 * len(detail_df.head(10))))
-
-    st.subheader("Brechas iniciales / actuales entre maestra y última compra")
-    b1, b2, b3 = st.columns([1.1, 1.1, 1.4])
-    cost_state_filter = b1.multiselect("Estado brecha costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"], key="cost_gap_state_filter")
-    cost_sort = b2.selectbox("Orden costo", ["Mayor brecha actual", "Mayor cambio vs inicial", "Mayor cambio vs previa"], key="cost_gap_sort")
-    cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=5000, value=200, step=20, key="cost_gap_limit"))
-
-    brechas = action_table[action_table["brecha_costo_pct"].notna()].copy()
-    if cost_state_filter:
-        brechas = brechas[brechas["estado_brecha_costo"].isin(cost_state_filter)]
-    sort_col = {
-        "Mayor brecha actual": "brecha_costo_pct",
-        "Mayor cambio vs inicial": "delta_brecha_costo_vs_inicial_pp",
-        "Mayor cambio vs previa": "delta_brecha_costo_vs_previa_pp",
-    }[cost_sort]
-    brechas = brechas.sort_values(sort_col, ascending=False)
-    brechas_show = brechas[[
-        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_inicial_pct", "brecha_costo_previa_pct",
-        "brecha_costo_pct", "delta_brecha_costo_vs_inicial_pp", "delta_brecha_costo_vs_previa_pp", "estado_brecha_costo", "accion_sugerida"
-    ]].copy()
-    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha inicial %", "Brecha previa %", "Brecha actual %", "Δ vs inicial pp", "Δ vs previa pp", "Estado", "Acción"]
-    for c in ["Costo maestra", "Última compra"]:
-        brechas_show[c] = brechas_show[c].map(fmt_money)
-    for c in ["Brecha inicial %", "Brecha previa %", "Brecha actual %"]:
-        brechas_show[c] = brechas_show[c].map(fmt_pct)
-    for c in ["Δ vs inicial pp", "Δ vs previa pp"]:
-        brechas_show[c] = brechas_show[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
-    st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
+    st.subheader("Brecha maestra de precios vs última compra")
+    brechas = action_table[action_table["brecha_costo_pct"].notna()][["sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"]].copy()
+    brechas = brechas.sort_values("brecha_costo_pct", ascending=False)
+    brechas.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo %", "Estado", "Acción"]
+    brechas["Costo maestra"] = brechas["Costo maestra"].map(fmt_money)
+    brechas["Última compra"] = brechas["Última compra"].map(fmt_money)
+    brechas["Brecha costo %"] = brechas["Brecha costo %"].map(fmt_pct)
+    st.dataframe(brechas.head(50), use_container_width=True, hide_index=True, height=250)
 
     st.subheader("Brecha comercial real: monto en simulación maestra vs ingreso estimado del reporte ML")
-    st.caption("La brecha comercial principal se mide contra la fuente de verdad operativa: MONTO EN SIMULACIÓN de la maestra versus INGRESO ESTIMADO del reporte de publicaciones.")
-    c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
-    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial actual", "Mayor deterioro margen", "Mayor fee total ML"], key="commercial_sort")
-    only_with_pub = c2.selectbox("Cobertura ML", ["Solo con publicación", "Todos"], key="commercial_pub_filter")
-    commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=5000, value=200, step=20, key="commercial_limit"))
-
-    commercial = action_table.copy()
-    if only_with_pub == "Solo con publicación":
-        commercial = commercial[commercial["ingreso_estimado_ml"].notna()]
-    commercial = commercial.sort_values({
-        "Mayor brecha comercial actual": "brecha_monto_sim_pct",
-        "Mayor deterioro margen": "delta_margen_30d_pp",
-        "Mayor fee total ML": "total_cargo_pct_ml",
-    }[commercial_sort], ascending=False)
-    commercial_required_cols = [
-        "sku", "descripcion", "status_publicacion", "publicaciones_total", "publicaciones_activas", "publicaciones_no_activas",
-        "monto_sim", "ingreso_estimado_ml", "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "brecha_monto_sim_pct",
-        "delta_brecha_ingreso_vs_inicial_pp", "delta_brecha_ingreso_vs_previa_pp",
-        "precio_ml_base", "precio_ml_oferta", "precio_ml_actual", "total_cargo_pct_ml", "costo_fijo_ml",
-        "margen_ml_reportado", "margen_ml_con_ads", "margen_hist_30d", "delta_margen_30d_pp"
-    ]
-    for col in commercial_required_cols:
-        if col not in commercial.columns:
-            commercial[col] = np.nan
-    commercial_show = commercial[commercial_required_cols].copy()
-    commercial_show.columns = [
-        "SKU", "Descripción", "Status principal", "# publicaciones", "# activas", "# no activas",
-        "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha inicial %", "Brecha previa %", "Brecha actual %",
-        "Δ vs inicial pp", "Δ vs previa pp",
-        "Precio base ML", "Precio oferta ML", "Precio final ML", "Fee total ML %", "Costo fijo ML",
-        "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d", "Δ margen 30d pp"
-    ]
+    commercial = action_table[action_table["ingreso_estimado_ml"].notna()].copy()
+    if "status_publicacion" not in commercial.columns:
+        commercial["status_publicacion"] = np.nan
+    commercial["status_publicacion"] = commercial["status_publicacion"].apply(normalize_publication_status)
+    commercial = commercial[[
+        "sku", "descripcion", "status_publicacion", "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct",
+        "precio_ml_base", "precio_ml_oferta", "precio_ml_actual", "total_cargo_pct_ml", "costo_fijo_ml"
+    ]].copy()
+    commercial = commercial.sort_values("brecha_monto_sim_pct", ascending=False)
+    commercial.columns = ["SKU", "Descripción", "Status", "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha comercial %", "Precio base ML", "Precio oferta ML", "Precio final ML", "Fee total ML %", "Costo fijo ML"]
     for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Precio final ML", "Costo fijo ML"]:
-        commercial_show[c] = commercial_show[c].map(fmt_money)
-    for c in ["Brecha inicial %", "Brecha previa %", "Brecha actual %", "Fee total ML %", "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d"]:
-        commercial_show[c] = commercial_show[c].map(fmt_pct)
-    for c in ["# publicaciones", "# activas", "# no activas"]:
-        commercial_show[c] = commercial_show[c].map(fmt_int)
-    for c in ["Δ vs inicial pp", "Δ vs previa pp", "Δ margen 30d pp"]:
-        commercial_show[c] = commercial_show[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
-    st.dataframe(commercial_show.head(commercial_limit), use_container_width=True, hide_index=True, height=360)
+        commercial[c] = commercial[c].map(fmt_money)
+    for c in ["Brecha comercial %", "Fee total ML %"]:
+        commercial[c] = commercial[c].map(fmt_pct)
+    st.dataframe(commercial.head(50), use_container_width=True, hide_index=True, height=250)
 
 # =========================================================
 # Tab 2 - Product sheet
@@ -1772,8 +1263,7 @@ with tabs[1]:
             st.write(f"Margen histórico ML 30d: {fmt_pct(row.get('margen_hist_30d'))}")
             st.write(f"Margen histórico ML 90d: {fmt_pct(row.get('margen_hist_90d'))}")
             st.write(f"Margen histórico ML total: {fmt_pct(row.get('margen_hist_total'))}")
-            st.write(f"Brecha precio ML: {fmt_pct(row.get('brecha_precio_pct'))}")
-            st.write(f"Brecha comercial real (monto simulación vs ingreso reporte ML): {fmt_pct(row.get('brecha_monto_sim_pct'))}")
+            st.write(f"Brecha comercial maestra vs ML: {fmt_pct(row.get('brecha_monto_sim_pct'))}")
         with b:
             st.markdown("#### Tienda")
             st.write(f"Precio bruto tienda: {fmt_money(row.get('precio_bruto'))}")
@@ -1819,7 +1309,7 @@ with tabs[1]:
             c1.metric("Última compra", fmt_date(pr["ultima_fecha_compra"]))
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
-            c4.metric("Brecha inicial / actual", fmt_pct(row["brecha_costo_pct"]))
+            c4.metric("Brecha costo maestra vs última compra", fmt_pct(row["brecha_costo_pct"]))
             hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
@@ -1865,117 +1355,76 @@ with tabs[1]:
             d2.metric("Peso", peso_real)
             d3.metric("Peso volumétrico", f"{safe_float(pr['peso_volumetrico_kg'], np.nan):.2f} kg" if pd.notna(pr["peso_volumetrico_kg"]) else "—")
             d4.metric("Días publicado", fmt_int(pr["dias_publicado"]))
-            st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
+            st.caption(f"Status: {normalize_publication_status(pr['status'])} | Entrega: {pr['entrega']}")
 
-        st.markdown("### Historial de ventas")
+        st.markdown("### Timeline del producto")
+        timeline_parts = []
+        if sku in model["purchase_map"]:
+            tmp = model["purchase_map"][sku][["fecha", "proveedor", "cantidad", "precio_unitario"]].copy()
+            tmp["tipo_evento"] = "Compra"
+            tmp["detalle"] = tmp.apply(lambda r: f"{r['proveedor']} · {fmt_int(r['cantidad'])} un · {fmt_money(r['precio_unitario'])}", axis=1)
+            timeline_parts.append(tmp[["fecha", "tipo_evento", "detalle"]])
         sales_sku = model["ventas"][model["ventas"]["sku"] == sku].copy()
-        if sales_sku.empty:
-            st.info("No encontré ventas para este SKU.")
+        if not sales_sku.empty:
+            sv = sales_sku[["fecha", "canal", "cantidad", "total_linea", "tipo_cliente"]].copy()
+            sv["tipo_evento"] = "Venta"
+            sv["detalle"] = sv.apply(lambda r: f"{r['canal']} · {r['tipo_cliente']} · {fmt_int(r['cantidad'])} un · {fmt_money(r['total_linea'])}", axis=1)
+            timeline_parts.append(sv[["fecha", "tipo_evento", "detalle"]])
+        promos_sku = model["promos"][model["promos"]["sku"] == sku].copy()
+        if not promos_sku.empty:
+            pp = promos_sku[["fecha_venci", "slot", "precio_b2c", "mlc"]].copy()
+            pp["fecha"] = pp["fecha_venci"]
+            pp["tipo_evento"] = "Promo"
+            pp["detalle"] = pp.apply(lambda r: f"Slot {int(r['slot'])} · {r['mlc']} · vence {fmt_date(r['fecha'])} · {fmt_money(r['precio_b2c'])}", axis=1)
+            timeline_parts.append(pp[["fecha", "tipo_evento", "detalle"]])
+
+        if timeline_parts:
+            tl = pd.concat(timeline_parts, ignore_index=True).sort_values("fecha", ascending=False)
+            tl["fecha"] = tl["fecha"].map(fmt_date)
+            tl.columns = ["Fecha", "Tipo", "Detalle"]
+            st.dataframe(tl, use_container_width=True, hide_index=True, height=320)
         else:
-            sales_sku["fecha"] = pd.to_datetime(sales_sku["fecha"], errors="coerce")
-            sales_sku = sales_sku.sort_values("fecha", ascending=False)
-
-            sales_ml = sales_sku[sales_sku["canal"] == "ML"].copy()
-            sales_tienda = sales_sku[sales_sku["canal"] == "TIENDA"].copy()
-
-            hm1, hm2, hm3, hm4 = st.columns(4)
-            hm1.metric("Ventas ML totales", fmt_money(sales_ml["total_linea"].sum()))
-            hm2.metric("Unidades ML", fmt_int(sales_ml["cantidad"].sum()))
-            hm3.metric("Ventas tienda totales", fmt_money(sales_tienda["total_linea"].sum()))
-            hm4.metric("Unidades tienda", fmt_int(sales_tienda["cantidad"].sum()))
-
-            vv1, vv2 = st.columns(2)
-            with vv1:
-                st.markdown("#### Ventas Mercado Libre")
-                if sales_ml.empty:
-                    st.info("No encontré ventas ML para este SKU.")
-                else:
-                    ml_show = sales_ml[["fecha", "tipo_cliente", "cantidad", "precio_unitario", "total_linea", "cliente", "rut"]].copy()
-                    ml_show.columns = ["Fecha", "Tipo cliente", "Cantidad", "Precio unitario", "Total línea", "Cliente", "RUT"]
-                    ml_show["Fecha"] = ml_show["Fecha"].map(fmt_date)
-                    ml_show["Precio unitario"] = ml_show["Precio unitario"].map(fmt_money)
-                    ml_show["Total línea"] = ml_show["Total línea"].map(fmt_money)
-                    st.dataframe(ml_show, use_container_width=True, hide_index=True, height=320)
-
-            with vv2:
-                st.markdown("#### Ventas Tienda")
-                if sales_tienda.empty:
-                    st.info("No encontré ventas tienda para este SKU.")
-                else:
-                    tienda_show = sales_tienda[["fecha", "tipo_cliente", "cantidad", "precio_unitario", "total_linea", "cliente", "rut"]].copy()
-                    tienda_show.columns = ["Fecha", "Tipo cliente", "Cantidad", "Precio unitario", "Total línea", "Cliente", "RUT"]
-                    tienda_show["Fecha"] = tienda_show["Fecha"].map(fmt_date)
-                    tienda_show["Precio unitario"] = tienda_show["Precio unitario"].map(fmt_money)
-                    tienda_show["Total línea"] = tienda_show["Total línea"].map(fmt_money)
-                    st.dataframe(tienda_show, use_container_width=True, hide_index=True, height=320)
+            st.info("No encontré eventos para armar el timeline.")
 
 # =========================================================
 # Tab 3 - Mass repricing
 # =========================================================
-if False:
-    st.subheader("Repricing técnico basado en reportes")
-    st.caption("La fuente de verdad para precio, cargos y comisión es el reporte de publicaciones ML. La maestra queda como consolidado de trabajo.")
-    x1, x2, x3, x4 = st.columns(4)
+with tabs[2]:
+    st.subheader("Reprecio masivo")
+    x1, x2, x3 = st.columns(3)
     proveedor_alza_pct = x1.number_input("Simular alza proveedor %", min_value=-30.0, max_value=200.0, value=0.0, step=1.0)
-    comision_extra_pct = x2.number_input("Cambio fee ML (pp)", min_value=-20.0, max_value=20.0, value=0.0, step=0.5)
-    margen_obj_ml = x3.number_input("Margen objetivo ML %", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
-    incluir_ads = x4.selectbox("Considerar ads en cálculo", ["Sí", "No"], index=0)
+    comision_extra_pct = x2.number_input("Simular cambio comisión ML (pp)", min_value=-20.0, max_value=20.0, value=0.0, step=0.5)
+    margen_obj_ml = x3.number_input("Margen técnico ML objetivo %", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
 
     sim = action_table.copy()
-    sim = sim[sim["precio_ml_actual"].notna()].copy()
-    for _col in ["total_cargo_pct_ml", "ads_share_ml_pct", "costo_fijo_ml", "costo_maestra", "precio_ml_actual"]:
-        if _col not in sim.columns:
-            sim[_col] = np.nan
     sim["costo_simulado"] = sim["costo_maestra"] * (1 + proveedor_alza_pct / 100.0)
-    sim["fee_total_sim_pct"] = sim["total_cargo_pct_ml"].fillna(0) + comision_extra_pct
-    sim["ads_pct_sim"] = sim["ads_share_ml_pct"].fillna(0) if incluir_ads == "Sí" else 0.0
-    sim["precio_sugerido_ml"] = sim.apply(lambda r: calc_price_for_target_ml_margin(r["costo_simulado"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), margen_obj_ml, r.get("ads_pct_sim", 0.0)), axis=1)
-    sim["margen_proyectado_actual"] = sim.apply(lambda r: calc_margin_from_ml_price(r["costo_simulado"], r["precio_ml_actual"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), r.get("ads_pct_sim", 0.0)), axis=1)
-    sim["margen_proyectado_sugerido"] = sim.apply(lambda r: calc_margin_from_ml_price(r["costo_simulado"], r["precio_sugerido_ml"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), r.get("ads_pct_sim", 0.0)), axis=1)
+    sim["ingreso_simulado_ml"] = sim["ingreso_estimado_ml"] * (1 - comision_extra_pct / 100.0)
+    neto_obj_factor = 1 - (margen_obj_ml / 100.0)
+    sim["precio_sugerido_ml"] = np.where(
+        sim["ingreso_simulado_ml"].notna() & (sim["ingreso_simulado_ml"] > 0),
+        ((sim["costo_simulado"] / neto_obj_factor) * 1.19),
+        np.nan
+    )
     sim["delta_precio_sugerido_pct"] = np.where(
         sim["precio_ml_actual"].notna() & (sim["precio_ml_actual"] != 0) & sim["precio_sugerido_ml"].notna(),
         ((sim["precio_sugerido_ml"] - sim["precio_ml_actual"]) / sim["precio_ml_actual"]) * 100,
         np.nan
     )
-    sim["gap_margen_obj_pp"] = sim["margen_proyectado_actual"] - margen_obj_ml
-    sim["decision_repricing"] = np.select(
-        [
-            sim["margen_proyectado_actual"].isna(),
-            sim["gap_margen_obj_pp"] <= -5,
-            sim["gap_margen_obj_pp"].between(-5, -1, inclusive="left"),
-            sim["gap_margen_obj_pp"] >= 3,
-        ],
-        [
-            "Sin base suficiente",
-            "Subir precio urgente",
-            "Subir precio / revisar costo",
-            "Hay holgura",
-        ],
-        default="Mantener / monitorear",
-    )
-
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("SKUs con base ML", fmt_int(len(sim)))
-    k2.metric("Subir urgente", fmt_int((sim["decision_repricing"] == "Subir precio urgente").sum()))
-    k3.metric("Gap margen promedio", "—" if sim["gap_margen_obj_pp"].dropna().empty else f"{sim['gap_margen_obj_pp'].mean():.1f} pp")
-    k4.metric("Δ precio sugerido promedio", "—" if sim["delta_precio_sugerido_pct"].dropna().empty else f"{sim['delta_precio_sugerido_pct'].mean():.1f}%")
 
     sim_show = sim[[
         "sku", "descripcion", "costo_maestra", "costo_simulado", "precio_ml_actual", "precio_sugerido_ml",
-        "fee_total_sim_pct", "ads_pct_sim", "costo_fijo_ml", "margen_proyectado_actual", "margen_proyectado_sugerido",
-        "delta_precio_sugerido_pct", "decision_repricing", "accion_sugerida"
+        "delta_precio_sugerido_pct", "accion_sugerida"
     ]].copy()
-    sim_show.columns = ["SKU", "Descripción", "Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Fee ML sim %", "Ads sim %", "Costo fijo ML", "Margen proyectado actual", "Margen proyectado sugerido", "Δ precio sugerido %", "Decisión repricing", "Acción base"]
-    for c in ["Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Costo fijo ML"]:
+    sim_show.columns = ["SKU", "Descripción", "Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Δ precio sugerido %", "Acción base"]
+    for c in ["Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML"]:
         sim_show[c] = sim_show[c].map(fmt_money)
-    for c in ["Fee ML sim %", "Ads sim %", "Margen proyectado actual", "Margen proyectado sugerido", "Δ precio sugerido %"]:
-        sim_show[c] = sim_show[c].map(fmt_pct)
-    st.dataframe(sim_show.sort_values(["Decisión repricing", "Δ precio sugerido %"], ascending=[True, False]), use_container_width=True, hide_index=True, height=540)
+    sim_show["Δ precio sugerido %"] = sim_show["Δ precio sugerido %"].map(fmt_pct)
+    st.dataframe(sim_show, use_container_width=True, hide_index=True, height=520)
 
 # =========================================================
 # Tab 4 - Promotions
 # =========================================================
-if False:
+with tabs[3]:
     st.subheader("Operador de promociones")
     promos_all = ensure_promos_schema(model.get("promos", pd.DataFrame()))
     if promos_all.empty:
@@ -2017,8 +1466,7 @@ if False:
                 if mass_date and not promos.empty:
                     for _, p in promos.iterrows():
                         update_single_promo(model, int(p["master_index"]), int(p["slot"]), p["precio_b2c"], mass_date, p["comentario"])
-                    persist_current_master_workbook(model, "promociones actualizadas masivamente")
-                    st.success("Fecha actualizada y compartida en vivo.")
+                    st.success("Fecha actualizada.")
                     st.rerun()
 
         with right:
@@ -2058,16 +1506,15 @@ if False:
                         new_comment = st.text_input("Comentario", value=str(cp["comentario"]) if pd.notna(cp["comentario"]) else "", key="promo_edit_comment_v3")
                     if st.button("Guardar cambios", key="promo_edit_save_v3"):
                         update_single_promo(model, master_index, slot, new_price, new_date, new_comment)
-                        persist_current_master_workbook(model, f"promo {cp['sku']} slot {slot} actualizada")
                         del st.session_state["edit_target_v3"]
-                        st.success("Promoción actualizada y compartida en vivo.")
+                        st.success("Promoción actualizada.")
                         st.rerun()
                     if st.button("Cerrar", key="promo_edit_close_v3"):
                         del st.session_state["edit_target_v3"]
                         st.rerun()
                 edit_promo_dialog()
 
-if False:
+with tabs[5]:
     st.subheader("Historial / snapshots")
     st.write("Los snapshots se guardan automáticamente cuando cambia la carga o cambia el estado consolidado del sistema.")
     runs = list_runs()
@@ -2076,36 +1523,4 @@ if False:
     else:
         st.dataframe(runs, use_container_width=True, hide_index=True, height=240)
         st.caption("La primera corrida se interpreta como brecha inicial entre maestra y realidad actual; las siguientes permiten trazabilidad y comparación.")
-
-    st.markdown("### Historial de archivos fuente")
-    source_events = list_source_file_events()
-    if source_events.empty:
-        st.info("Aún no hay reemplazos de archivos registrados.")
-    else:
-        show = source_events.copy()
-        rename_map = {
-            "created_at": "Fecha",
-            "file_key": "Tipo",
-            "active_filename": "Activo",
-            "archived_filename": "Archivado",
-            "original_filename": "Nombre original",
-            "file_sig": "Firma",
-            "file_size": "Tamaño",
-        }
-        show = show.rename(columns=rename_map)
-        show["Tipo"] = show["Tipo"].map(lambda x: FILE_SPECS.get(x, {}).get("label", x))
-        st.dataframe(show[["Fecha", "Tipo", "Activo", "Archivado", "Nombre original", "Tamaño"]], use_container_width=True, hide_index=True, height=260)
-
-if False:
-    st.subheader("Descargar maestra actualizada")
-    wb = model["wb"]
-    download_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
-    st.download_button(
-        "Descargar workbook actualizado",
-        data=download_bytes,
-        file_name=f"maestra_actualizada_{date.today().isoformat()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-    st.caption("Este archivo conserva las hojas originales y reemplaza la maestra / relámpago con el estado actual en memoria.")
 
