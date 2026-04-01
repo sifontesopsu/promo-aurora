@@ -342,6 +342,17 @@ def detect_buyer_type(documento: str) -> str:
     return "OTRO"
 
 
+def normalize_publication_status(value) -> str:
+    s = str(value).strip().upper()
+    if not s or s == "NAN":
+        return "SIN STATUS"
+    if any(tok in s for tok in ["ACTIVA", "ACTIVE"]):
+        return "ACTIVA"
+    if any(tok in s for tok in ["PAUS", "INACT", "DESACT", "CERR", "CLOSE", "FINALIZ", "SUSPEN"]):
+        return "DESACTIVADA"
+    return s
+
+
 def classify_cost_gap_pct(pct):
     if pd.isna(pct):
         return "SIN DATOS"
@@ -1004,6 +1015,7 @@ def load_publications(file_bytes: bytes):
     raw["sku"] = raw["sku"].map(norm_sku)
     raw["mlc"] = raw["mlc"].map(norm_mlc)
     raw["fecha_creacion"] = pd.to_datetime(raw["fecha_creacion"], errors="coerce", dayfirst=True).dt.normalize()
+    raw["status"] = raw["status"].apply(normalize_publication_status)
     for c in ["comision_pct", "cargo_cuotas_pct", "total_cargo_pct", "total_cargo_monto", "costo_fijo", "precio_final", "precio_base",
               "precio_oferta", "ventas_hist_pub", "cantidad_pub", "full_stock", "calidad", "dias_publicado", "ventas_por_dia_pub", "stock_real"]:
         raw[c] = raw[c].map(safe_float)
@@ -1270,7 +1282,7 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
                     "dias_publicado": safe_float(pr["dias_publicado"]),
                     "stock_real": safe_float(pr["stock_real"]),
                     "ventas_por_dia_pub": safe_float(pr["ventas_por_dia_pub"]),
-                    "status_publicacion": pr["status"],
+                    "status_publicacion": normalize_publication_status(pr.get("status", "")),
                     "dimensiones": pr["dimensiones"],
                     "peso_volumetrico_kg": safe_float(pr["peso_volumetrico_kg"]),
                     "comision_pct_ml": safe_float(pr.get("comision_pct", np.nan)),
@@ -1654,53 +1666,44 @@ with tabs[0]:
                     st.markdown(f"**{name}**")
                     st.dataframe(detail_df, use_container_width=True, hide_index=True, height=min(260, 60 + 35 * len(detail_df.head(10))))
 
-    st.subheader("Brechas iniciales / actuales entre maestra y última compra")
-    b1, b2, b3 = st.columns([1.1, 1.1, 1.4])
-    cost_state_filter = b1.multiselect("Estado brecha costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"], key="cost_gap_state_filter")
-    cost_sort = b2.selectbox("Orden costo", ["Mayor brecha actual", "Mayor cambio vs inicial", "Mayor cambio vs previa"], key="cost_gap_sort")
+    st.subheader("Brecha maestra vs última compra")
+    b1, b2, b3 = st.columns([1.4, 1.1, 1.1])
+    cost_state_filter = b1.multiselect("Estado costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"])
+    cost_sort = b2.selectbox("Orden costo", ["Mayor brecha costo", "Menor brecha costo"], key="cost_gap_sort")
     cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=5000, value=200, step=20, key="cost_gap_limit"))
 
     brechas = action_table[action_table["brecha_costo_pct"].notna()].copy()
     if cost_state_filter:
         brechas = brechas[brechas["estado_brecha_costo"].isin(cost_state_filter)]
-    sort_col = {
-        "Mayor brecha actual": "brecha_costo_pct",
-        "Mayor cambio vs inicial": "delta_brecha_costo_vs_inicial_pp",
-        "Mayor cambio vs previa": "delta_brecha_costo_vs_previa_pp",
-    }[cost_sort]
-    brechas = brechas.sort_values(sort_col, ascending=False)
+    brechas = brechas.sort_values("brecha_costo_pct", ascending=(cost_sort == "Menor brecha costo"))
     brechas_show = brechas[[
-        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_inicial_pct", "brecha_costo_previa_pct",
-        "brecha_costo_pct", "delta_brecha_costo_vs_inicial_pp", "delta_brecha_costo_vs_previa_pp", "estado_brecha_costo", "accion_sugerida"
+        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"
     ]].copy()
-    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha inicial %", "Brecha previa %", "Brecha actual %", "Δ vs inicial pp", "Δ vs previa pp", "Estado", "Acción"]
+    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo %", "Estado", "Acción"]
     for c in ["Costo maestra", "Última compra"]:
         brechas_show[c] = brechas_show[c].map(fmt_money)
-    for c in ["Brecha inicial %", "Brecha previa %", "Brecha actual %"]:
-        brechas_show[c] = brechas_show[c].map(fmt_pct)
-    for c in ["Δ vs inicial pp", "Δ vs previa pp"]:
-        brechas_show[c] = brechas_show[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
+    brechas_show["Brecha costo %"] = brechas_show["Brecha costo %"].map(fmt_pct)
     st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
 
     st.subheader("Brecha comercial real: monto en simulación maestra vs ingreso estimado del reporte ML")
-    st.caption("La brecha comercial principal se mide contra la fuente de verdad operativa: MONTO EN SIMULACIÓN de la maestra versus INGRESO ESTIMADO del reporte de publicaciones.")
+    st.caption("La brecha comercial se mide contra la fuente de verdad operativa: MONTO EN SIMULACIÓN de la maestra versus INGRESO ESTIMADO del reporte de publicaciones.")
     c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
-    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial actual", "Mayor deterioro margen", "Mayor fee total ML"], key="commercial_sort")
+    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial", "Menor brecha comercial", "Mayor deterioro margen"], key="commercial_sort")
     only_with_pub = c2.selectbox("Cobertura ML", ["Solo con publicación", "Todos"], key="commercial_pub_filter")
     commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=5000, value=200, step=20, key="commercial_limit"))
 
     commercial = action_table.copy()
     if only_with_pub == "Solo con publicación":
         commercial = commercial[commercial["ingreso_estimado_ml"].notna()]
-    commercial = commercial.sort_values({
-        "Mayor brecha comercial actual": "brecha_monto_sim_pct",
-        "Mayor deterioro margen": "delta_margen_30d_pp",
-        "Mayor fee total ML": "total_cargo_pct_ml",
-    }[commercial_sort], ascending=False)
+    sort_map = {
+        "Mayor brecha comercial": ("brecha_monto_sim_pct", False),
+        "Menor brecha comercial": ("brecha_monto_sim_pct", True),
+        "Mayor deterioro margen": ("delta_margen_30d_pp", True),
+    }
+    sort_col, asc = sort_map[commercial_sort]
+    commercial = commercial.sort_values(sort_col, ascending=asc)
     commercial_required_cols = [
-        "sku", "descripcion", "status_publicacion", "publicaciones_total", "publicaciones_activas", "publicaciones_no_activas",
-        "monto_sim", "ingreso_estimado_ml", "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "brecha_monto_sim_pct",
-        "delta_brecha_ingreso_vs_inicial_pp", "delta_brecha_ingreso_vs_previa_pp",
+        "sku", "descripcion", "status_publicacion", "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct",
         "precio_ml_base", "precio_ml_oferta", "precio_ml_actual", "total_cargo_pct_ml", "costo_fijo_ml",
         "margen_ml_reportado", "margen_ml_con_ads", "margen_hist_30d", "delta_margen_30d_pp"
     ]
@@ -1709,20 +1712,16 @@ with tabs[0]:
             commercial[col] = np.nan
     commercial_show = commercial[commercial_required_cols].copy()
     commercial_show.columns = [
-        "SKU", "Descripción", "Status principal", "# publicaciones", "# activas", "# no activas",
-        "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha inicial %", "Brecha previa %", "Brecha actual %",
-        "Δ vs inicial pp", "Δ vs previa pp",
+        "SKU", "Descripción", "Status", "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha comercial %",
         "Precio base ML", "Precio oferta ML", "Precio final ML", "Fee total ML %", "Costo fijo ML",
         "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d", "Δ margen 30d pp"
     ]
+    commercial_show["Status"] = commercial_show["Status"].apply(normalize_publication_status)
     for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Precio final ML", "Costo fijo ML"]:
         commercial_show[c] = commercial_show[c].map(fmt_money)
-    for c in ["Brecha inicial %", "Brecha previa %", "Brecha actual %", "Fee total ML %", "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d"]:
+    for c in ["Brecha comercial %", "Fee total ML %", "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d"]:
         commercial_show[c] = commercial_show[c].map(fmt_pct)
-    for c in ["# publicaciones", "# activas", "# no activas"]:
-        commercial_show[c] = commercial_show[c].map(fmt_int)
-    for c in ["Δ vs inicial pp", "Δ vs previa pp", "Δ margen 30d pp"]:
-        commercial_show[c] = commercial_show[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
+    commercial_show["Δ margen 30d pp"] = commercial_show["Δ margen 30d pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
     st.dataframe(commercial_show.head(commercial_limit), use_container_width=True, hide_index=True, height=360)
 
 # =========================================================
@@ -1819,7 +1818,7 @@ with tabs[1]:
             c1.metric("Última compra", fmt_date(pr["ultima_fecha_compra"]))
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
-            c4.metric("Brecha inicial / actual", fmt_pct(row["brecha_costo_pct"]))
+            c4.metric("Brecha costo maestra vs última compra", fmt_pct(row["brecha_costo_pct"]))
             hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
