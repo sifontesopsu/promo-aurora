@@ -342,17 +342,6 @@ def detect_buyer_type(documento: str) -> str:
     return "OTRO"
 
 
-def normalize_publication_status(value) -> str:
-    s = str(value).strip().upper()
-    if not s or s == "NAN":
-        return "SIN STATUS"
-    if any(tok in s for tok in ["ACTIVA", "ACTIVE"]):
-        return "ACTIVA"
-    if any(tok in s for tok in ["PAUS", "INACT", "DESACT", "CERR", "CLOSE", "FINALIZ", "SUSPEN"]):
-        return "DESACTIVADA"
-    return s
-
-
 def classify_cost_gap_pct(pct):
     if pd.isna(pct):
         return "SIN DATOS"
@@ -1015,7 +1004,6 @@ def load_publications(file_bytes: bytes):
     raw["sku"] = raw["sku"].map(norm_sku)
     raw["mlc"] = raw["mlc"].map(norm_mlc)
     raw["fecha_creacion"] = pd.to_datetime(raw["fecha_creacion"], errors="coerce", dayfirst=True).dt.normalize()
-    raw["status"] = raw["status"].apply(normalize_publication_status)
     for c in ["comision_pct", "cargo_cuotas_pct", "total_cargo_pct", "total_cargo_monto", "costo_fijo", "precio_final", "precio_base",
               "precio_oferta", "ventas_hist_pub", "cantidad_pub", "full_stock", "calidad", "dias_publicado", "ventas_por_dia_pub", "stock_real"]:
         raw[c] = raw[c].map(safe_float)
@@ -1282,7 +1270,7 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
                     "dias_publicado": safe_float(pr["dias_publicado"]),
                     "stock_real": safe_float(pr["stock_real"]),
                     "ventas_por_dia_pub": safe_float(pr["ventas_por_dia_pub"]),
-                    "status_publicacion": normalize_publication_status(pr.get("status", "")),
+                    "status_publicacion": pr["status"],
                     "dimensiones": pr["dimensiones"],
                     "peso_volumetrico_kg": safe_float(pr["peso_volumetrico_kg"]),
                     "comision_pct_ml": safe_float(pr.get("comision_pct", np.nan)),
@@ -1303,21 +1291,14 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
     base["margen_ml_reportado"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0), axis=1)
     base["margen_ml_con_ads"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), r.get("ads_share_ml_pct", 0.0)), axis=1)
     base["margen_tienda_actual"] = base.apply(lambda r: calc_margin_from_bruto(r["costo_maestra"], r["precio_bruto"]), axis=1)
-    base["brecha_costo_pct"] = np.where(
-        base["costo_maestra"].notna() & base["ultimo_costo_compra"].notna() & (base["costo_maestra"] != 0),
-        ((base["ultimo_costo_compra"] - base["costo_maestra"]) / base["costo_maestra"]) * 100,
-        np.nan
-    )
-    base["brecha_precio_pct"] = np.where(
-        base["precio_bruto"].notna() & base["precio_ml_actual"].notna() & (base["precio_bruto"] != 0),
-        ((base["precio_ml_actual"] - base["precio_bruto"]) / base["precio_bruto"]) * 100,
-        np.nan
-    )
-    base["brecha_monto_sim_pct"] = np.where(
-        base["monto_sim"].notna() & base["ingreso_estimado_ml"].notna() & (base["monto_sim"] != 0),
-        ((base["ingreso_estimado_ml"] - base["monto_sim"]) / base["monto_sim"]) * 100,
-        np.nan
-    )
+
+    costo_den = pd.to_numeric(base["costo_maestra"], errors="coerce").replace(0, np.nan)
+    precio_den = pd.to_numeric(base["precio_bruto"], errors="coerce").replace(0, np.nan)
+    monto_den = pd.to_numeric(base["monto_sim"], errors="coerce").replace(0, np.nan)
+
+    base["brecha_costo_pct"] = ((pd.to_numeric(base["ultimo_costo_compra"], errors="coerce") - costo_den) / costo_den) * 100
+    base["brecha_precio_pct"] = ((pd.to_numeric(base["precio_ml_actual"], errors="coerce") - precio_den) / precio_den) * 100
+    base["brecha_monto_sim_pct"] = ((pd.to_numeric(base["ingreso_estimado_ml"], errors="coerce") - monto_den) / monto_den) * 100
     base["delta_margen_30d_pp"] = base["margen_ml_actual"] - base["margen_hist_30d"]
     base["estado_brecha_costo"] = base["brecha_costo_pct"].apply(classify_cost_gap_pct)
     base["estado_margen"] = base["delta_margen_30d_pp"].apply(classify_margin_delta_pp)
@@ -1634,12 +1615,14 @@ with tabs[0]:
         ]
 
     display = work[[
-        "sku", "descripcion", "estado_general", "brecha_costo_pct",
-        "ads_flag", "margen_ml_actual", "ingresos_ml_30d", "accion_sugerida"
+        "sku", "descripcion", "estado_general", "brecha_costo_pct", "delta_margen_30d_pp",
+        "ads_flag", "margen_ml_actual", "margen_hist_30d", "ingresos_ml_30d", "accion_sugerida"
     ]].copy()
-    display.columns = ["SKU", "Descripción", "Estado", "Δ costo %", "Ads", "Margen ML actual", "Ventas ML 30d", "Acción sugerida"]
+    display.columns = ["SKU", "Descripción", "Estado", "Δ costo %", "Δ margen pp", "Ads", "Margen ML actual", "Margen hist. 30d", "Ventas ML 30d", "Acción sugerida"]
     display["Δ costo %"] = display["Δ costo %"].map(fmt_pct)
+    display["Δ margen pp"] = display["Δ margen pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
     display["Margen ML actual"] = display["Margen ML actual"].map(fmt_pct)
+    display["Margen hist. 30d"] = display["Margen hist. 30d"].map(fmt_pct)
     display["Ventas ML 30d"] = display["Ventas ML 30d"].map(fmt_money)
     display["Ads"] = display["Ads"].map(lambda x: "Sí" if bool(x) else "No")
     st.dataframe(display, use_container_width=True, hide_index=True, height=420)
@@ -1664,61 +1647,75 @@ with tabs[0]:
                     st.markdown(f"**{name}**")
                     st.dataframe(detail_df, use_container_width=True, hide_index=True, height=min(260, 60 + 35 * len(detail_df.head(10))))
 
-    st.subheader("Brecha maestra vs última compra")
-    b1, b2, b3 = st.columns([1.4, 1.1, 1.1])
-    cost_state_filter = b1.multiselect("Estado costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"])
-    cost_sort = b2.selectbox("Orden costo", ["Mayor brecha costo", "Menor brecha costo"], key="cost_gap_sort")
-    cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=10000, value=200, step=20, key="cost_gap_limit"))
+    st.subheader("Brechas iniciales / actuales entre maestra y última compra")
+    b1, b2, b3 = st.columns([1.1, 1.1, 1.4])
+    cost_state_filter = b1.multiselect("Estado brecha costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"], key="cost_gap_state_filter")
+    cost_sort = b2.selectbox("Orden costo", ["Mayor brecha actual", "Mayor cambio vs inicial", "Mayor cambio vs previa"], key="cost_gap_sort")
+    cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=5000, value=200, step=20, key="cost_gap_limit"))
 
     brechas = action_table[action_table["brecha_costo_pct"].notna()].copy()
     if cost_state_filter:
         brechas = brechas[brechas["estado_brecha_costo"].isin(cost_state_filter)]
-    brechas = brechas.sort_values("brecha_costo_pct", ascending=(cost_sort == "Menor brecha costo"))
+    sort_col = {
+        "Mayor brecha actual": "brecha_costo_pct",
+        "Mayor cambio vs inicial": "delta_brecha_costo_vs_inicial_pp",
+        "Mayor cambio vs previa": "delta_brecha_costo_vs_previa_pp",
+    }[cost_sort]
+    brechas = brechas.sort_values(sort_col, ascending=False)
     brechas_show = brechas[[
-        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"
+        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_inicial_pct", "brecha_costo_previa_pct",
+        "brecha_costo_pct", "delta_brecha_costo_vs_inicial_pp", "delta_brecha_costo_vs_previa_pp", "estado_brecha_costo", "accion_sugerida"
     ]].copy()
-    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo %", "Estado", "Acción"]
+    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha inicial %", "Brecha previa %", "Brecha actual %", "Δ vs inicial pp", "Δ vs previa pp", "Estado", "Acción"]
     for c in ["Costo maestra", "Última compra"]:
         brechas_show[c] = brechas_show[c].map(fmt_money)
-    brechas_show["Brecha costo %"] = brechas_show["Brecha costo %"].map(fmt_pct)
+    for c in ["Brecha inicial %", "Brecha previa %", "Brecha actual %"]:
+        brechas_show[c] = brechas_show[c].map(fmt_pct)
+    for c in ["Δ vs inicial pp", "Δ vs previa pp"]:
+        brechas_show[c] = brechas_show[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
     st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
 
     st.subheader("Brecha comercial real: monto en simulación maestra vs ingreso estimado del reporte ML")
-    st.caption("La brecha comercial se mide contra la fuente de verdad operativa: MONTO EN SIMULACIÓN de la maestra versus INGRESO ESTIMADO del reporte de publicaciones.")
+    st.caption("La brecha comercial principal se mide contra la fuente de verdad operativa: MONTO EN SIMULACIÓN de la maestra versus INGRESO ESTIMADO del reporte de publicaciones.")
     c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
-    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial", "Menor brecha comercial", "Mayor deterioro margen"], key="commercial_sort")
+    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial actual", "Mayor deterioro margen", "Mayor fee total ML"], key="commercial_sort")
     only_with_pub = c2.selectbox("Cobertura ML", ["Solo con publicación", "Todos"], key="commercial_pub_filter")
-    commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=10000, value=200, step=20, key="commercial_limit"))
+    commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=5000, value=200, step=20, key="commercial_limit"))
 
     commercial = action_table.copy()
     if only_with_pub == "Solo con publicación":
         commercial = commercial[commercial["ingreso_estimado_ml"].notna()]
-    sort_map = {
-        "Mayor brecha comercial": ("brecha_monto_sim_pct", False),
-        "Menor brecha comercial": ("brecha_monto_sim_pct", True),
-        "Mayor deterioro margen": ("delta_margen_30d_pp", True),
-    }
-    sort_col, asc = sort_map[commercial_sort]
-    commercial = commercial.sort_values(sort_col, ascending=asc)
+    commercial = commercial.sort_values({
+        "Mayor brecha comercial actual": "brecha_monto_sim_pct",
+        "Mayor deterioro margen": "delta_margen_30d_pp",
+        "Mayor fee total ML": "total_cargo_pct_ml",
+    }[commercial_sort], ascending=False)
     commercial_required_cols = [
-        "sku", "descripcion", "status_publicacion", "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct",
-        "precio_ml_base", "precio_ml_oferta", "costo_fijo_ml",
-        "margen_ml_reportado"
+        "sku", "descripcion", "status_publicacion", "publicaciones_total", "publicaciones_activas", "publicaciones_no_activas",
+        "monto_sim", "ingreso_estimado_ml", "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "brecha_monto_sim_pct",
+        "delta_brecha_ingreso_vs_inicial_pp", "delta_brecha_ingreso_vs_previa_pp",
+        "precio_ml_base", "precio_ml_oferta", "precio_ml_actual", "total_cargo_pct_ml", "costo_fijo_ml",
+        "margen_ml_reportado", "margen_ml_con_ads", "margen_hist_30d", "delta_margen_30d_pp"
     ]
     for col in commercial_required_cols:
         if col not in commercial.columns:
             commercial[col] = np.nan
     commercial_show = commercial[commercial_required_cols].copy()
     commercial_show.columns = [
-        "SKU", "Descripción", "Status", "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha comercial %",
-        "Precio base ML", "Precio oferta ML", "Costo fijo ML",
-        "Margen ML reportado"
+        "SKU", "Descripción", "Status principal", "# publicaciones", "# activas", "# no activas",
+        "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha inicial %", "Brecha previa %", "Brecha actual %",
+        "Δ vs inicial pp", "Δ vs previa pp",
+        "Precio base ML", "Precio oferta ML", "Precio final ML", "Fee total ML %", "Costo fijo ML",
+        "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d", "Δ margen 30d pp"
     ]
-    commercial_show["Status"] = commercial_show["Status"].apply(normalize_publication_status)
-    for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Costo fijo ML"]:
+    for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Precio final ML", "Costo fijo ML"]:
         commercial_show[c] = commercial_show[c].map(fmt_money)
-    for c in ["Brecha comercial %", "Margen ML reportado"]:
+    for c in ["Brecha inicial %", "Brecha previa %", "Brecha actual %", "Fee total ML %", "Margen ML reportado", "Margen ML con ads", "Margen hist. 30d"]:
         commercial_show[c] = commercial_show[c].map(fmt_pct)
+    for c in ["# publicaciones", "# activas", "# no activas"]:
+        commercial_show[c] = commercial_show[c].map(fmt_int)
+    for c in ["Δ vs inicial pp", "Δ vs previa pp", "Δ margen 30d pp"]:
+        commercial_show[c] = commercial_show[c].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
     st.dataframe(commercial_show.head(commercial_limit), use_container_width=True, hide_index=True, height=360)
 
 # =========================================================
@@ -1747,21 +1744,25 @@ with tabs[1]:
             st.metric("Acción sugerida", row["accion_sugerida"])
 
         st.markdown("### Resumen rápido")
-        r1, r2, r3, r4 = st.columns(4)
+        r1, r2, r3, r4, r5, r6 = st.columns(6)
         r1.metric("Ventas ML 30d", fmt_money(row.get("ingresos_ml_30d")), fmt_int(row.get("unidades_ml_30d")) + " un")
         r2.metric("Ventas tienda 30d", fmt_money(row.get("ingresos_tienda_30d")), fmt_int(row.get("unidades_tienda_30d")) + " un")
         r3.metric("Margen ML actual", fmt_pct(row.get("margen_ml_actual")))
-        r4.metric("Δ costo", fmt_pct(row.get("brecha_costo_pct")))
+        r4.metric("Margen hist. ML 30d", fmt_pct(row.get("margen_hist_30d")))
+        r5.metric("Δ margen", "—" if pd.isna(row.get("delta_margen_30d_pp")) else f"{row.get('delta_margen_30d_pp'):.1f} pp")
+        r6.metric("Δ costo", fmt_pct(row.get("brecha_costo_pct")))
 
         st.markdown("### Precios y rentabilidad")
         a, b = st.columns(2)
         with a:
             st.markdown("#### Mercado Libre")
+            st.write(f"Precio ML actual: {fmt_money(row.get('precio_ml_actual'))}")
             st.write(f"Precio base ML: {fmt_money(row.get('precio_ml_base'))}")
             st.write(f"Precio oferta ML: {fmt_money(row.get('precio_ml_oferta'))}")
             st.write(f"Monto en simulación: {fmt_money(row.get('monto_sim'))}")
             st.write(f"Ingreso estimado ML: {fmt_money(row.get('ingreso_estimado_ml'))}")
             st.write(f"Margen ML actual: {fmt_pct(row.get('margen_ml_actual'))}")
+            st.write(f"Margen histórico ML 30d: {fmt_pct(row.get('margen_hist_30d'))}")
             st.write(f"Margen histórico ML 90d: {fmt_pct(row.get('margen_hist_90d'))}")
             st.write(f"Margen histórico ML total: {fmt_pct(row.get('margen_hist_total'))}")
             st.write(f"Brecha precio ML: {fmt_pct(row.get('brecha_precio_pct'))}")
@@ -1811,7 +1812,7 @@ with tabs[1]:
             c1.metric("Última compra", fmt_date(pr["ultima_fecha_compra"]))
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
-            c4.metric("Brecha costo maestra vs última compra", fmt_pct(row["brecha_costo_pct"]))
+            c4.metric("Brecha inicial / actual", fmt_pct(row["brecha_costo_pct"]))
             hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
