@@ -2051,8 +2051,7 @@ with tabs[1]:
             st.write(f"Ventas tienda 30d: {fmt_money(row.get('ingresos_tienda_30d'))}")
             st.write(f"Ventas tienda 90d: {fmt_money(model['sales_windows'].get(90, pd.DataFrame()).set_index('sku').get('ingresos_tienda_90d', pd.Series()).get(sku, np.nan) if not model['sales_windows'].get(90, pd.DataFrame()).empty else np.nan)}")
 
-        st.caption("Build ads limpio v1")
-        st.markdown("### Ads")
+        st.markdown("### Ads (sin tabla maestra)")
         ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
         if ads_detail.empty:
             st.info("No encontré Product Ads asociados a las publicaciones de este SKU.")
