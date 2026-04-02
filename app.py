@@ -1720,10 +1720,10 @@ with tabs[0]:
     }[cost_sort]
     brechas = brechas.sort_values(sort_col, ascending=False, na_position="last")
     brechas_show = brechas[[
-        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"
+        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_clp", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"
     ]].copy()
-    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo %", "Estado", "Acción"]
-    for c in ["Costo maestra", "Última compra"]:
+    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo ($)", "Brecha costo %", "Estado", "Acción"]
+    for c in ["Costo maestra", "Última compra", "Brecha costo ($)"]:
         brechas_show[c] = brechas_show[c].map(fmt_money)
     brechas_show["Brecha costo %"] = brechas_show["Brecha costo %"].map(fmt_pct)
     st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
@@ -1795,7 +1795,7 @@ with tabs[1]:
         r3.metric("Margen ML actual", fmt_pct(row.get("margen_ml_actual")))
         r4.metric("Margen hist. ML 30d", fmt_pct(row.get("margen_hist_30d")))
         r5.metric("Δ margen", "—" if pd.isna(row.get("delta_margen_30d_pp")) else f"{row.get('delta_margen_30d_pp'):.1f} pp")
-        r6.metric("Δ costo", fmt_pct(row.get("brecha_costo_pct")))
+        r6.metric("Brecha costo ($)", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
 
         st.markdown("### Precios y rentabilidad")
         a, b = st.columns(2)
@@ -1857,11 +1857,7 @@ with tabs[1]:
             c1.metric("Última compra", fmt_date(pr["ultima_fecha_compra"]))
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
-            c4.metric(
-                "Brecha maestra vs última compra ($)",
-                fmt_money(row.get("brecha_costo_clp")),
-                delta=fmt_pct(row.get("brecha_costo_pct"))
-            )
+            c4.metric("Brecha maestra vs última compra", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
             hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
