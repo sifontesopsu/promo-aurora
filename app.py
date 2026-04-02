@@ -280,6 +280,16 @@ def norm_mlc(value) -> str:
         s = f"MLC{s}"
     return s
 
+def normalize_mlc_list(values) -> list[str]:
+    out = []
+    seen = set()
+    for v in (values or []):
+        mlc = norm_mlc(v)
+        if mlc and mlc not in seen:
+            seen.add(mlc)
+            out.append(mlc)
+    return out
+
 
 def to_date_only(value):
     if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -386,6 +396,26 @@ def classify_margin_delta_pp(delta_pp):
         return "MEJORA"
     return "ESTABLE"
 
+def classify_margin_health(margin_con_ads, delta_pp=np.nan):
+    margin_con_ads = safe_float(margin_con_ads, np.nan)
+    delta_pp = safe_float(delta_pp, np.nan)
+    if pd.notna(margin_con_ads):
+        if margin_con_ads < 0:
+            return "CRÍTICO"
+        if margin_con_ads < 8:
+            return "ALERTA"
+        if margin_con_ads >= 20 and (pd.isna(delta_pp) or delta_pp >= 0):
+            return "MEJORA"
+    if pd.isna(delta_pp):
+        return "SIN HISTÓRICO"
+    if delta_pp <= -8:
+        return "CRÍTICO"
+    if delta_pp <= -3:
+        return "ALERTA"
+    if delta_pp >= 3:
+        return "MEJORA"
+    return "ESTABLE"
+
 
 def parse_dimensions(dim_str):
     out = {
@@ -445,22 +475,120 @@ def choose_primary_publication(df):
     return tmp.iloc[0]
 
 
-def format_mlc_list(values) -> str:
-    if not isinstance(values, list) or not values:
+def full_flag_to_text(value) -> str:
+    x = safe_float(value, np.nan)
+    if pd.notna(x):
+        return "FULL" if x > 0 else "No FULL"
+    s = str(value).strip().upper()
+    if s in ("", "NAN", "NONE"):
         return "—"
-    cleaned = []
-    for v in values:
-        s = str(v).strip().upper().replace(" ", "")
-        if not s or s == "NAN":
-            continue
-        s = re.sub(r"\.0$", "", s)
-        if s.isdigit():
-            s = f"MLC{s}"
-        elif s.startswith("MLC") and s[3:].isdigit():
-            s = f"MLC{s[3:]}"
-        cleaned.append(s)
-    cleaned = list(dict.fromkeys(cleaned))
-    return ", ".join(cleaned) if cleaned else "—"
+    if s in ("TRUE", "SI", "SÍ", "YES", "FULL"):
+        return "FULL"
+    return "No FULL"
+
+
+def summarize_publication_mix(pub_df: pd.DataFrame) -> dict:
+    if pub_df is None or pub_df.empty:
+        return {
+            "cantidad_mlcs": 0,
+            "mlcs_activos": 0,
+            "mlcs_full": 0,
+            "mlcs_no_full": 0,
+            "mix_logistico": "—",
+            "categorias_activas_txt": "—",
+            "mlcs_activos_txt": "—",
+        }
+    tmp = pub_df.copy()
+    tmp["status_txt"] = tmp.get("status", pd.Series(index=tmp.index, dtype=object)).astype(str).str.upper().str.strip()
+    tmp["full_txt"] = tmp.get("full_stock", pd.Series(index=tmp.index, dtype=float)).apply(full_flag_to_text)
+    activos = tmp[tmp["status_txt"].eq("ACTIVA")].copy()
+    full_count = int((tmp["full_txt"] == "FULL").sum())
+    no_full_count = int((tmp["full_txt"] == "No FULL").sum())
+    if full_count > 0 and no_full_count > 0:
+        mix = "Mixto"
+    elif full_count > 0:
+        mix = "Solo FULL"
+    elif no_full_count > 0:
+        mix = "Solo No FULL"
+    else:
+        mix = "—"
+    categorias_activas = sorted(set(activos.get("categoria_nombre", pd.Series(dtype=object)).dropna().astype(str).str.strip()))
+    mlcs_activos = sorted(set(activos.get("mlc", pd.Series(dtype=object)).dropna().astype(str).str.strip()))
+    return {
+        "cantidad_mlcs": int(tmp.get("mlc", pd.Series(dtype=object)).dropna().astype(str).str.strip().ne("").sum()),
+        "mlcs_activos": int(len(mlcs_activos)),
+        "mlcs_full": full_count,
+        "mlcs_no_full": no_full_count,
+        "mix_logistico": mix,
+        "categorias_activas_txt": ", ".join(categorias_activas) if categorias_activas else "—",
+        "mlcs_activos_txt": ", ".join(mlcs_activos) if mlcs_activos else "—",
+    }
+
+
+def build_publication_detail_df(pub_df: pd.DataFrame, costo_maestra, product_ads: pd.DataFrame | None = None) -> pd.DataFrame:
+    base_cols = [
+        "mlc", "status", "full_txt", "categoria_nombre", "titulo", "precio_final", "precio_base", "precio_oferta",
+        "comision_pct", "cargo_cuotas_pct", "total_cargo_pct", "total_cargo_monto", "costo_fijo", "ingreso_estimado_ml",
+        "margen_pub_sin_ads", "margen_pub_con_ads", "ads_inversion_mlc", "ingresos_ads_mlc", "ads_acos_mlc", "ads_roas_mlc",
+        "ventas_hist_pub", "ventas_por_dia_pub", "stock_real", "dias_publicado", "entrega"
+    ]
+    if pub_df is None or pub_df.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    detail = pub_df.copy()
+    required_defaults = {
+        "mlc": "", "status": "", "full_stock": np.nan, "categoria_nombre": "", "titulo": "", "precio_final": np.nan,
+        "precio_base": np.nan, "precio_oferta": np.nan, "comision_pct": np.nan, "cargo_cuotas_pct": np.nan,
+        "total_cargo_pct": np.nan, "total_cargo_monto": np.nan, "costo_fijo": np.nan, "ingreso_estimado_ml": np.nan,
+        "ventas_hist_pub": np.nan, "ventas_por_dia_pub": np.nan, "stock_real": np.nan, "dias_publicado": np.nan, "entrega": ""
+    }
+    for col, default in required_defaults.items():
+        if col not in detail.columns:
+            detail[col] = default
+
+    detail["full_txt"] = detail["full_stock"].apply(full_flag_to_text)
+
+    if product_ads is not None and isinstance(product_ads, pd.DataFrame) and not product_ads.empty and "mlc" in product_ads.columns:
+        ads = product_ads.copy()
+        for c in ["inversion_ads", "ingresos_ads", "acos", "roas", "ventas_ads"]:
+            if c not in ads.columns:
+                ads[c] = np.nan
+        ads_mlc = ads.groupby("mlc", dropna=False).agg(
+            ads_inversion_mlc=("inversion_ads", "sum"),
+            ingresos_ads_mlc=("ingresos_ads", "sum"),
+            ventas_ads_mlc=("ventas_ads", "sum"),
+        ).reset_index()
+        detail = detail.merge(ads_mlc, on="mlc", how="left")
+    else:
+        detail["ads_inversion_mlc"] = np.nan
+        detail["ingresos_ads_mlc"] = np.nan
+        detail["ventas_ads_mlc"] = np.nan
+
+    for c in ["ads_inversion_mlc", "ingresos_ads_mlc", "ventas_ads_mlc"]:
+        if c not in detail.columns:
+            detail[c] = np.nan
+
+    detail["ads_acos_mlc"] = np.where(
+        detail["ingresos_ads_mlc"].fillna(0) > 0,
+        detail["ads_inversion_mlc"].fillna(0) / detail["ingresos_ads_mlc"].fillna(0) * 100,
+        np.nan
+    )
+    detail["ads_roas_mlc"] = np.where(
+        detail["ads_inversion_mlc"].fillna(0) > 0,
+        detail["ingresos_ads_mlc"].fillna(0) / detail["ads_inversion_mlc"].fillna(0),
+        np.nan
+    )
+    detail["margen_pub_sin_ads"] = detail.apply(
+        lambda r: calc_margin_from_ml_price(costo_maestra, r.get("precio_final"), r.get("total_cargo_pct"), r.get("costo_fijo"), 0.0), axis=1
+    )
+    detail["margen_pub_con_ads"] = detail.apply(
+        lambda r: calc_margin_from_ml_price(costo_maestra, r.get("precio_final"), r.get("total_cargo_pct"), r.get("costo_fijo"), safe_float(r.get("ads_acos_mlc"), 0.0)), axis=1
+    )
+
+    order_cols = [c for c in base_cols if c in detail.columns]
+    detail = detail[order_cols].copy()
+    detail = detail.sort_values(["status", "ventas_hist_pub", "mlc"], ascending=[True, False, True], na_position="last")
+    return detail
 
 
 def build_ads_report_detail_for_sku(sku: str, product_ads: pd.DataFrame | None, publications: pd.DataFrame | None) -> pd.DataFrame:
@@ -493,6 +621,74 @@ def build_ads_report_detail_for_sku(sku: str, product_ads: pd.DataFrame | None, 
     ads = ads[base_cols].copy()
     ads = ads.sort_values(["inversion_ads", "ingresos_ads", "campana", "mlc"], ascending=[False, False, True, True], na_position="last")
     return ads
+
+
+def build_promos_ads_table_for_sku(sku: str, promos_df: pd.DataFrame | None, product_ads: pd.DataFrame | None, publications: pd.DataFrame | None) -> pd.DataFrame:
+    base_cols = ["slot", "mlc", "campana_ads", "precio_b2c", "fecha_venci", "comentario"]
+    promos_sku = pd.DataFrame(columns=base_cols)
+    if isinstance(promos_df, pd.DataFrame) and not promos_df.empty:
+        promos_sku = promos_df[promos_df.get("sku", pd.Series(dtype=str)) == sku].copy()
+        for col in base_cols:
+            if col not in promos_sku.columns:
+                promos_sku[col] = np.nan if col not in ["campana_ads", "comentario", "mlc"] else ""
+        promos_sku = promos_sku[base_cols].copy()
+
+    ads_detail = build_ads_report_detail_for_sku(sku, product_ads, publications)
+    ads_map = {}
+    if isinstance(ads_detail, pd.DataFrame) and not ads_detail.empty:
+        tmp = ads_detail.copy()
+        tmp["campana"] = tmp["campana"].fillna("").astype(str).str.strip()
+        tmp["mlc"] = tmp["mlc"].astype(str).str.replace(r"\.0$", "", regex=True)
+        tmp = tmp[tmp["campana"] != ""]
+        if not tmp.empty:
+            ads_map = tmp.groupby("mlc")["campana"].apply(lambda s: " | ".join(dict.fromkeys([x for x in s.tolist() if x]))).to_dict()
+
+    if promos_sku.empty:
+        pubs_sku = pd.DataFrame(columns=["mlc"])
+        if isinstance(publications, pd.DataFrame) and not publications.empty:
+            pubs_sku = publications[publications.get("sku", pd.Series(dtype=str)) == sku][["mlc"]].drop_duplicates().copy()
+        mlcs = []
+        if isinstance(pubs_sku, pd.DataFrame) and not pubs_sku.empty:
+            mlcs.extend([
+                str(x).replace('.0', '').strip()
+                for x in pubs_sku["mlc"].dropna().astype(str).tolist()
+                if str(x).strip()
+            ])
+        mlcs.extend(list(ads_map.keys()))
+        mlcs = list(dict.fromkeys(mlcs))
+        if mlcs:
+            promos_sku = pd.DataFrame({
+                "slot": [""] * len(mlcs),
+                "mlc": mlcs,
+                "campana_ads": [ads_map.get(mlc, "") for mlc in mlcs],
+                "precio_b2c": [np.nan] * len(mlcs),
+                "fecha_venci": [pd.NaT] * len(mlcs),
+                "comentario": [""] * len(mlcs),
+            })
+        else:
+            return pd.DataFrame(columns=base_cols)
+    else:
+        promos_sku["mlc"] = promos_sku["mlc"].astype(str).str.replace(r"\.0$", "", regex=True)
+        # La campaña debe venir solo del reporte Ads, no de la maestra.
+        promos_sku["campana_ads"] = promos_sku["mlc"].map(ads_map).fillna("")
+        missing_mlcs = [mlc for mlc in ads_map.keys() if mlc not in promos_sku["mlc"].tolist()]
+        if missing_mlcs:
+            extra = pd.DataFrame({
+                "slot": [""] * len(missing_mlcs),
+                "mlc": missing_mlcs,
+                "campana_ads": [ads_map.get(mlc, "") for mlc in missing_mlcs],
+                "precio_b2c": [np.nan] * len(missing_mlcs),
+                "fecha_venci": [pd.NaT] * len(missing_mlcs),
+                "comentario": [""] * len(missing_mlcs),
+            })
+            promos_sku = pd.concat([promos_sku, extra], ignore_index=True)
+
+    if "slot" in promos_sku.columns:
+        promos_sku["_slot_sort"] = pd.to_numeric(promos_sku["slot"], errors="coerce")
+    else:
+        promos_sku["_slot_sort"] = np.nan
+    promos_sku = promos_sku.sort_values(["_slot_sort", "mlc"], ascending=[True, True], na_position="last").drop(columns=["_slot_sort"])
+    return promos_sku[base_cols].copy()
 
 
 def ensure_history_db():
@@ -1336,25 +1532,30 @@ def keywords_summary(keywords):
     }
 
 
-def build_action_table(master, sales_windows, total_hist, purchase_summary, publications, ads_by_sku):
+def build_action_table(master, sales_windows, total_hist, purchase_summary, publications, product_ads, ads_by_sku):
     base = master[[
         "sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim",
         "margen_local_maestra", "margen_meli1_maestra", "ads_flag", "mlcs"
     ]].copy()
+    base = base.rename(columns={"ads_flag": "ads_flag_maestra"})
 
     sw30 = sales_windows.get(30, pd.DataFrame(columns=["sku"]))
     sw90 = sales_windows.get(90, pd.DataFrame(columns=["sku"]))
     base = base.merge(sw30, on="sku", how="left").merge(sw90[["sku", "margen_hist_90d"]], on="sku", how="left").merge(total_hist, on="sku", how="left")
     base = base.merge(purchase_summary, on="sku", how="left").merge(ads_by_sku, on="sku", how="left")
 
-    # current publication snapshot
+    # current publication snapshot + publication-level risk summary
     pub_primary_rows = []
     pub_map = {}
+    publication_mix_rows = []
+    publication_risk_rows = []
+    cost_map = base.set_index("sku")["costo_maestra"].to_dict()
+
     if publications is not None and not publications.empty:
         for sku, grp in publications.groupby("sku", sort=False):
+            pub_map[sku] = grp.copy()
             pr = choose_primary_publication(grp)
             if pr is not None:
-                pub_map[sku] = grp.copy()
                 pub_primary_rows.append({
                     "sku": sku,
                     "mlc_principal": pr["mlc"],
@@ -1374,8 +1575,60 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
                     "total_cargo_monto_ml": safe_float(pr.get("total_cargo_monto", np.nan)),
                     "costo_fijo_ml": safe_float(pr.get("costo_fijo", np.nan)),
                 })
+
+            mix = summarize_publication_mix(grp)
+            mix["sku"] = sku
+            publication_mix_rows.append(mix)
+
+            detail = build_publication_detail_df(grp, cost_map.get(sku, np.nan), product_ads)
+            if not detail.empty:
+                active_detail = detail[detail["status"].astype(str).str.upper().eq("ACTIVA")].copy()
+                ref = active_detail if not active_detail.empty else detail
+                publication_risk_rows.append({
+                    "sku": sku,
+                    "margen_mlc_peor_con_ads": pd.to_numeric(ref["margen_pub_con_ads"], errors="coerce").min(),
+                    "margen_mlc_mejor_con_ads": pd.to_numeric(ref["margen_pub_con_ads"], errors="coerce").max(),
+                    "margen_mlc_prom_con_ads": pd.to_numeric(ref["margen_pub_con_ads"], errors="coerce").mean(),
+                    "mlcs_criticos_con_ads": int((pd.to_numeric(ref["margen_pub_con_ads"], errors="coerce") < 0).sum()),
+                    "mlcs_alerta_con_ads": int(((pd.to_numeric(ref["margen_pub_con_ads"], errors="coerce") >= 0) & (pd.to_numeric(ref["margen_pub_con_ads"], errors="coerce") < 8)).sum()),
+                })
+
     pub_primary = pd.DataFrame(pub_primary_rows)
-    base = base.merge(pub_primary, on="sku", how="left")
+    if not pub_primary.empty:
+        base = base.merge(pub_primary, on="sku", how="left")
+
+    publication_mix = pd.DataFrame(publication_mix_rows)
+    if not publication_mix.empty:
+        base = base.merge(publication_mix, on="sku", how="left")
+    else:
+        for col, default in {
+            "cantidad_mlcs": 0,
+            "mlcs_activos": 0,
+            "mlcs_full": 0,
+            "mlcs_no_full": 0,
+            "mix_logistico": "—",
+            "categorias_activas_txt": "—",
+            "mlcs_activos_txt": "—",
+        }.items():
+            base[col] = default
+
+    publication_risk = pd.DataFrame(publication_risk_rows)
+    if not publication_risk.empty:
+        base = base.merge(publication_risk, on="sku", how="left")
+    else:
+        for col in ["margen_mlc_peor_con_ads", "margen_mlc_mejor_con_ads", "margen_mlc_prom_con_ads"]:
+            base[col] = np.nan
+        for col in ["mlcs_criticos_con_ads", "mlcs_alerta_con_ads"]:
+            base[col] = 0
+
+    base["ads_report_flag"] = (
+        base["ads_inversion"].fillna(0).gt(0) |
+        base["ads_ingresos"].fillna(0).gt(0) |
+        base["ads_ventas"].fillna(0).gt(0)
+    )
+    base["ads_flag"] = base["ads_report_flag"]
+    base["impacto_ventas_ml"] = base["ingresos_ml_30d"].fillna(0)
+    base["impacto_ads"] = base["ads_inversion"].fillna(0)
 
     base["ads_share_ml_pct"] = np.where(
         base["ingresos_ml_30d"].fillna(0) > 0,
@@ -1383,8 +1636,9 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
         0.0
     )
     base["margen_ml_actual"] = base.apply(lambda r: calc_margin_from_monto_sim(r["costo_maestra"], r["monto_sim"]), axis=1)
-    base["margen_ml_reportado"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0), axis=1)
-    base["margen_ml_con_ads"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), r.get("ads_share_ml_pct", 0.0)), axis=1)
+    base["margen_ml_reportado"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r.get("precio_ml_actual"), r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0), axis=1)
+    base["margen_ml_con_ads"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r.get("precio_ml_actual"), r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), r.get("ads_share_ml_pct", 0.0)), axis=1)
+    base["margen_ml_real_con_ads"] = np.where(base["margen_mlc_peor_con_ads"].notna(), base["margen_mlc_peor_con_ads"], base["margen_ml_con_ads"])
     base["margen_tienda_actual"] = base.apply(lambda r: calc_margin_from_bruto(r["costo_maestra"], r["precio_bruto"]), axis=1)
     base["brecha_costo_pct"] = np.where(
         base["costo_maestra"].notna() & base["ultimo_costo_compra"].notna() & (base["costo_maestra"] != 0),
@@ -1406,28 +1660,37 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
         ((base["ingreso_estimado_ml"] - base["monto_sim"]) / base["monto_sim"]) * 100,
         np.nan
     )
-    base["delta_margen_30d_pp"] = base["margen_ml_actual"] - base["margen_hist_30d"]
+    base["delta_margen_30d_pp"] = base["margen_ml_real_con_ads"] - base["margen_hist_30d"]
     base["estado_brecha_costo"] = base["brecha_costo_pct"].apply(classify_cost_gap_pct)
-    base["estado_margen"] = base["delta_margen_30d_pp"].apply(classify_margin_delta_pp)
+    base["estado_margen"] = base.apply(lambda r: classify_margin_health(r.get("margen_ml_real_con_ads"), r.get("delta_margen_30d_pp")), axis=1)
 
     def action(row):
         cost_state = row["estado_brecha_costo"]
         margin_state = row["estado_margen"]
+        ads_report = bool(row.get("ads_report_flag", False))
+        real_margin = safe_float(row.get("margen_ml_real_con_ads"), np.nan)
+        impacto = safe_float(row.get("impacto_ventas_ml"), 0.0)
+        if ads_report and pd.notna(real_margin) and real_margin < 0:
+            return "APAGAR ADS O SUBIR PRECIO"
         if cost_state == "CRÍTICO" and margin_state in ("CRÍTICO", "ALERTA"):
             return "REPRECIO URGENTE"
         if cost_state == "CRÍTICO":
             return "REVISAR COSTO Y PRECIO"
-        if row.get("ads_flag", False) and margin_state in ("CRÍTICO", "ALERTA"):
+        if ads_report and margin_state in ("CRÍTICO", "ALERTA"):
             return "REVISAR PRECIO / ADS"
-        if margin_state == "CRÍTICO":
+        if margin_state == "CRÍTICO" and impacto >= 100000:
             return "REVISAR RENTABILIDAD"
-        if cost_state == "BAJÓ COSTO":
+        if cost_state == "BAJÓ COSTO" and (pd.isna(real_margin) or real_margin >= 12):
             return "OPORTUNIDAD"
         return "MANTENER / MONITOREAR"
 
     def semaforo(row):
         cost_state = row["estado_brecha_costo"]
         margin_state = row["estado_margen"]
+        ads_report = bool(row.get("ads_report_flag", False))
+        real_margin = safe_float(row.get("margen_ml_real_con_ads"), np.nan)
+        if ads_report and pd.notna(real_margin) and real_margin < 0:
+            return "CRÍTICO"
         if cost_state == "CRÍTICO" or margin_state == "CRÍTICO":
             return "CRÍTICO"
         if cost_state == "ALERTA" or margin_state == "ALERTA":
@@ -1440,9 +1703,9 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
     base["accion_sugerida"] = base.apply(action, axis=1)
 
     state_score = {"CRÍTICO": 3, "ALERTA": 2, "OPORTUNIDAD": 1, "ESTABLE": 0}
-    base["score"] = base["estado_general"].map(state_score).fillna(0) * 100
-    base["score"] += base["ingresos_ml_30d"].fillna(0) / 10000
-    base["score"] += base["ads_inversion"].fillna(0) / 10000
+    base["score"] = base["estado_general"].map(state_score).fillna(0) * 1000000
+    base["score"] += base["impacto_ventas_ml"].fillna(0)
+    base["score"] += base["impacto_ads"].fillna(0)
     base = base.sort_values(["score", "ingresos_ml_30d"], ascending=[False, False])
 
     return base, pub_map
@@ -1504,7 +1767,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     purchase_summary, purchase_map = summarize_purchases(compras)
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
-    action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
+    action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, product_ads, ads_by_sku)
     validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos)
 
     product_options = action_table["sku"].dropna().tolist()
@@ -1686,7 +1949,7 @@ with tabs[0]:
     critical_cost = int((action_table["estado_brecha_costo"] == "CRÍTICO").sum())
     alert_cost = int((action_table["estado_brecha_costo"] == "ALERTA").sum())
     critical_margin = int((action_table["estado_margen"] == "CRÍTICO").sum())
-    ads_risk = int(((action_table["ads_flag"]) & (action_table["estado_margen"].isin(["CRÍTICO", "ALERTA"]))).sum())
+    ads_risk = int(((action_table["ads_report_flag"]) & (action_table["estado_margen"].isin(["CRÍTICO", "ALERTA"]))).sum())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Brechas costo críticas", critical_cost)
@@ -1709,9 +1972,9 @@ with tabs[0]:
     elif canal_filter == "TIENDA":
         work = work[work["ingresos_tienda_30d"].fillna(0) > 0]
     if ads_filter == "Solo con ads":
-        work = work[work["ads_flag"]]
+        work = work[work["ads_report_flag"]]
     elif ads_filter == "Solo sin ads":
-        work = work[~work["ads_flag"]]
+        work = work[~work["ads_report_flag"]]
     if text_filter:
         q = text_filter.strip().lower()
         work = work[
@@ -1721,17 +1984,16 @@ with tabs[0]:
         ]
 
     display = work[[
-        "sku", "descripcion", "estado_general", "brecha_costo_clp", "brecha_costo_pct", "delta_margen_30d_pp",
-        "ads_flag", "margen_ml_actual", "margen_hist_30d", "ingresos_ml_30d", "accion_sugerida"
+        "sku", "descripcion", "estado_general", "brecha_costo_pct", "delta_margen_30d_pp",
+        "ads_report_flag", "margen_ml_real_con_ads", "margen_hist_30d", "ingresos_ml_30d", "accion_sugerida"
     ]].copy()
-    display.columns = ["SKU", "Descripción", "Estado", "Brecha costo ($)", "Δ costo %", "Δ margen pp", "Ads", "Margen ML actual", "Margen hist. 30d", "Ventas ML 30d", "Acción sugerida"]
-    display["Brecha costo ($)"] = display["Brecha costo ($)"].map(fmt_money)
+    display.columns = ["SKU", "Descripción", "Estado", "Δ costo %", "Δ margen pp", "Ads reporte", "Margen ML real c/ads", "Margen hist. 30d", "Ventas ML 30d", "Acción sugerida"]
     display["Δ costo %"] = display["Δ costo %"].map(fmt_pct)
     display["Δ margen pp"] = display["Δ margen pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
     display["Margen ML actual"] = display["Margen ML actual"].map(fmt_pct)
     display["Margen hist. 30d"] = display["Margen hist. 30d"].map(fmt_pct)
     display["Ventas ML 30d"] = display["Ventas ML 30d"].map(fmt_money)
-    display["Ads"] = display["Ads"].map(lambda x: "Sí" if bool(x) else "No")
+    display["Ads reporte"] = display["Ads reporte"].map(lambda x: "Sí" if bool(x) else "No")
     st.dataframe(display, use_container_width=True, hide_index=True, height=420)
 
     sku_labels = [f"{sku} — {model['sku_desc'].get(sku, '')}" for sku in work["sku"].tolist()]
@@ -1770,10 +2032,10 @@ with tabs[0]:
     }[cost_sort]
     brechas = brechas.sort_values(sort_col, ascending=False, na_position="last")
     brechas_show = brechas[[
-        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_clp", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"
+        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"
     ]].copy()
-    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo ($)", "Brecha costo %", "Estado", "Acción"]
-    for c in ["Costo maestra", "Última compra", "Brecha costo ($)"]:
+    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo %", "Estado", "Acción"]
+    for c in ["Costo maestra", "Última compra"]:
         brechas_show[c] = brechas_show[c].map(fmt_money)
     brechas_show["Brecha costo %"] = brechas_show["Brecha costo %"].map(fmt_pct)
     st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
@@ -1833,7 +2095,7 @@ with tabs[1]:
         header_l, header_r = st.columns([3, 1.2])
         with header_l:
             st.subheader(f"{row['sku']} — {row['descripcion']}")
-            st.write(f"MLC asociados: {format_mlc_list(row.get('mlcs'))}")
+            st.write(f"MLC asociados: {', '.join(normalize_mlc_list(row['mlcs'])) if isinstance(row['mlcs'], list) and row['mlcs'] else '—'}")
         with header_r:
             st.metric("Estado general", row["estado_general"])
             st.metric("Acción sugerida", row["accion_sugerida"])
@@ -1845,7 +2107,7 @@ with tabs[1]:
         r3.metric("Margen ML actual", fmt_pct(row.get("margen_ml_actual")))
         r4.metric("Margen hist. ML 30d", fmt_pct(row.get("margen_hist_30d")))
         r5.metric("Δ margen", "—" if pd.isna(row.get("delta_margen_30d_pp")) else f"{row.get('delta_margen_30d_pp'):.1f} pp")
-        r6.metric("Brecha costo ($)", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
+        r6.metric("Δ costo", fmt_pct(row.get("brecha_costo_pct")))
 
         st.markdown("### Precios y rentabilidad")
         a, b = st.columns(2)
@@ -1856,7 +2118,8 @@ with tabs[1]:
             st.write(f"Precio oferta ML: {fmt_money(row.get('precio_ml_oferta'))}")
             st.write(f"Monto en simulación: {fmt_money(row.get('monto_sim'))}")
             st.write(f"Ingreso estimado ML: {fmt_money(row.get('ingreso_estimado_ml'))}")
-            st.write(f"Margen ML actual: {fmt_pct(row.get('margen_ml_actual'))}")
+            st.write(f"Margen ML actual maestra: {fmt_pct(row.get('margen_ml_actual'))}")
+            st.write(f"Margen ML real c/ads: {fmt_pct(row.get('margen_ml_real_con_ads'))}")
             st.write(f"Margen histórico ML 30d: {fmt_pct(row.get('margen_hist_30d'))}")
             st.write(f"Margen histórico ML 90d: {fmt_pct(row.get('margen_hist_90d'))}")
             st.write(f"Margen histórico ML total: {fmt_pct(row.get('margen_hist_total'))}")
@@ -1910,7 +2173,7 @@ with tabs[1]:
             c1.metric("Última compra", fmt_date(pr["ultima_fecha_compra"]))
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
-            c4.metric("Brecha maestra vs última compra", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
+            c4.metric("Brecha maestra vs última compra", fmt_pct(row["brecha_costo_pct"]))
             hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
@@ -1943,9 +2206,12 @@ with tabs[1]:
                 st.write(f"P90 personas: {fmt_int(srow.get(f'p90_unidades_persona_{default_period}d'))} unidades")
 
         st.markdown("### Datos de Publicación ML")
-        pr = choose_primary_publication(model["pub_map"].get(sku, pd.DataFrame()))
+        sku_pub_df = model["pub_map"].get(sku, pd.DataFrame()).copy()
+        if sku_pub_df.empty:
+            sku_pub_df = model["pubs"][model["pubs"]["sku"] == sku].copy() if "pubs" in model else pd.DataFrame()
+        pr = choose_primary_publication(sku_pub_df)
         if pr is None:
-            st.info("No encontré publicación principal para este SKU.")
+            st.info("No encontré publicaciones para este SKU.")
         else:
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("Dimensiones", pr["dimensiones"])
@@ -1956,7 +2222,66 @@ with tabs[1]:
             d2.metric("Peso", peso_real)
             d3.metric("Peso volumétrico", f"{safe_float(pr['peso_volumetrico_kg'], np.nan):.2f} kg" if pd.notna(pr["peso_volumetrico_kg"]) else "—")
             d4.metric("Días publicado", fmt_int(pr["dias_publicado"]))
-            st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
+            st.caption(f"Publicación principal: {pr['mlc']} | Status: {pr['status']} | Entrega: {pr['entrega']}")
+
+        mix = summarize_publication_mix(sku_pub_df)
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("MLCs totales", fmt_int(mix.get("cantidad_mlcs", 0)))
+        m2.metric("MLCs activos", fmt_int(mix.get("mlcs_activos", 0)))
+        m3.metric("MLCs FULL", fmt_int(mix.get("mlcs_full", 0)))
+        m4.metric("MLCs No FULL", fmt_int(mix.get("mlcs_no_full", 0)))
+        m5.metric("Mix logístico", mix.get("mix_logistico", "—"))
+        st.write(f"Categorías activas: {mix.get('categorias_activas_txt', '—')}")
+        st.write(f"MLCs activos: {mix.get('mlcs_activos_txt', '—')}")
+
+        st.markdown("### Publicaciones asociadas al SKU")
+        if sku_pub_df.empty:
+            st.info("No encontré publicaciones asociadas a este SKU.")
+        else:
+            pub_detail = build_publication_detail_df(sku_pub_df, row.get("costo_maestra", np.nan), model.get("product_ads", pd.DataFrame()))
+            if pub_detail.empty:
+                st.info("No encontré detalle utilizable de publicaciones para este SKU.")
+            else:
+                rename_map = {
+                    "mlc": "MLC",
+                    "status": "Status",
+                    "full_txt": "FULL",
+                    "categoria_nombre": "Categoría",
+                    "titulo": "Título",
+                    "precio_final": "Precio final",
+                    "precio_base": "Precio base",
+                    "precio_oferta": "Precio oferta",
+                    "comision_pct": "Comisión %",
+                    "cargo_cuotas_pct": "Cuotas %",
+                    "total_cargo_pct": "Cargo total %",
+                    "total_cargo_monto": "Cargo total $",
+                    "costo_fijo": "Costo fijo $",
+                    "ingreso_estimado_ml": "Ingreso estimado $",
+                    "margen_pub_sin_ads": "Margen s/ads",
+                    "margen_pub_con_ads": "Margen c/ads",
+                    "ads_inversion_mlc": "Ads inversión $",
+                    "ingresos_ads_mlc": "Ads ingresos $",
+                    "ads_acos_mlc": "Ads ACOS %",
+                    "ads_roas_mlc": "Ads ROAS",
+                    "ventas_hist_pub": "Ventas hist.",
+                    "ventas_por_dia_pub": "Ventas/día",
+                    "stock_real": "Stock real",
+                    "dias_publicado": "Días pub.",
+                    "entrega": "Entrega",
+                }
+                pub_show = pub_detail.rename(columns=rename_map).copy()
+                for c in ["Precio final", "Precio base", "Precio oferta", "Cargo total $", "Costo fijo $", "Ingreso estimado $", "Ads inversión $", "Ads ingresos $"]:
+                    if c in pub_show.columns:
+                        pub_show[c] = pub_show[c].map(fmt_money)
+                for c in ["Comisión %", "Cuotas %", "Cargo total %", "Margen s/ads", "Margen c/ads", "Ads ACOS %"]:
+                    if c in pub_show.columns:
+                        pub_show[c] = pub_show[c].map(fmt_pct)
+                if "Ads ROAS" in pub_show.columns:
+                    pub_show["Ads ROAS"] = pub_show["Ads ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                for c in ["Ventas hist.", "Ventas/día", "Stock real", "Días pub."]:
+                    if c in pub_show.columns:
+                        pub_show[c] = pub_show[c].map(fmt_int)
+                st.dataframe(pub_show, use_container_width=True, hide_index=True, height=320)
 
         st.markdown("### Historial de ventas")
         sales_sku = model["ventas"][model["ventas"]["sku"] == sku].copy()
