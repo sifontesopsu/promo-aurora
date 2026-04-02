@@ -281,6 +281,21 @@ def norm_mlc(value) -> str:
     return s
 
 
+def normalize_mlc_list(values) -> list[str]:
+    if values is None:
+        return []
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+    cleaned = []
+    seen = set()
+    for value in values:
+        mlc = norm_mlc(value)
+        if mlc and mlc not in seen:
+            seen.add(mlc)
+            cleaned.append(mlc)
+    return cleaned
+
+
 def to_date_only(value):
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return pd.NaT
@@ -2014,7 +2029,8 @@ with tabs[1]:
         header_l, header_r = st.columns([3, 1.2])
         with header_l:
             st.subheader(f"{row['sku']} — {row['descripcion']}")
-            st.write(f"MLC asociados: {', '.join(row['mlcs']) if isinstance(row['mlcs'], list) and row['mlcs'] else '—'}")
+            mlcs_display = normalize_mlc_list(row.get("mlcs"))
+            st.write(f"MLC asociados: {', '.join(mlcs_display) if mlcs_display else '—'}")
         with header_r:
             st.metric("Estado general", row["estado_general"])
             st.metric("Acción sugerida", row["accion_sugerida"])
@@ -2051,7 +2067,7 @@ with tabs[1]:
             st.write(f"Ventas tienda 30d: {fmt_money(row.get('ingresos_tienda_30d'))}")
             st.write(f"Ventas tienda 90d: {fmt_money(model['sales_windows'].get(90, pd.DataFrame()).set_index('sku').get('ingresos_tienda_90d', pd.Series()).get(sku, np.nan) if not model['sales_windows'].get(90, pd.DataFrame()).empty else np.nan)}")
 
-        st.markdown("### Ads (sin tabla maestra)")
+        st.markdown("### Ads")
         ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
         if ads_detail.empty:
             st.info("No encontré Product Ads asociados a las publicaciones de este SKU.")
