@@ -464,6 +464,51 @@ def classify_margin_delta_pp(delta_pp):
     return "ESTABLE"
 
 
+def classify_ads_state(row, target_margin_pct: float = 15.0):
+    ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
+    ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
+    ads_clicks = safe_float(row.get("ads_clics"), 0.0)
+    ads_active = (ads_inversion > 0) or (ads_ingresos > 0) or (ads_clicks > 0)
+    if not ads_active:
+        return "SIN ADS"
+
+    margen_con_ads = safe_float(row.get("margen_ml_con_ads"), np.nan)
+    acos_real = safe_float(row.get("ads_acos"), np.nan)
+    acos_max = safe_float(row.get("acos_max_permitido_pct"), np.nan)
+    brecha_obj = safe_float(row.get("brecha_ads_objetivo_pp"), np.nan)
+
+    if pd.notna(ads_inversion) and ads_inversion > 0 and (pd.isna(ads_ingresos) or ads_ingresos <= 0):
+        return "CRÍTICO"
+    if pd.notna(margen_con_ads) and margen_con_ads < 0:
+        return "CRÍTICO"
+    if pd.notna(acos_real) and pd.notna(acos_max) and acos_real > acos_max:
+        return "CRÍTICO"
+    if pd.notna(brecha_obj) and brecha_obj < 0:
+        return "ALERTA"
+    if pd.notna(acos_real) and acos_real <= 10 and pd.notna(margen_con_ads) and margen_con_ads >= max(target_margin_pct + 10, 25):
+        return "OPORTUNIDAD"
+    return "OK"
+
+
+def suggest_ads_action(row, target_margin_pct: float = 15.0):
+    estado_ads = str(row.get("estado_ads", "")).upper()
+    ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
+    ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
+    if estado_ads == "SIN ADS":
+        if pd.notna(safe_float(row.get("margen_ml_reportado"), np.nan)) and safe_float(row.get("margen_ml_reportado"), np.nan) >= max(target_margin_pct + 10, 25):
+            return "PROBAR ESCALA ADS"
+        return "SIN ACCIÓN ADS"
+    if estado_ads == "CRÍTICO":
+        if ads_inversion > 0 and ads_ingresos <= 0:
+            return "PAUSAR / CORTAR GASTO"
+        return "BAJAR PUJA O REVISAR PRECIO"
+    if estado_ads == "ALERTA":
+        return "OPTIMIZAR ADS"
+    if estado_ads == "OPORTUNIDAD":
+        return "ESCALAR ADS"
+    return "MANTENER ADS"
+
+
 def parse_dimensions(dim_str):
     out = {
         "dimensiones": "—",
@@ -742,7 +787,7 @@ def enrich_action_table_with_snapshot_history(action_table: pd.DataFrame) -> pd.
     return out
 
 
-def build_validation_layers(master, ventas, compras, pubs, product_ads, promos):
+def build_validation_layers(master, ventas, compras, pubs, product_ads, promos, action_table=None):
     details = {}
     summary_rows = []
 
@@ -802,6 +847,34 @@ def build_validation_layers(master, ventas, compras, pubs, product_ads, promos):
 
     future_purchases = compras[compras.get("fecha", pd.Series(dtype='datetime64[ns]')) > pd.Timestamp(date.today())] if not compras.empty else pd.DataFrame()
     register("Compras con fecha futura", "ALERTA" if not future_purchases.empty else "OK", future_purchases[[c for c in ["sku", "fecha", "proveedor", "precio_unitario"] if c in future_purchases.columns]], "Hay registros de compras con fecha posterior a hoy.")
+
+    action_table = action_table.copy() if isinstance(action_table, pd.DataFrame) else pd.DataFrame()
+    if not action_table.empty:
+        ads_burning = action_table[(action_table.get("ads_inversion", 0).fillna(0) > 0) & (action_table.get("ads_ingresos", 0).fillna(0) <= 0)].copy() if "ads_inversion" in action_table.columns else pd.DataFrame()
+        register(
+            "Ads quemando gasto sin ventas",
+            "CRÍTICO" if not ads_burning.empty else "OK",
+            ads_burning[[c for c in ["sku", "descripcion", "ads_inversion", "ads_ingresos", "ads_clics", "accion_ads"] if c in ads_burning.columns]],
+            "Hay inversión publicitaria sin ingresos atribuidos; conviene pausar o recortar mientras se revisa ficha, precio o targeting.",
+        )
+
+        ads_negative_margin = action_table[action_table.get("estado_ads", pd.Series(dtype=str)).astype(str).eq("CRÍTICO")].copy() if "estado_ads" in action_table.columns else pd.DataFrame()
+        if not ads_negative_margin.empty and "margen_ml_con_ads" in ads_negative_margin.columns:
+            ads_negative_margin = ads_negative_margin[(ads_negative_margin["margen_ml_con_ads"].fillna(0) < 0) | (ads_negative_margin.get("gap_acos_pct", np.nan).fillna(-np.inf) > 0)]
+        register(
+            "Ads incoherente vs rentabilidad",
+            "CRÍTICO" if not ads_negative_margin.empty else "OK",
+            ads_negative_margin[[c for c in ["sku", "descripcion", "ads_acos", "acos_max_permitido_pct", "margen_ml_con_ads", "accion_ads"] if c in ads_negative_margin.columns]],
+            "El ACOS real ya superó el ACOS máximo permitido o el margen con Ads quedó negativo.",
+        )
+
+        ads_scale = action_table[action_table.get("estado_ads", pd.Series(dtype=str)).astype(str).eq("OPORTUNIDAD")].copy() if "estado_ads" in action_table.columns else pd.DataFrame()
+        register(
+            "Ads escalables",
+            "OK" if ads_scale.empty else "ALERTA",
+            ads_scale[[c for c in ["sku", "descripcion", "ads_acos", "margen_ml_con_ads", "ads_roas", "accion_ads"] if c in ads_scale.columns]],
+            "Estos SKUs tienen margen con Ads holgado y ACOS bajo; podrían absorber más presupuesto.",
+        )
 
     summary = pd.DataFrame(summary_rows)
     severity_rank = {"CRÍTICO": 3, "ALERTA": 2, "OK": 1}
@@ -1486,6 +1559,20 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
     base["delta_margen_30d_pp"] = base["margen_ml_actual"] - base["margen_hist_30d"]
     base["estado_brecha_costo"] = base["brecha_costo_pct"].apply(classify_cost_gap_pct)
     base["estado_margen"] = base["delta_margen_30d_pp"].apply(classify_margin_delta_pp)
+    base["objetivo_margen_ads_pct"] = 15.0
+    base["acos_max_permitido_pct"] = np.where(base["margen_ml_reportado"].notna(), base["margen_ml_reportado"], base["margen_ml_actual"])
+    base["gap_acos_pct"] = np.where(
+        base["ads_acos"].notna() & base["acos_max_permitido_pct"].notna(),
+        base["ads_acos"] - base["acos_max_permitido_pct"],
+        np.nan,
+    )
+    base["brecha_ads_objetivo_pp"] = base["margen_ml_con_ads"] - base["objetivo_margen_ads_pct"]
+    base["estado_ads"] = base.apply(classify_ads_state, axis=1)
+    base["accion_ads"] = base.apply(suggest_ads_action, axis=1)
+    base["ads_score"] = 0.0
+    base["ads_score"] += base["margen_ml_con_ads"].fillna(0) * 0.5
+    base["ads_score"] += base["ads_roas"].fillna(0) * 10 * 0.3
+    base["ads_score"] -= base["ads_acos"].fillna(0) * 0.2
 
     def action(row):
         cost_state = row["estado_brecha_costo"]
@@ -1494,6 +1581,10 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
             return "REPRECIO URGENTE"
         if cost_state == "CRÍTICO":
             return "REVISAR COSTO Y PRECIO"
+        if str(row.get("estado_ads", "")).upper() == "CRÍTICO":
+            return "REVISAR ADS URGENTE"
+        if str(row.get("estado_ads", "")).upper() == "ALERTA":
+            return "OPTIMIZAR ADS / PRECIO"
         if row.get("ads_flag", False) and margin_state in ("CRÍTICO", "ALERTA"):
             return "REVISAR PRECIO / ADS"
         if margin_state == "CRÍTICO":
@@ -1505,11 +1596,12 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
     def semaforo(row):
         cost_state = row["estado_brecha_costo"]
         margin_state = row["estado_margen"]
-        if cost_state == "CRÍTICO" or margin_state == "CRÍTICO":
+        ads_state = str(row.get("estado_ads", "")).upper()
+        if cost_state == "CRÍTICO" or margin_state == "CRÍTICO" or ads_state == "CRÍTICO":
             return "CRÍTICO"
-        if cost_state == "ALERTA" or margin_state == "ALERTA":
+        if cost_state == "ALERTA" or margin_state == "ALERTA" or ads_state == "ALERTA":
             return "ALERTA"
-        if cost_state == "BAJÓ COSTO" or margin_state == "MEJORA":
+        if cost_state == "BAJÓ COSTO" or margin_state == "MEJORA" or ads_state == "OPORTUNIDAD":
             return "OPORTUNIDAD"
         return "ESTABLE"
 
@@ -1582,7 +1674,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
     action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
-    validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos)
+    validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos, action_table)
 
     product_options = action_table["sku"].dropna().tolist()
     sku_desc = action_table.set_index("sku")["descripcion"].to_dict()
@@ -1762,7 +1854,7 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
             st.warning(f"No pude guardar snapshot automático: {e}")
 
 model["action_table"] = action_table
-model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"])
+model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"], action_table)
 
 tabs = st.tabs([
     "Centro de Control Comercial",
@@ -1776,13 +1868,13 @@ with tabs[0]:
     critical_cost = int((action_table["estado_brecha_costo"] == "CRÍTICO").sum())
     alert_cost = int((action_table["estado_brecha_costo"] == "ALERTA").sum())
     critical_margin = int((action_table["estado_margen"] == "CRÍTICO").sum())
-    ads_risk = int(((action_table["ads_flag"]) & (action_table["estado_margen"].isin(["CRÍTICO", "ALERTA"]))).sum())
+    ads_risk = int((action_table.get("estado_ads", pd.Series(dtype=str)).isin(["CRÍTICO", "ALERTA"])).sum())
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Brechas costo críticas", critical_cost)
     c2.metric("Brechas costo alerta", alert_cost)
     c3.metric("Margen histórico deteriorado", critical_margin)
-    c4.metric("Productos con Ads en riesgo", ads_risk)
+    c4.metric("Ads en riesgo", ads_risk)
 
     st.subheader("Bandeja de acción")
     f1, f2, f3, f4 = st.columns([1.2, 1, 1, 1.2])
@@ -1874,6 +1966,52 @@ with tabs[0]:
         brechas_show[c] = brechas_show[c].map(fmt_money)
     brechas_show["Brecha costo %"] = brechas_show["Brecha costo %"].map(fmt_pct)
     st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
+
+    st.subheader("Bandeja de acción Ads")
+    st.caption("Prioriza campañas que están quemando margen, las que requieren optimización y las que tienen espacio para escalar.")
+    a1, a2, a3, a4 = st.columns([1.1, 1.0, 1.0, 1.2])
+    ads_state_filter = a1.multiselect("Estado Ads", ["CRÍTICO", "ALERTA", "OPORTUNIDAD", "OK", "SIN ADS"], default=["CRÍTICO", "ALERTA", "OPORTUNIDAD", "OK"], key="ads_state_filter")
+    ads_sort = a2.selectbox("Orden Ads", ["Mayor gap ACOS", "Peor margen con Ads", "Mayor inversión Ads", "Mejor oportunidad Ads"], key="ads_sort")
+    ads_only_active = a3.selectbox("Cobertura Ads", ["Solo con ads activos", "Todos"], key="ads_coverage_filter")
+    ads_limit = int(a4.number_input("Filas Ads", min_value=20, max_value=10000, value=200, step=20, key="ads_limit"))
+
+    ads_work = action_table.copy()
+    if ads_state_filter:
+        ads_work = ads_work[ads_work["estado_ads"].isin(ads_state_filter)]
+    if ads_only_active == "Solo con ads activos":
+        ads_work = ads_work[(ads_work["ads_inversion"].fillna(0) > 0) | (ads_work["ads_ingresos"].fillna(0) > 0) | (ads_work["ads_clics"].fillna(0) > 0)]
+
+    ads_sort_map = {
+        "Mayor gap ACOS": ["gap_acos_pct", "ads_inversion"],
+        "Peor margen con Ads": ["margen_ml_con_ads", "ads_inversion"],
+        "Mayor inversión Ads": ["ads_inversion", "ads_ingresos"],
+        "Mejor oportunidad Ads": ["ads_score", "margen_ml_con_ads"],
+    }
+    sort_cols = ads_sort_map[ads_sort]
+    ascending = [False, False]
+    if ads_sort == "Peor margen con Ads":
+        ascending = [True, False]
+    ads_work = ads_work.sort_values(sort_cols, ascending=ascending, na_position="last")
+
+    ads_required_cols = [
+        "sku", "descripcion", "estado_ads", "ads_inversion", "ads_ingresos", "ads_acos",
+        "acos_max_permitido_pct", "gap_acos_pct", "margen_ml_reportado", "margen_ml_con_ads",
+        "brecha_ads_objetivo_pp", "accion_ads"
+    ]
+    for col in ads_required_cols:
+        if col not in ads_work.columns:
+            ads_work[col] = np.nan
+    ads_show = ads_work[ads_required_cols].copy()
+    ads_show.columns = [
+        "SKU", "Descripción", "Estado Ads", "Inversión Ads", "Ingresos Ads", "ACOS real",
+        "ACOS máx.", "Gap ACOS", "Margen sin Ads", "Margen con Ads",
+        "Brecha vs objetivo", "Acción Ads"
+    ]
+    for c in ["Inversión Ads", "Ingresos Ads"]:
+        ads_show[c] = ads_show[c].map(fmt_money)
+    for c in ["ACOS real", "ACOS máx.", "Gap ACOS", "Margen sin Ads", "Margen con Ads", "Brecha vs objetivo"]:
+        ads_show[c] = ads_show[c].map(fmt_pct)
+    st.dataframe(ads_show.head(ads_limit), use_container_width=True, hide_index=True, height=320)
 
     st.subheader("Brecha comercial real: monto en simulación maestra vs ingreso estimado del reporte ML")
     st.caption("La brecha comercial principal se mide contra la fuente de verdad operativa: MONTO EN SIMULACIÓN de la maestra versus INGRESO ESTIMADO del reporte de publicaciones.")
