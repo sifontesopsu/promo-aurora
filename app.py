@@ -608,6 +608,7 @@ def build_promos_ads_table_for_sku(sku: str, promos_df: pd.DataFrame | None, pro
     if isinstance(ads_detail, pd.DataFrame) and not ads_detail.empty:
         tmp = ads_detail.copy()
         tmp["campana"] = tmp["campana"].fillna("").astype(str).str.strip()
+        tmp["mlc"] = tmp["mlc"].astype(str).str.replace(r"\.0$", "", regex=True)
         tmp = tmp[tmp["campana"] != ""]
         if not tmp.empty:
             ads_map = tmp.groupby("mlc")["campana"].apply(lambda s: " | ".join(dict.fromkeys([x for x in s.tolist() if x]))).to_dict()
@@ -618,7 +619,11 @@ def build_promos_ads_table_for_sku(sku: str, promos_df: pd.DataFrame | None, pro
             pubs_sku = publications[publications.get("sku", pd.Series(dtype=str)) == sku][["mlc"]].drop_duplicates().copy()
         mlcs = []
         if isinstance(pubs_sku, pd.DataFrame) and not pubs_sku.empty:
-            mlcs.extend([x for x in pubs_sku["mlc"].dropna().astype(str).tolist() if x])
+            mlcs.extend([
+                str(x).replace('.0', '').strip()
+                for x in pubs_sku["mlc"].dropna().astype(str).tolist()
+                if str(x).strip()
+            ])
         mlcs.extend(list(ads_map.keys()))
         mlcs = list(dict.fromkeys(mlcs))
         if mlcs:
@@ -633,7 +638,8 @@ def build_promos_ads_table_for_sku(sku: str, promos_df: pd.DataFrame | None, pro
         else:
             return pd.DataFrame(columns=base_cols)
     else:
-        promos_sku["mlc"] = promos_sku["mlc"].astype(str)
+        promos_sku["mlc"] = promos_sku["mlc"].astype(str).str.replace(r"\.0$", "", regex=True)
+        # La campaña debe venir solo del reporte Ads, no de la maestra.
         promos_sku["campana_ads"] = promos_sku["mlc"].map(ads_map).fillna("")
         missing_mlcs = [mlc for mlc in ads_map.keys() if mlc not in promos_sku["mlc"].tolist()]
         if missing_mlcs:
