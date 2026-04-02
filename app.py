@@ -1770,6 +1770,29 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, product_ads, ads_by_sku)
     validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos)
 
+    # Fallbacks defensivos para evitar quiebres si alguna columna nueva no quedó materializada
+    if "ads_report_flag" not in action_table.columns:
+        action_table["ads_report_flag"] = (
+            action_table.get("ads_inversion", pd.Series(0, index=action_table.index)).fillna(0).gt(0) |
+            action_table.get("ads_ingresos", pd.Series(0, index=action_table.index)).fillna(0).gt(0) |
+            action_table.get("ads_ventas", pd.Series(0, index=action_table.index)).fillna(0).gt(0) |
+            action_table.get("ads_flag", pd.Series(False, index=action_table.index)).fillna(False).astype(bool)
+        )
+    if "margen_ml_real_con_ads" not in action_table.columns:
+        if "margen_mlc_peor_con_ads" in action_table.columns:
+            action_table["margen_ml_real_con_ads"] = action_table["margen_mlc_peor_con_ads"]
+        elif "margen_ml_con_ads" in action_table.columns:
+            action_table["margen_ml_real_con_ads"] = action_table["margen_ml_con_ads"]
+        else:
+            action_table["margen_ml_real_con_ads"] = np.nan
+    if "brecha_costo_clp" not in action_table.columns:
+        action_table["brecha_costo_clp"] = np.where(
+            action_table.get("costo_maestra", pd.Series(np.nan, index=action_table.index)).notna() &
+            action_table.get("ultimo_costo_compra", pd.Series(np.nan, index=action_table.index)).notna(),
+            action_table.get("ultimo_costo_compra", pd.Series(np.nan, index=action_table.index)) - action_table.get("costo_maestra", pd.Series(np.nan, index=action_table.index)),
+            np.nan
+        )
+
     product_options = action_table["sku"].dropna().tolist()
     sku_desc = action_table.set_index("sku")["descripcion"].to_dict()
 
