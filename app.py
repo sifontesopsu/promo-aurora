@@ -1810,10 +1810,17 @@ with tabs[0]:
             work["mlc_principal"].astype(str).str.lower().str.contains(q, na=False)
         ]
 
-    display = work[[
+    display_required_cols = [
         "sku", "descripcion", "estado_general", "brecha_costo_clp", "brecha_costo_pct", "delta_margen_30d_pp",
         "ads_flag", "margen_ml_actual", "margen_hist_30d", "ingresos_ml_30d", "accion_sugerida"
-    ]].copy()
+    ]
+    for col in display_required_cols:
+        if col not in work.columns:
+            if col == "ads_flag":
+                work[col] = False
+            else:
+                work[col] = np.nan
+    display = work[display_required_cols].copy()
     display.columns = ["SKU", "Descripción", "Estado", "Brecha costo ($)", "Δ costo %", "Δ margen pp", "Ads", "Margen ML actual", "Margen hist. 30d", "Ventas ML 30d", "Acción sugerida"]
     display["Brecha costo ($)"] = display["Brecha costo ($)"].map(fmt_money)
     display["Δ costo %"] = display["Δ costo %"].map(fmt_pct)
