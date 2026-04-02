@@ -593,6 +593,68 @@ def build_ads_report_detail_for_sku(sku: str, product_ads: pd.DataFrame | None, 
     return ads
 
 
+def build_promos_ads_table_for_sku(sku: str, promos_df: pd.DataFrame | None, product_ads: pd.DataFrame | None, publications: pd.DataFrame | None) -> pd.DataFrame:
+    base_cols = ["slot", "mlc", "campana_ads", "precio_b2c", "fecha_venci", "comentario"]
+    promos_sku = pd.DataFrame(columns=base_cols)
+    if isinstance(promos_df, pd.DataFrame) and not promos_df.empty:
+        promos_sku = promos_df[promos_df.get("sku", pd.Series(dtype=str)) == sku].copy()
+        for col in base_cols:
+            if col not in promos_sku.columns:
+                promos_sku[col] = np.nan if col not in ["campana_ads", "comentario", "mlc"] else ""
+        promos_sku = promos_sku[base_cols].copy()
+
+    ads_detail = build_ads_report_detail_for_sku(sku, product_ads, publications)
+    ads_map = {}
+    if isinstance(ads_detail, pd.DataFrame) and not ads_detail.empty:
+        tmp = ads_detail.copy()
+        tmp["campana"] = tmp["campana"].fillna("").astype(str).str.strip()
+        tmp = tmp[tmp["campana"] != ""]
+        if not tmp.empty:
+            ads_map = tmp.groupby("mlc")["campana"].apply(lambda s: " | ".join(dict.fromkeys([x for x in s.tolist() if x]))).to_dict()
+
+    if promos_sku.empty:
+        pubs_sku = pd.DataFrame(columns=["mlc"])
+        if isinstance(publications, pd.DataFrame) and not publications.empty:
+            pubs_sku = publications[publications.get("sku", pd.Series(dtype=str)) == sku][["mlc"]].drop_duplicates().copy()
+        mlcs = []
+        if isinstance(pubs_sku, pd.DataFrame) and not pubs_sku.empty:
+            mlcs.extend([x for x in pubs_sku["mlc"].dropna().astype(str).tolist() if x])
+        mlcs.extend(list(ads_map.keys()))
+        mlcs = list(dict.fromkeys(mlcs))
+        if mlcs:
+            promos_sku = pd.DataFrame({
+                "slot": [""] * len(mlcs),
+                "mlc": mlcs,
+                "campana_ads": [ads_map.get(mlc, "") for mlc in mlcs],
+                "precio_b2c": [np.nan] * len(mlcs),
+                "fecha_venci": [pd.NaT] * len(mlcs),
+                "comentario": [""] * len(mlcs),
+            })
+        else:
+            return pd.DataFrame(columns=base_cols)
+    else:
+        promos_sku["mlc"] = promos_sku["mlc"].astype(str)
+        promos_sku["campana_ads"] = promos_sku["mlc"].map(ads_map).fillna("")
+        missing_mlcs = [mlc for mlc in ads_map.keys() if mlc not in promos_sku["mlc"].tolist()]
+        if missing_mlcs:
+            extra = pd.DataFrame({
+                "slot": [""] * len(missing_mlcs),
+                "mlc": missing_mlcs,
+                "campana_ads": [ads_map.get(mlc, "") for mlc in missing_mlcs],
+                "precio_b2c": [np.nan] * len(missing_mlcs),
+                "fecha_venci": [pd.NaT] * len(missing_mlcs),
+                "comentario": [""] * len(missing_mlcs),
+            })
+            promos_sku = pd.concat([promos_sku, extra], ignore_index=True)
+
+    if "slot" in promos_sku.columns:
+        promos_sku["_slot_sort"] = pd.to_numeric(promos_sku["slot"], errors="coerce")
+    else:
+        promos_sku["_slot_sort"] = np.nan
+    promos_sku = promos_sku.sort_values(["_slot_sort", "mlc"], ascending=[True, True], na_position="last").drop(columns=["_slot_sort"])
+    return promos_sku[base_cols].copy()
+
+
 def ensure_history_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -1986,14 +2048,22 @@ with tabs[1]:
         st.markdown("### Promos y Ads")
         p1, p2 = st.columns(2)
         with p1:
-            promos_sku = model["promos"][model["promos"]["sku"] == sku].copy()
-            if promos_sku.empty:
-                st.info("No hay promos configuradas en maestra para este SKU.")
+            promos_ads_sku = build_promos_ads_table_for_sku(
+                sku,
+                model.get("promos", pd.DataFrame()),
+                model.get("product_ads", pd.DataFrame()),
+                model.get("pubs", pd.DataFrame()),
+            )
+            if promos_ads_sku.empty:
+                st.info("No encontré registros de promos o campañas Ads para este SKU.")
             else:
-                promos_show = promos_sku[["slot", "mlc", "campana_ads", "precio_b2c", "fecha_venci", "comentario"]].copy()
+                promos_show = promos_ads_sku[["slot", "mlc", "campana_ads", "precio_b2c", "fecha_venci", "comentario"]].copy()
                 promos_show.columns = ["Slot", "MLC", "Campaña / Ads", "Precio B2C", "Fecha venci", "Comentario"]
+                promos_show["MLC"] = promos_show["MLC"].astype(str).str.replace(r"\.0$", "", regex=True)
                 promos_show["Precio B2C"] = promos_show["Precio B2C"].map(fmt_money)
                 promos_show["Fecha venci"] = promos_show["Fecha venci"].map(fmt_date)
+                promos_show["Campaña / Ads"] = promos_show["Campaña / Ads"].replace("", "—")
+                promos_show["Comentario"] = promos_show["Comentario"].replace("", "—")
                 st.dataframe(promos_show, use_container_width=True, hide_index=True, height=220)
         with p2:
             ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
