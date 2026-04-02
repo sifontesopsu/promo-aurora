@@ -1341,6 +1341,7 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
         ((base["ultimo_costo_compra"] - base["costo_maestra"]) / base["costo_maestra"]) * 100,
         np.nan
     )
+    base["brecha_costo_clp"] = base["ultimo_costo_compra"] - base["costo_maestra"]
     base["brecha_precio_pct"] = np.where(
         base["precio_bruto"].notna() & base["precio_ml_actual"].notna() & (base["precio_bruto"] != 0),
         ((base["precio_ml_actual"] - base["precio_bruto"]) / base["precio_bruto"]) * 100,
