@@ -2013,7 +2013,7 @@ with tabs[0]:
     display.columns = ["SKU", "Descripción", "Estado", "Δ costo %", "Δ margen pp", "Ads reporte", "Margen ML real c/ads", "Margen hist. 30d", "Ventas ML 30d", "Acción sugerida"]
     display["Δ costo %"] = display["Δ costo %"].map(fmt_pct)
     display["Δ margen pp"] = display["Δ margen pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
-    display["Margen ML actual"] = display["Margen ML actual"].map(fmt_pct)
+    display["Margen ML real c/ads"] = display["Margen ML real c/ads"].map(fmt_pct)
     display["Margen hist. 30d"] = display["Margen hist. 30d"].map(fmt_pct)
     display["Ventas ML 30d"] = display["Ventas ML 30d"].map(fmt_money)
     display["Ads reporte"] = display["Ads reporte"].map(lambda x: "Sí" if bool(x) else "No")
