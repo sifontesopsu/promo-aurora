@@ -2051,54 +2051,34 @@ with tabs[1]:
             st.write(f"Ventas tienda 30d: {fmt_money(row.get('ingresos_tienda_30d'))}")
             st.write(f"Ventas tienda 90d: {fmt_money(model['sales_windows'].get(90, pd.DataFrame()).set_index('sku').get('ingresos_tienda_90d', pd.Series()).get(sku, np.nan) if not model['sales_windows'].get(90, pd.DataFrame()).empty else np.nan)}")
 
-        st.markdown("### Promos y Ads")
-        p1, p2 = st.columns(2)
-        with p1:
-            promos_ads_sku = build_promos_ads_table_for_sku(
-                sku,
-                model.get("promos", pd.DataFrame()),
-                model.get("product_ads", pd.DataFrame()),
-                model.get("pubs", pd.DataFrame()),
-            )
-            if promos_ads_sku.empty:
-                st.info("No encontré registros de promos o campañas Ads para este SKU.")
-            else:
-                promos_show = promos_ads_sku[["slot", "mlc", "campana_ads", "precio_b2c", "fecha_venci", "comentario"]].copy()
-                promos_show.columns = ["Slot", "MLC", "Campaña / Ads", "Precio B2C", "Fecha venci", "Comentario"]
-                promos_show["MLC"] = promos_show["MLC"].astype(str).str.replace(r"\.0$", "", regex=True)
-                promos_show["Precio B2C"] = promos_show["Precio B2C"].map(fmt_money)
-                promos_show["Fecha venci"] = promos_show["Fecha venci"].map(fmt_date)
-                promos_show["Campaña / Ads"] = promos_show["Campaña / Ads"].replace("", "—")
-                promos_show["Comentario"] = promos_show["Comentario"].replace("", "—")
-                st.dataframe(promos_show, use_container_width=True, hide_index=True, height=220)
-        with p2:
-            ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
-            if ads_detail.empty:
-                st.write("Ads en reporte: No")
-                st.write("No encontré Product Ads asociados a las publicaciones de este SKU.")
-            else:
-                inversion_total = ads_detail["inversion_ads"].fillna(0).sum()
-                ingresos_total = ads_detail["ingresos_ads"].fillna(0).sum()
-                ventas_total = ads_detail["ventas_ads"].fillna(0).sum()
-                acos_total = (inversion_total / ingresos_total * 100) if ingresos_total > 0 else np.nan
-                roas_total = (ingresos_total / inversion_total) if inversion_total > 0 else np.nan
-                campañas = sorted([str(x).strip() for x in ads_detail["campana"].dropna().tolist() if str(x).strip()])
-                campañas_txt = " | ".join(dict.fromkeys(campañas)) if campañas else "—"
-                st.write("Ads en reporte: Sí")
-                st.write(f"Campañas: {campañas_txt}")
-                st.write(f"Inversión: {fmt_money(inversion_total)}")
-                st.write(f"Ingresos ads: {fmt_money(ingresos_total)}")
-                st.write(f"ACOS: {fmt_pct(acos_total)}")
-                st.write(f"ROAS: {roas_total:.2f}" if pd.notna(roas_total) else "ROAS: —")
-                st.write(f"Ventas por publicidad: {fmt_int(ventas_total)}")
-                ads_show = ads_detail[["campana", "mlc", "estado", "inversion_ads", "ingresos_ads", "acos", "roas", "ventas_ads"]].copy()
-                ads_show.columns = ["Campaña", "MLC", "Estado", "Inversión", "Ingresos", "ACOS", "ROAS", "Ventas Ads"]
-                ads_show["Inversión"] = ads_show["Inversión"].map(fmt_money)
-                ads_show["Ingresos"] = ads_show["Ingresos"].map(fmt_money)
-                ads_show["ACOS"] = ads_show["ACOS"].map(fmt_pct)
-                ads_show["ROAS"] = ads_show["ROAS"].map(lambda x: f"{safe_float(x, np.nan):.2f}" if pd.notna(x) else "—")
-                ads_show["Ventas Ads"] = ads_show["Ventas Ads"].map(fmt_int)
-                st.dataframe(ads_show, use_container_width=True, hide_index=True, height=220)
+        st.markdown("### Ads")
+        ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
+        if ads_detail.empty:
+            st.info("No encontré Product Ads asociados a las publicaciones de este SKU.")
+        else:
+            inversion_total = ads_detail["inversion_ads"].fillna(0).sum()
+            ingresos_total = ads_detail["ingresos_ads"].fillna(0).sum()
+            ventas_total = ads_detail["ventas_ads"].fillna(0).sum()
+            acos_total = (inversion_total / ingresos_total * 100) if ingresos_total > 0 else np.nan
+            roas_total = (ingresos_total / inversion_total) if inversion_total > 0 else np.nan
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Ads en reporte", "Sí")
+            m2.metric("Inversión", fmt_money(inversion_total))
+            m3.metric("Ingresos ads", fmt_money(ingresos_total))
+            m4.metric("ACOS", fmt_pct(acos_total))
+            m5.metric("ROAS", f"{roas_total:.2f}" if pd.notna(roas_total) else "—")
+            st.caption(f"Ventas por publicidad: {fmt_int(ventas_total)}")
+
+            ads_show = ads_detail[["campana", "mlc", "estado", "inversion_ads", "ingresos_ads", "acos", "roas", "ventas_ads"]].copy()
+            ads_show.columns = ["Campaña", "MLC", "Estado", "Inversión", "Ingresos", "ACOS", "ROAS", "Ventas Ads"]
+            ads_show["MLC"] = ads_show["MLC"].astype(str).str.replace(r"\.0$", "", regex=True)
+            ads_show["Inversión"] = ads_show["Inversión"].map(fmt_money)
+            ads_show["Ingresos"] = ads_show["Ingresos"].map(fmt_money)
+            ads_show["ACOS"] = ads_show["ACOS"].map(fmt_pct)
+            ads_show["ROAS"] = ads_show["ROAS"].map(lambda x: f"{safe_float(x, np.nan):.2f}" if pd.notna(x) else "—")
+            ads_show["Ventas Ads"] = ads_show["Ventas Ads"].map(fmt_int)
+            st.dataframe(ads_show, use_container_width=True, hide_index=True, height=220)
 
         st.markdown("### Compras")
         ps = model["purchase_summary"]
