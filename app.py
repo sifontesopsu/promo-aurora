@@ -1369,7 +1369,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
             return np.nan
         return (utilidad / ingresos) * 100
 
-    total_hist = ml_sales.groupby("sku").apply(hist_margin).rename("margen_hist_total").reset_index()
+    total_hist = ml_sales.groupby("sku").apply(hist_margin).rename("margen_hist_total").reset_index() if not ml_sales.empty else pd.DataFrame(columns=["sku", "margen_hist_total"])
 
     for d in days_list:
         cutoff = today - pd.Timedelta(days=d)
@@ -1380,7 +1380,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
             ingresos=("total_linea", "sum"),
             unidades=("cantidad", "sum"),
             ventas=("sku", "size")
-        ).reset_index()
+        ).reset_index() if not sw.empty else pd.DataFrame(columns=["sku", "canal", "ingresos", "unidades", "ventas"])
 
         rows = []
         for sku, grp in bysku.groupby("sku"):
@@ -1391,7 +1391,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
                 row[f"unidades_{canal.lower()}_{d}d"] = cgrp["unidades"].sum() if not cgrp.empty else 0.0
                 row[f"ventas_{canal.lower()}_{d}d"] = cgrp["ventas"].sum() if not cgrp.empty else 0.0
             rows.append(row)
-        base = pd.DataFrame(rows)
+        base = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["sku"])
 
         # buyer split and purchase pattern
         sw_pos = sw[(sw["cantidad"] > 0) & (sw["total_linea"] > 0)].copy()
@@ -1418,7 +1418,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
                 row[f"mediana_unidades_{tipo.lower()}_{d}d"] = tgrp["mediana_unidades"].iloc[0] if not tgrp.empty else np.nan
                 row[f"p90_unidades_{tipo.lower()}_{d}d"] = tgrp["p90_unidades"].iloc[0] if not tgrp.empty else np.nan
             buyer_rows.append(row)
-        buyer_df = pd.DataFrame(buyer_rows)
+        buyer_df = pd.DataFrame(buyer_rows) if buyer_rows else pd.DataFrame(columns=["sku"])
 
         hist_d = mlw.groupby("sku").apply(hist_margin).rename(f"margen_hist_{d}d").reset_index() if not mlw.empty else pd.DataFrame(columns=["sku", f"margen_hist_{d}d"])
 
