@@ -1369,7 +1369,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
             return np.nan
         return (utilidad / ingresos) * 100
 
-    total_hist = ml_sales.groupby("sku").apply(hist_margin).rename("margen_hist_total").reset_index() if not ml_sales.empty else pd.DataFrame(columns=["sku", "margen_hist_total"])
+    total_hist = ml_sales.groupby("sku").apply(hist_margin).rename("margen_hist_total").reset_index()
 
     for d in days_list:
         cutoff = today - pd.Timedelta(days=d)
@@ -1380,7 +1380,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
             ingresos=("total_linea", "sum"),
             unidades=("cantidad", "sum"),
             ventas=("sku", "size")
-        ).reset_index() if not sw.empty else pd.DataFrame(columns=["sku", "canal", "ingresos", "unidades", "ventas"])
+        ).reset_index()
 
         rows = []
         for sku, grp in bysku.groupby("sku"):
@@ -1391,7 +1391,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
                 row[f"unidades_{canal.lower()}_{d}d"] = cgrp["unidades"].sum() if not cgrp.empty else 0.0
                 row[f"ventas_{canal.lower()}_{d}d"] = cgrp["ventas"].sum() if not cgrp.empty else 0.0
             rows.append(row)
-        base = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["sku"])
+        base = pd.DataFrame(rows)
 
         # buyer split and purchase pattern
         sw_pos = sw[(sw["cantidad"] > 0) & (sw["total_linea"] > 0)].copy()
@@ -1418,7 +1418,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
                 row[f"mediana_unidades_{tipo.lower()}_{d}d"] = tgrp["mediana_unidades"].iloc[0] if not tgrp.empty else np.nan
                 row[f"p90_unidades_{tipo.lower()}_{d}d"] = tgrp["p90_unidades"].iloc[0] if not tgrp.empty else np.nan
             buyer_rows.append(row)
-        buyer_df = pd.DataFrame(buyer_rows) if buyer_rows else pd.DataFrame(columns=["sku"])
+        buyer_df = pd.DataFrame(buyer_rows)
 
         hist_d = mlw.groupby("sku").apply(hist_margin).rename(f"margen_hist_{d}d").reset_index() if not mlw.empty else pd.DataFrame(columns=["sku", f"margen_hist_{d}d"])
 
@@ -1537,9 +1537,20 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
         (base["ads_inversion"].fillna(0) / base["ingresos_ml_30d"].fillna(0)) * 100,
         0.0
     )
-    base["margen_ml_actual"] = base.apply(lambda r: calc_margin_from_monto_sim(r["costo_maestra"], r["monto_sim"]), axis=1)
-    base["margen_ml_reportado"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0), axis=1)
-    base["margen_ml_con_ads"] = base.apply(lambda r: calc_margin_from_ml_price(r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), r.get("ads_share_ml_pct", 0.0)), axis=1)
+    base["monto_sim_neto"] = np.where(base["monto_sim"].notna(), base["monto_sim"] / 1.19, np.nan)
+    base["margen_ads_base_pct"] = base.apply(lambda r: calc_margin_from_monto_sim(r["costo_maestra"], r["monto_sim"]), axis=1)
+    base["margen_ml_actual"] = base["margen_ads_base_pct"]
+    base["margen_ml_reportado"] = base.apply(
+        lambda r: calc_margin_from_ml_price(
+            r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0
+        ),
+        axis=1,
+    )
+    base["margen_ml_con_ads"] = np.where(
+        base["margen_ads_base_pct"].notna() & base["ads_acos"].notna(),
+        base["margen_ads_base_pct"] - base["ads_acos"],
+        base["margen_ads_base_pct"],
+    )
     base["margen_tienda_actual"] = base.apply(lambda r: calc_margin_from_bruto(r["costo_maestra"], r["precio_bruto"]), axis=1)
     base["brecha_costo_pct"] = np.where(
         base["costo_maestra"].notna() & base["ultimo_costo_compra"].notna() & (base["costo_maestra"] != 0),
@@ -1564,20 +1575,30 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
     base["delta_margen_30d_pp"] = base["margen_ml_actual"] - base["margen_hist_30d"]
     base["estado_brecha_costo"] = base["brecha_costo_pct"].apply(classify_cost_gap_pct)
     base["estado_margen"] = base["delta_margen_30d_pp"].apply(classify_margin_delta_pp)
-    base["objetivo_margen_ads_pct"] = 15.0
-    base["acos_max_permitido_pct"] = np.where(base["margen_ml_reportado"].notna(), base["margen_ml_reportado"], base["margen_ml_actual"])
+    base["objetivo_margen_ads_pct"] = ADS_TARGET_MARGIN_PCT
+    base["acos_max_permitido_pct"] = np.where(
+        base["margen_ads_base_pct"].notna(),
+        base["margen_ads_base_pct"] - base["objetivo_margen_ads_pct"],
+        np.nan,
+    )
     base["gap_acos_pct"] = np.where(
         base["ads_acos"].notna() & base["acos_max_permitido_pct"].notna(),
         base["ads_acos"] - base["acos_max_permitido_pct"],
         np.nan,
     )
-    base["brecha_ads_objetivo_pp"] = base["margen_ml_con_ads"] - base["objetivo_margen_ads_pct"]
+    base["brecha_ads_objetivo_pp"] = np.where(
+        base["margen_ml_con_ads"].notna(),
+        base["margen_ml_con_ads"] - base["objetivo_margen_ads_pct"],
+        np.nan,
+    )
     base["estado_ads"] = base.apply(classify_ads_state, axis=1)
+    base["motivo_ads"] = base.apply(classify_ads_reason, axis=1)
     base["accion_ads"] = base.apply(suggest_ads_action, axis=1)
     base["ads_score"] = 0.0
     base["ads_score"] += base["margen_ml_con_ads"].fillna(0) * 0.5
-    base["ads_score"] += base["ads_roas"].fillna(0) * 10 * 0.3
-    base["ads_score"] -= base["ads_acos"].fillna(0) * 0.2
+    base["ads_score"] += base["ads_roas"].fillna(0) * 3.0
+    base["ads_score"] -= base["ads_acos"].fillna(0) * 0.7
+    base["ads_score"] += np.where(base["estado_ads"].eq("OPORTUNIDAD"), 10, 0)
 
     def action(row):
         cost_state = row["estado_brecha_costo"]
