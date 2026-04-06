@@ -334,6 +334,27 @@ def safe_float(value, default=np.nan):
         return default
 
 
+def optimize_df_memory(df: pd.DataFrame, category_threshold: float = 0.5) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        series = out[col]
+        if pd.api.types.is_float_dtype(series):
+            out[col] = pd.to_numeric(series, downcast="float")
+        elif pd.api.types.is_integer_dtype(series):
+            out[col] = pd.to_numeric(series, downcast="integer")
+        elif pd.api.types.is_object_dtype(series):
+            nunique = series.nunique(dropna=True)
+            non_null = max(int(series.notna().sum()), 1)
+            if nunique > 0 and nunique / non_null <= category_threshold:
+                try:
+                    out[col] = series.astype("category")
+                except Exception:
+                    pass
+    return out
+
+
 def norm_sku(value) -> str:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return ""
@@ -1010,7 +1031,6 @@ def load_master_workbook(file_bytes: bytes):
         "master_df": master_df,
         "bridge_df": bridge_df,
         "rel_df": rel_df,
-        "file_bytes": file_bytes,
     }
 
 
@@ -1249,7 +1269,7 @@ def load_sales(file_bytes: bytes):
     raw["rut"] = raw["Rut"].fillna("").astype(str)
     raw["cliente"] = raw["Razón Social"].fillna("").astype(str)
     raw = raw[raw["sku"] != ""].copy()
-    return raw
+    return optimize_df_memory(raw)
 
 
 @st.cache_data(show_spinner=False)
@@ -1267,7 +1287,7 @@ def load_purchases(file_bytes: bytes):
     raw["documento"] = raw["Documento"].fillna("").astype(str)
     raw["folio"] = raw["Folio"].fillna("").astype(str)
     raw = raw[raw["sku"] != ""].copy()
-    return raw
+    return optimize_df_memory(raw)
 
 
 @st.cache_data(show_spinner=False)
@@ -1317,7 +1337,7 @@ def load_publications(file_bytes: bytes):
     raw = pd.concat([raw, dims], axis=1)
     raw["ingreso_estimado_ml"] = raw["precio_final"].map(safe_float) - raw["total_cargo_monto"].map(safe_float).fillna(0) - raw["costo_fijo"].map(safe_float).fillna(0)
     raw = raw[raw["sku"] != ""].copy()
-    return raw
+    return optimize_df_memory(raw)
 
 
 @st.cache_data(show_spinner=False)
@@ -1344,7 +1364,7 @@ def load_product_ads(file_bytes: bytes):
     for c in ["impresiones", "clics", "ingresos_ads", "inversion_ads", "acos", "roas", "ventas_ads"]:
         out[c] = out[c].map(safe_float)
     out = out[out["mlc"] != ""].copy()
-    return out
+    return optimize_df_memory(out)
 
 
 @st.cache_data(show_spinner=False)
@@ -1368,7 +1388,7 @@ def load_keywords(file_bytes: bytes):
         out[dst] = df[src] if src in df.columns else np.nan
     for c in ["impresiones", "clics", "ingresos", "inversion", "acos", "roas", "ventas_ads"]:
         out[c] = out[c].map(safe_float)
-    return out
+    return optimize_df_memory(out)
 
 
 # =========================================================
@@ -1509,12 +1529,10 @@ def summarize_purchases(purchases):
     if purchases is None or purchases.empty:
         return pd.DataFrame(columns=[
             "sku", "ultima_fecha_compra", "ultimo_costo_compra", "ultimo_proveedor", "ultima_cantidad_compra", "brecha_doc", "compras_total"
-        ]), {}
-    by_sku = {}
+        ])
     rows = []
     for sku, grp in purchases.groupby("sku", sort=False):
         grp = grp.sort_values("fecha")
-        by_sku[sku] = grp.copy()
         last = grp.iloc[-1]
         rows.append({
             "sku": sku,
@@ -1524,7 +1542,7 @@ def summarize_purchases(purchases):
             "ultima_cantidad_compra": safe_float(last["cantidad"]),
             "compras_total": len(grp),
         })
-    return pd.DataFrame(rows), by_sku
+    return optimize_df_memory(pd.DataFrame(rows))
 
 
 def aggregate_ads_by_sku(product_ads, publications):
@@ -1583,12 +1601,10 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
 
     # current publication snapshot
     pub_primary_rows = []
-    pub_map = {}
     if publications is not None and not publications.empty:
         for sku, grp in publications.groupby("sku", sort=False):
             pr = choose_primary_publication(grp)
             if pr is not None:
-                pub_map[sku] = grp.copy()
                 pub_primary_rows.append({
                     "sku": sku,
                     "mlc_principal": pr["mlc"],
@@ -1707,7 +1723,7 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
     base["score"] += base["ads_inversion"].fillna(0) / 10000
     base = base.sort_values(["score", "ingresos_ml_30d"], ascending=[False, False])
 
-    return base, pub_map
+    return optimize_df_memory(base)
 
 
 def rel_to_sheet_df(rel_df: pd.DataFrame) -> pd.DataFrame:
@@ -1748,6 +1764,39 @@ def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, original
     return out.getvalue()
 
 
+@st.cache_data(show_spinner=False)
+def get_sales_history_for_sku(ventas_bytes: bytes | None, sku: str) -> pd.DataFrame:
+    if not ventas_bytes or not sku:
+        return pd.DataFrame()
+    sales = load_sales(ventas_bytes)
+    return sales[sales["sku"] == norm_sku(sku)].copy()
+
+
+@st.cache_data(show_spinner=False)
+def get_purchase_history_for_sku(compras_bytes: bytes | None, sku: str) -> pd.DataFrame:
+    if not compras_bytes or not sku:
+        return pd.DataFrame()
+    purchases = load_purchases(compras_bytes)
+    return purchases[purchases["sku"] == norm_sku(sku)].copy()
+
+
+@st.cache_data(show_spinner=False)
+def get_publications_for_sku(pubs_bytes: bytes | None, sku: str) -> pd.DataFrame:
+    if not pubs_bytes or not sku:
+        return pd.DataFrame()
+    pubs = load_publications(pubs_bytes)
+    return pubs[pubs["sku"] == norm_sku(sku)].copy()
+
+
+@st.cache_data(show_spinner=False)
+def get_ads_report_detail_for_sku_cached(ads_bytes: bytes | None, pubs_bytes: bytes | None, sku: str) -> pd.DataFrame:
+    if not ads_bytes or not pubs_bytes or not sku:
+        return pd.DataFrame()
+    product_ads = load_product_ads(ads_bytes)
+    publications = load_publications(pubs_bytes)
+    return build_ads_report_detail_for_sku(norm_sku(sku), product_ads, publications)
+
+
 # =========================================================
 # Model
 # =========================================================
@@ -1762,11 +1811,11 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     product_ads = load_product_ads(ads_up.getvalue()) if ads_up else pd.DataFrame()
     keywords = load_keywords(keywords_up.getvalue()) if keywords_up else pd.DataFrame()
 
-    sales_windows, total_hist, ml_sales = summarize_sales_windows(ventas, master, compras, days_list=(7, 15, 30, 90))
-    purchase_summary, purchase_map = summarize_purchases(compras)
+    sales_windows, total_hist, _ml_sales = summarize_sales_windows(ventas, master, compras, days_list=(7, 15, 30, 90))
+    purchase_summary = summarize_purchases(compras)
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
-    action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
+    action_table = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
     validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos, action_table)
 
     product_options = action_table["sku"].dropna().tolist()
@@ -1777,19 +1826,11 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
         "master": master,
         "promos": promos,
         "rel": rel,
-        "ventas": ventas,
-        "compras": compras,
-        "pubs": pubs,
-        "product_ads": product_ads,
-        "keywords": keywords,
         "kw_summary": kw_summary,
         "sales_windows": sales_windows,
-        "ml_sales": ml_sales,
         "purchase_summary": purchase_summary,
-        "purchase_map": purchase_map,
         "ads_by_sku": ads_by_sku,
         "action_table": action_table,
-        "pub_map": pub_map,
         "product_options": product_options,
         "sku_desc": sku_desc,
         "validations": validations,
@@ -1821,7 +1862,8 @@ def build_shared_model(resolved_files: dict):
 def persist_current_master_workbook(model: dict, note: str = "maestra actualizada desde app"):
     ensure_storage_dirs()
     wb = model["wb"]
-    output_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
+    original_master_bytes = load_active_file("master").getvalue() if load_active_file("master") is not None else b""
+    output_bytes = build_download_bytes(model["master"], model["rel"], original_master_bytes, wb["maestra_name"], wb["rel_name"])
     active_path = active_file_path("master")
     archived_path = archive_existing_active_file("master")
     active_path.write_bytes(output_bytes)
@@ -1947,7 +1989,6 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
             st.warning(f"No pude guardar snapshot automático: {e}")
 
 model["action_table"] = action_table
-model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"], action_table)
 
 tabs = st.tabs([
     "Centro de Control Comercial",
@@ -2200,7 +2241,11 @@ with tabs[1]:
             st.write(f"Ventas tienda 90d: {fmt_money(model['sales_windows'].get(90, pd.DataFrame()).set_index('sku').get('ingresos_tienda_90d', pd.Series()).get(sku, np.nan) if not model['sales_windows'].get(90, pd.DataFrame()).empty else np.nan)}")
 
         st.markdown("### Ads")
-        ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
+        ads_detail = get_ads_report_detail_for_sku_cached(
+            resolved_files.get("ads").getvalue() if resolved_files.get("ads") else None,
+            resolved_files.get("pubs").getvalue() if resolved_files.get("pubs") else None,
+            sku,
+        )
         if ads_detail.empty:
             st.info("No encontré Product Ads asociados a las publicaciones de este SKU.")
         else:
@@ -2240,7 +2285,10 @@ with tabs[1]:
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
             c4.metric("Brecha maestra vs última compra", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
-            hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
+            hist = get_purchase_history_for_sku(
+                resolved_files.get("compras").getvalue() if resolved_files.get("compras") else None,
+                sku,
+            ).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
                 hist_show.columns = ["Fecha", "Proveedor", "Cantidad", "Precio Unitario", "Documento", "Folio"]
@@ -2272,7 +2320,12 @@ with tabs[1]:
                 st.write(f"P90 personas: {fmt_int(srow.get(f'p90_unidades_persona_{default_period}d'))} unidades")
 
         st.markdown("### Datos de Publicación ML")
-        pr = choose_primary_publication(model["pub_map"].get(sku, pd.DataFrame()))
+        pr = choose_primary_publication(
+            get_publications_for_sku(
+                resolved_files.get("pubs").getvalue() if resolved_files.get("pubs") else None,
+                sku,
+            )
+        )
         if pr is None:
             st.info("No encontré publicación principal para este SKU.")
         else:
@@ -2288,7 +2341,10 @@ with tabs[1]:
             st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
 
         st.markdown("### Historial de ventas")
-        sales_sku = model["ventas"][model["ventas"]["sku"] == sku].copy()
+        sales_sku = get_sales_history_for_sku(
+            resolved_files.get("ventas").getvalue() if resolved_files.get("ventas") else None,
+            sku,
+        ).copy()
         if sales_sku.empty:
             st.info("No encontré ventas para este SKU.")
         else:
@@ -2743,7 +2799,8 @@ if False:
 if False:
     st.subheader("Descargar maestra actualizada")
     wb = model["wb"]
-    download_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
+    original_master_bytes = load_active_file("master").getvalue() if load_active_file("master") is not None else b""
+    download_bytes = build_download_bytes(model["master"], model["rel"], original_master_bytes, wb["maestra_name"], wb["rel_name"])
     st.download_button(
         "Descargar workbook actualizado",
         data=download_bytes,
