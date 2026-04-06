@@ -617,41 +617,6 @@ def build_ads_report_detail_for_sku(sku: str, product_ads: pd.DataFrame | None, 
     return ads
 
 
-@st.cache_data(show_spinner=False)
-def load_ads_detail_sources(pubs_bytes: bytes | None, ads_bytes: bytes | None):
-    pubs = load_publications(pubs_bytes) if pubs_bytes else pd.DataFrame()
-    product_ads = load_product_ads(ads_bytes) if ads_bytes else pd.DataFrame()
-    return {"pubs": pubs, "product_ads": product_ads}
-
-
-def build_ads_report_detail_for_sku_context(sku: str, model: dict | None = None, resolved_files: dict | None = None) -> pd.DataFrame:
-    product_ads = model.get("product_ads") if isinstance(model, dict) else None
-    publications = model.get("pubs") if isinstance(model, dict) else None
-
-    has_model_ads = isinstance(product_ads, pd.DataFrame) and not product_ads.empty
-    has_model_pubs = isinstance(publications, pd.DataFrame) and not publications.empty
-
-    if not (has_model_ads and has_model_pubs):
-        pubs_file = resolved_files.get("pubs") if isinstance(resolved_files, dict) else None
-        ads_file = resolved_files.get("ads") if isinstance(resolved_files, dict) else None
-
-        pubs_bytes = pubs_file.getvalue() if pubs_file is not None else None
-        ads_bytes = ads_file.getvalue() if ads_file is not None else None
-
-        if pubs_bytes is None:
-            active_pubs = load_active_file("pubs")
-            pubs_bytes = active_pubs.getvalue() if active_pubs is not None else None
-        if ads_bytes is None:
-            active_ads = load_active_file("ads")
-            ads_bytes = active_ads.getvalue() if active_ads is not None else None
-
-        sources = load_ads_detail_sources(pubs_bytes, ads_bytes)
-        publications = sources["pubs"]
-        product_ads = sources["product_ads"]
-
-    return build_ads_report_detail_for_sku(sku, product_ads, publications)
-
-
 def ensure_history_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
@@ -1889,11 +1854,17 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
             st.warning(f"No pude guardar snapshot automático: {e}")
 
 model["action_table"] = action_table
-model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"], action_table)
+if "validations" not in model or not isinstance(model.get("validations"), dict):
+    _ventas_val = load_sales(ventas_up.getvalue()) if ventas_up else pd.DataFrame()
+    _compras_val = load_purchases(compras_up.getvalue()) if compras_up else pd.DataFrame()
+    _pubs_val = load_publications(pubs_up.getvalue()) if pubs_up else pd.DataFrame()
+    _ads_val = load_product_ads(ads_up.getvalue()) if ads_up else pd.DataFrame()
+    model["validations"] = build_validation_layers(model["master"], _ventas_val, _compras_val, _pubs_val, _ads_val, model["promos"], action_table)
 
 tabs = st.tabs([
     "Centro de Control Comercial",
     "Ficha de Producto",
+    "Ads",
 ])
 
 # =========================================================
@@ -2141,7 +2112,7 @@ with tabs[1]:
             st.write(f"Ventas tienda 90d: {fmt_money(model['sales_windows'].get(90, pd.DataFrame()).set_index('sku').get('ingresos_tienda_90d', pd.Series()).get(sku, np.nan) if not model['sales_windows'].get(90, pd.DataFrame()).empty else np.nan)}")
 
         st.markdown("### Ads")
-        ads_detail = build_ads_report_detail_for_sku_context(sku, model=model, resolved_files=resolved_files)
+        ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
         if ads_detail.empty:
             st.info("No encontré Product Ads asociados a las publicaciones de este SKU.")
         else:
