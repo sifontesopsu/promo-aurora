@@ -25,6 +25,11 @@ BASE_DATA_DIR = Path("data")
 ACTIVE_FILES_DIR = BASE_DATA_DIR / "activos"
 BACKUP_FILES_DIR = BASE_DATA_DIR / "respaldo_archivos"
 
+ADS_TARGET_MARGIN_PCT = 20.0
+ADS_GLOBAL_ACOS_ALERT_PCT = 5.09
+ADS_GLOBAL_ROAS_MIN = 10.0
+ADS_OPPORTUNITY_EXTRA_MARGIN_PCT = 5.0
+
 FILE_SPECS = {
     "master": {"label": "Maestra de precios", "filename": "maestra.xlsx", "required": True},
     "ventas": {"label": "Reporte de ventas", "filename": "ventas.xlsx", "required": True},
@@ -1669,7 +1674,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     product_ads = load_product_ads(ads_up.getvalue()) if ads_up else pd.DataFrame()
     keywords = load_keywords(keywords_up.getvalue()) if keywords_up else pd.DataFrame()
 
-    sales_windows, total_hist, ml_sales = summarize_sales_windows(ventas, master, compras, days_list=(30, 90))
+    sales_windows, total_hist, ml_sales = summarize_sales_windows(ventas, master, compras, days_list=(7, 15, 30, 90))
     purchase_summary, purchase_map = summarize_purchases(compras)
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
@@ -1714,59 +1719,6 @@ def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_byte
     return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
 
 
-
-
-def get_model_or_loaded_df(model: dict, resolved_files: dict, key: str) -> pd.DataFrame:
-    df = model.get(key) if isinstance(model, dict) else None
-    if isinstance(df, pd.DataFrame):
-        return df
-    rf = resolved_files.get(key) if isinstance(resolved_files, dict) else None
-    if rf is None:
-        return pd.DataFrame()
-    try:
-        data = rf.getvalue()
-        if key == "ventas":
-            return load_sales(data)
-        if key == "compras":
-            return load_purchases(data)
-        if key == "pubs":
-            return load_publications(data)
-        if key == "ads":
-            return load_product_ads(data)
-        if key == "keywords":
-            return load_keywords(data)
-    except Exception:
-        return pd.DataFrame()
-    return pd.DataFrame()
-
-
-def get_purchase_history_for_sku(model: dict, resolved_files: dict, sku: str) -> pd.DataFrame:
-    purchase_map = model.get("purchase_map") if isinstance(model, dict) else None
-    if isinstance(purchase_map, dict):
-        hist = purchase_map.get(sku, pd.DataFrame())
-        return hist.copy() if isinstance(hist, pd.DataFrame) else pd.DataFrame()
-    compras_df = get_model_or_loaded_df(model, resolved_files, "compras")
-    if compras_df.empty or "sku" not in compras_df.columns:
-        return pd.DataFrame()
-    return compras_df[compras_df["sku"] == sku].copy()
-
-
-def get_publications_for_sku(model: dict, resolved_files: dict, sku: str) -> pd.DataFrame:
-    pub_map = model.get("pub_map") if isinstance(model, dict) else None
-    if isinstance(pub_map, dict):
-        pubs = pub_map.get(sku, pd.DataFrame())
-        return pubs.copy() if isinstance(pubs, pd.DataFrame) else pd.DataFrame()
-    pubs_df = get_model_or_loaded_df(model, resolved_files, "pubs")
-    if pubs_df.empty or "sku" not in pubs_df.columns:
-        return pd.DataFrame()
-    return pubs_df[pubs_df["sku"] == sku].copy()
-
-
-def get_sales_for_sku(model: dict, resolved_files: dict, sku: str) -> pd.DataFrame:
-    ventas_df = get_model_or_loaded_df(model, resolved_files, "ventas")
-    if ventas_df.empty or "sku" not in ventas_df.columns:
-        return pd.DataFrame()
-    return ventas_df[ventas_df["sku"] == sku].copy()
 def build_shared_model(resolved_files: dict):
     return build_model_cached(
         resolved_files["master"].getvalue() if resolved_files.get("master") else None,
@@ -1843,7 +1795,7 @@ with st.sidebar:
     st.dataframe(status_df, use_container_width=True, hide_index=True, height=250)
 
     st.markdown("---")
-    default_period = st.selectbox("Periodo de análisis", [30, 90], index=0)
+    default_period = st.selectbox("Periodo de análisis", [7, 15, 30, 90], index=2)
     st.caption("Ventas, patrones y margen histórico se priorizan con este periodo.")
 
     st.markdown("---")
@@ -1907,12 +1859,7 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
             st.warning(f"No pude guardar snapshot automático: {e}")
 
 model["action_table"] = action_table
-if "validations" not in model or not isinstance(model.get("validations"), dict):
-    _ventas_val = load_sales(ventas_up.getvalue()) if ventas_up else pd.DataFrame()
-    _compras_val = load_purchases(compras_up.getvalue()) if compras_up else pd.DataFrame()
-    _pubs_val = load_publications(pubs_up.getvalue()) if pubs_up else pd.DataFrame()
-    _ads_val = load_product_ads(ads_up.getvalue()) if ads_up else pd.DataFrame()
-    model["validations"] = build_validation_layers(model["master"], _ventas_val, _compras_val, _pubs_val, _ads_val, model["promos"], action_table)
+model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"], action_table)
 
 tabs = st.tabs([
     "Centro de Control Comercial",
@@ -2205,7 +2152,7 @@ with tabs[1]:
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
             c4.metric("Brecha maestra vs última compra", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
-            hist = get_purchase_history_for_sku(model, resolved_files, sku)
+            hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
                 hist_show.columns = ["Fecha", "Proveedor", "Cantidad", "Precio Unitario", "Documento", "Folio"]
@@ -2237,7 +2184,7 @@ with tabs[1]:
                 st.write(f"P90 personas: {fmt_int(srow.get(f'p90_unidades_persona_{default_period}d'))} unidades")
 
         st.markdown("### Datos de Publicación ML")
-        pr = choose_primary_publication(get_publications_for_sku(model, resolved_files, sku))
+        pr = choose_primary_publication(model["pub_map"].get(sku, pd.DataFrame()))
         if pr is None:
             st.info("No encontré publicación principal para este SKU.")
         else:
@@ -2253,7 +2200,7 @@ with tabs[1]:
             st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
 
         st.markdown("### Historial de ventas")
-        sales_sku = get_sales_for_sku(model, resolved_files, sku)
+        sales_sku = model["ventas"][model["ventas"]["sku"] == sku].copy()
         if sales_sku.empty:
             st.info("No encontré ventas para este SKU.")
         else:
@@ -2356,6 +2303,211 @@ if False:
     for c in ["Fee ML sim %", "Ads sim %", "Margen proyectado actual", "Margen proyectado sugerido", "Δ precio sugerido %"]:
         sim_show[c] = sim_show[c].map(fmt_pct)
     st.dataframe(sim_show.sort_values(["Decisión repricing", "Δ precio sugerido %"], ascending=[True, False]), use_container_width=True, hide_index=True, height=540)
+
+
+# =========================================================
+# Tab 3 - Ads
+# =========================================================
+with tabs[2]:
+    st.subheader("Módulo Ads")
+    st.caption("Rentabilidad Ads calculada con la base actual del sistema. Aquí puedes revisar alertas, oportunidades y el detalle por SKU con sus campañas.")
+
+    ads_table = action_table.copy()
+    if ads_table.empty:
+        st.info("No hay base suficiente para construir el módulo Ads.")
+    else:
+        active_ads = ads_table[(ads_table["ads_inversion"].fillna(0) > 0) | (ads_table["ads_ingresos"].fillna(0) > 0) | (ads_table["ads_clics"].fillna(0) > 0)].copy()
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        total_inv = active_ads["ads_inversion"].fillna(0).sum()
+        total_ing = active_ads["ads_ingresos"].fillna(0).sum()
+        global_acos = (total_inv / total_ing * 100) if total_ing > 0 else np.nan
+        global_roas = (total_ing / total_inv) if total_inv > 0 else np.nan
+        k1.metric("Inversión Ads", fmt_money(total_inv))
+        k2.metric("Ingresos Ads", fmt_money(total_ing))
+        k3.metric("ACOS global", fmt_pct(global_acos))
+        k4.metric("ROAS global", "—" if pd.isna(global_roas) else f"{global_roas:.2f}")
+        k5.metric("SKUs críticos", fmt_int(int((ads_table.get("estado_ads", pd.Series(dtype=str)) == "CRÍTICO").sum())))
+        k6.metric("SKUs oportunidad", fmt_int(int((ads_table.get("estado_ads", pd.Series(dtype=str)) == "OPORTUNIDAD").sum())))
+
+        x1, x2, x3, x4 = st.columns([1.2, 1.2, 1.0, 1.2])
+        state_options = ["CRÍTICO", "ALERTA", "OPORTUNIDAD", "OK", "SIN ADS", "NO USAR ADS"]
+        ads_state_filter = x1.multiselect("Estado Ads", state_options, default=state_options, key="ads_module_state")
+        ads_action_filter = x2.multiselect("Acción Ads", sorted([x for x in ads_table.get("accion_ads", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x]), default=[], key="ads_module_action")
+        ads_only_live = x3.selectbox("Cobertura", ["Todos", "Solo con datos Ads", "Solo sin Ads"], key="ads_module_coverage")
+        ads_search = x4.text_input("Buscar SKU / descripción / MLC", key="ads_module_search")
+
+        y1, y2, y3, y4 = st.columns(4)
+        min_inv = float(y1.number_input("Inversión mínima", min_value=0.0, value=0.0, step=1000.0, key="ads_module_min_inv"))
+        min_clicks = float(y2.number_input("Clicks mínimos", min_value=0.0, value=0.0, step=1.0, key="ads_module_min_clicks"))
+        acos_view = y3.selectbox("Vista ACOS", ["Todos", "Sobre 5.09%", "Sobre ACOS máximo", "Dentro de límite"], key="ads_module_acos_view")
+        sort_mode = y4.selectbox("Orden", ["Mayor criticidad", "Mayor inversión", "Peor margen con Ads", "Mayor gap ACOS", "Mejor oportunidad"], key="ads_module_sort")
+
+        ads_work = ads_table.copy()
+        required_ads_cols = {
+            "sku": "", "descripcion": "", "mlc_principal": "", "estado_ads": "SIN ADS", "accion_ads": "Sin acción",
+            "ads_inversion": np.nan, "ads_ingresos": np.nan, "ads_acos": np.nan, "ads_roas": np.nan,
+            "ads_clics": np.nan, "ads_impresiones": np.nan, "acos_max_permitido_pct": np.nan,
+            "gap_acos_pct": np.nan, "margen_ml_reportado": np.nan, "margen_ml_con_ads": np.nan,
+            "brecha_ads_objetivo_pp": np.nan, "margen_ads_base_pct": np.nan, "motivo_ads": "Sin datos suficientes",
+            "ads_score": np.nan, "precio_ml_actual": np.nan, "monto_sim": np.nan, "monto_sim_neto": np.nan,
+        }
+        for _col, _default in required_ads_cols.items():
+            if _col not in ads_work.columns:
+                ads_work[_col] = _default
+
+        if ads_state_filter:
+            ads_work = ads_work[ads_work["estado_ads"].isin(ads_state_filter)]
+        if ads_action_filter:
+            ads_work = ads_work[ads_work["accion_ads"].isin(ads_action_filter)]
+        if ads_only_live == "Solo con datos Ads":
+            ads_work = ads_work[(ads_work["ads_inversion"].fillna(0) > 0) | (ads_work["ads_ingresos"].fillna(0) > 0) | (ads_work["ads_clics"].fillna(0) > 0)]
+        elif ads_only_live == "Solo sin Ads":
+            ads_work = ads_work[(ads_work["ads_inversion"].fillna(0) <= 0) & (ads_work["ads_ingresos"].fillna(0) <= 0) & (ads_work["ads_clics"].fillna(0) <= 0)]
+        ads_work = ads_work[ads_work["ads_inversion"].fillna(0) >= min_inv]
+        ads_work = ads_work[ads_work["ads_clics"].fillna(0) >= min_clicks]
+        if acos_view == "Sobre 5.09%":
+            ads_work = ads_work[ads_work["ads_acos"].fillna(-np.inf) > ADS_GLOBAL_ACOS_ALERT_PCT]
+        elif acos_view == "Sobre ACOS máximo":
+            ads_work = ads_work[ads_work["gap_acos_pct"].fillna(-np.inf) > 0]
+        elif acos_view == "Dentro de límite":
+            ads_work = ads_work[ads_work["gap_acos_pct"].fillna(np.inf) <= 0]
+        if ads_search:
+            q = ads_search.strip().lower()
+            ads_work = ads_work[
+                ads_work["sku"].astype(str).str.lower().str.contains(q, na=False) |
+                ads_work["descripcion"].astype(str).str.lower().str.contains(q, na=False) |
+                ads_work["mlc_principal"].astype(str).str.lower().str.contains(q, na=False)
+            ]
+
+        severity_rank = {"CRÍTICO": 5, "NO USAR ADS": 4, "ALERTA": 3, "OPORTUNIDAD": 2, "OK": 1, "SIN ADS": 0}
+        ads_work["_ads_rank"] = ads_work["estado_ads"].map(severity_rank).fillna(0)
+        sort_config = {
+            "Mayor criticidad": (["_ads_rank", "ads_inversion", "gap_acos_pct"], [False, False, False]),
+            "Mayor inversión": (["ads_inversion", "ads_ingresos"], [False, False]),
+            "Peor margen con Ads": (["margen_ml_con_ads", "ads_inversion"], [True, False]),
+            "Mayor gap ACOS": (["gap_acos_pct", "ads_inversion"], [False, False]),
+            "Mejor oportunidad": (["ads_score", "ads_roas"], [False, False]),
+        }
+        scols, sasc = sort_config[sort_mode]
+        ads_work = ads_work.sort_values(scols, ascending=sasc, na_position="last")
+
+        ads_tabs = st.tabs(["Resumen", "Alertas", "Oportunidades", "Detalle por SKU"])
+
+        with ads_tabs[0]:
+            top_summary = ads_work[[
+                "sku", "descripcion", "estado_ads", "motivo_ads", "accion_ads",
+                "ads_inversion", "ads_ingresos", "ads_acos", "ads_roas",
+                "margen_ads_base_pct", "margen_ml_con_ads", "acos_max_permitido_pct", "gap_acos_pct"
+            ]].copy()
+            top_summary.columns = [
+                "SKU", "Descripción", "Estado Ads", "Motivo", "Acción Ads",
+                "Inversión Ads", "Ingresos Ads", "ACOS real", "ROAS",
+                "Margen base Ads", "Margen con Ads", "ACOS máximo", "Gap ACOS"
+            ]
+            for c in ["Inversión Ads", "Ingresos Ads"]:
+                top_summary[c] = top_summary[c].map(fmt_money)
+            for c in ["ACOS real", "Margen base Ads", "Margen con Ads", "ACOS máximo", "Gap ACOS"]:
+                top_summary[c] = top_summary[c].map(fmt_pct)
+            top_summary["ROAS"] = top_summary["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+            st.dataframe(top_summary.head(200), use_container_width=True, hide_index=True, height=420)
+
+        with ads_tabs[1]:
+            alerts = ads_work[ads_work["estado_ads"].isin(["CRÍTICO", "ALERTA", "NO USAR ADS"])].copy()
+            if alerts.empty:
+                st.success("No hay SKUs en alerta con los filtros aplicados.")
+            else:
+                alert_view = alerts[[
+                    "sku", "descripcion", "mlc_principal", "estado_ads", "motivo_ads", "accion_ads",
+                    "ads_inversion", "ads_ingresos", "ads_clics", "ads_impresiones",
+                    "ads_acos", "ads_roas", "margen_ads_base_pct", "margen_ml_con_ads",
+                    "acos_max_permitido_pct", "gap_acos_pct", "precio_ml_actual", "monto_sim", "monto_sim_neto"
+                ]].copy()
+                alert_view.columns = [
+                    "SKU", "Descripción", "MLC", "Estado Ads", "Motivo", "Acción Ads",
+                    "Inversión Ads", "Ingresos Ads", "Clicks", "Impresiones",
+                    "ACOS real", "ROAS", "Margen base Ads", "Margen con Ads",
+                    "ACOS máximo", "Gap ACOS", "Precio real ML", "Monto simulación", "Monto sim neto"
+                ]
+                for c in ["Inversión Ads", "Ingresos Ads", "Precio real ML", "Monto simulación", "Monto sim neto"]:
+                    alert_view[c] = alert_view[c].map(fmt_money)
+                for c in ["ACOS real", "Margen base Ads", "Margen con Ads", "ACOS máximo", "Gap ACOS"]:
+                    alert_view[c] = alert_view[c].map(fmt_pct)
+                alert_view["ROAS"] = alert_view["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                alert_view["Clicks"] = alert_view["Clicks"].map(fmt_int)
+                alert_view["Impresiones"] = alert_view["Impresiones"].map(fmt_int)
+                st.dataframe(alert_view.head(300), use_container_width=True, hide_index=True, height=460)
+
+        with ads_tabs[2]:
+            opp = ads_work[ads_work["estado_ads"].isin(["OPORTUNIDAD", "SIN ADS"])].copy()
+            opp = opp.sort_values(["estado_ads", "ads_score", "margen_ads_base_pct"], ascending=[True, False, False], na_position="last")
+            if opp.empty:
+                st.info("No encontré oportunidades con los filtros aplicados.")
+            else:
+                opp_view = opp[[
+                    "sku", "descripcion", "estado_ads", "motivo_ads", "accion_ads",
+                    "margen_ads_base_pct", "margen_ml_con_ads", "ads_acos", "ads_roas",
+                    "ads_inversion", "ads_ingresos", "precio_ml_actual", "monto_sim"
+                ]].copy()
+                opp_view.columns = [
+                    "SKU", "Descripción", "Estado Ads", "Motivo", "Acción Ads",
+                    "Margen base Ads", "Margen con Ads", "ACOS real", "ROAS",
+                    "Inversión Ads", "Ingresos Ads", "Precio real ML", "Monto simulación"
+                ]
+                for c in ["Inversión Ads", "Ingresos Ads", "Precio real ML", "Monto simulación"]:
+                    opp_view[c] = opp_view[c].map(fmt_money)
+                for c in ["Margen base Ads", "Margen con Ads", "ACOS real"]:
+                    opp_view[c] = opp_view[c].map(fmt_pct)
+                opp_view["ROAS"] = opp_view["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                st.dataframe(opp_view.head(300), use_container_width=True, hide_index=True, height=420)
+
+        with ads_tabs[3]:
+            sku_labels_ads = [f"{sku} — {model['sku_desc'].get(sku, '')}" for sku in ads_work["sku"].dropna().astype(str).tolist()]
+            if not sku_labels_ads:
+                st.info("No hay SKUs disponibles con los filtros actuales.")
+            else:
+                default_sku_ads = st.session_state.get("selected_sku", ads_work.iloc[0]["sku"])
+                default_label_ads = f"{default_sku_ads} — {model['sku_desc'].get(default_sku_ads, '')}"
+                index_ads = sku_labels_ads.index(default_label_ads) if default_label_ads in sku_labels_ads else 0
+                selected_label_ads = st.selectbox("SKU Ads", sku_labels_ads, index=index_ads, key="ads_detail_sku")
+                sku_ads = selected_label_ads.split(" — ")[0]
+                st.session_state.selected_sku = sku_ads
+
+                detail = ads_table[ads_table["sku"] == sku_ads].copy()
+                if detail.empty:
+                    st.info("No encontré detalle para ese SKU.")
+                else:
+                    drow = detail.iloc[0]
+                    d1, d2, d3, d4, d5, d6 = st.columns(6)
+                    d1.metric("Estado Ads", str(drow.get("estado_ads", "—")))
+                    d2.metric("Acción Ads", str(drow.get("accion_ads", "—")))
+                    d3.metric("Margen base Ads", fmt_pct(drow.get("margen_ads_base_pct")))
+                    d4.metric("Margen con Ads", fmt_pct(drow.get("margen_ml_con_ads")))
+                    d5.metric("ACOS real / máx", f"{fmt_pct(drow.get('ads_acos'))} / {fmt_pct(drow.get('acos_max_permitido_pct'))}")
+                    d6.metric("ROAS", "—" if pd.isna(safe_float(drow.get("ads_roas"), np.nan)) else f"{safe_float(drow.get('ads_roas')):.2f}")
+
+                    st.write(f"**Motivo:** {drow.get('motivo_ads', '—')}")
+                    st.write(f"**MLC principal:** {drow.get('mlc_principal', '—')}")
+                    st.write(f"**Precio real ML:** {fmt_money(drow.get('precio_ml_actual'))}")
+                    st.write(f"**Monto simulación:** {fmt_money(drow.get('monto_sim'))}")
+                    st.write(f"**Monto simulación neto:** {fmt_money(drow.get('monto_sim_neto'))}")
+                    st.write(f"**Margen real reportado ML:** {fmt_pct(drow.get('margen_ml_reportado'))}")
+
+                    report_detail = build_ads_report_detail_for_sku(sku_ads, model.get("product_ads"), model.get("pubs"))
+                    if report_detail.empty:
+                        st.info("No encontré campañas/anuncios Ads para este SKU en el reporte cargado.")
+                    else:
+                        show_detail = report_detail.copy()
+                        show_detail.columns = [
+                            "Campaña", "MLC", "Título", "Estado", "Inversión Ads", "Ingresos Ads", "ACOS", "ROAS", "Ventas Ads", "Impresiones", "Clicks"
+                        ]
+                        for c in ["Inversión Ads", "Ingresos Ads"]:
+                            show_detail[c] = show_detail[c].map(fmt_money)
+                        show_detail["ACOS"] = show_detail["ACOS"].map(fmt_pct)
+                        show_detail["ROAS"] = show_detail["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                        show_detail["Ventas Ads"] = show_detail["Ventas Ads"].map(fmt_int)
+                        show_detail["Impresiones"] = show_detail["Impresiones"].map(fmt_int)
+                        show_detail["Clicks"] = show_detail["Clicks"].map(fmt_int)
+                        st.dataframe(show_detail, use_container_width=True, hide_index=True, height=320)
 
 # =========================================================
 # Tab 4 - Promotions
