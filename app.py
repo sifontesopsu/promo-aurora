@@ -345,7 +345,12 @@ def optimize_df_memory(df: pd.DataFrame, category_threshold: float = 0.5) -> pd.
         elif pd.api.types.is_integer_dtype(series):
             out[col] = pd.to_numeric(series, downcast="integer")
         elif pd.api.types.is_object_dtype(series):
-            nunique = series.nunique(dropna=True)
+            try:
+                nunique = series.nunique(dropna=True)
+            except TypeError:
+                # Algunas columnas object traen listas u otros objetos no hasheables
+                # como la colección de MLCs por SKU. Esas se dejan tal cual.
+                continue
             non_null = max(int(series.notna().sum()), 1)
             if nunique > 0 and nunique / non_null <= category_threshold:
                 try:
