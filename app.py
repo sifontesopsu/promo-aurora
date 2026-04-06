@@ -1425,18 +1425,24 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
             return np.nan
         return (utilidad / ingresos) * 100
 
-    total_hist = ml_sales.groupby("sku").apply(hist_margin).rename("margen_hist_total").reset_index()
+    total_hist = (
+        ml_sales.groupby("sku").apply(hist_margin).rename("margen_hist_total").reset_index()
+        if not ml_sales.empty else pd.DataFrame(columns=["sku", "margen_hist_total"])
+    )
 
     for d in days_list:
         cutoff = today - pd.Timedelta(days=d)
         sw = sales[sales["fecha"] >= cutoff].copy()
         mlw = ml_sales[ml_sales["fecha"] >= cutoff].copy()
 
-        bysku = sw.groupby(["sku", "canal"]).agg(
-            ingresos=("total_linea", "sum"),
-            unidades=("cantidad", "sum"),
-            ventas=("sku", "size")
-        ).reset_index()
+        if not sw.empty:
+            bysku = sw.groupby(["sku", "canal"]).agg(
+                ingresos=("total_linea", "sum"),
+                unidades=("cantidad", "sum"),
+                ventas=("sku", "size")
+            ).reset_index()
+        else:
+            bysku = pd.DataFrame(columns=["sku", "canal", "ingresos", "unidades", "ventas"])
 
         rows = []
         for sku, grp in bysku.groupby("sku"):
@@ -1447,7 +1453,14 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
                 row[f"unidades_{canal.lower()}_{d}d"] = cgrp["unidades"].sum() if not cgrp.empty else 0.0
                 row[f"ventas_{canal.lower()}_{d}d"] = cgrp["ventas"].sum() if not cgrp.empty else 0.0
             rows.append(row)
+        base_cols = [
+            "sku",
+            f"ingresos_ml_{d}d", f"unidades_ml_{d}d", f"ventas_ml_{d}d",
+            f"ingresos_tienda_{d}d", f"unidades_tienda_{d}d", f"ventas_tienda_{d}d",
+        ]
         base = pd.DataFrame(rows)
+        if base.empty:
+            base = pd.DataFrame(columns=base_cols)
 
         # buyer split and purchase pattern
         sw_pos = sw[(sw["cantidad"] > 0) & (sw["total_linea"] > 0)].copy()
@@ -1461,7 +1474,7 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
                 p90_unidades=("cantidad", lambda s: s.quantile(0.90))
             ).reset_index()
         else:
-            bt = pd.DataFrame(columns=["sku", "tipo_cliente"])
+            bt = pd.DataFrame(columns=["sku", "tipo_cliente", "ingresos", "unidades", "ventas", "mediana_unidades", "p90_unidades"])
 
         buyer_rows = []
         for sku, grp in bt.groupby("sku"):
@@ -1474,9 +1487,19 @@ def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
                 row[f"mediana_unidades_{tipo.lower()}_{d}d"] = tgrp["mediana_unidades"].iloc[0] if not tgrp.empty else np.nan
                 row[f"p90_unidades_{tipo.lower()}_{d}d"] = tgrp["p90_unidades"].iloc[0] if not tgrp.empty else np.nan
             buyer_rows.append(row)
+        buyer_cols = [
+            "sku",
+            f"participacion_empresa_{d}d", f"mediana_unidades_empresa_{d}d", f"p90_unidades_empresa_{d}d",
+            f"participacion_persona_{d}d", f"mediana_unidades_persona_{d}d", f"p90_unidades_persona_{d}d",
+        ]
         buyer_df = pd.DataFrame(buyer_rows)
+        if buyer_df.empty:
+            buyer_df = pd.DataFrame(columns=buyer_cols)
 
-        hist_d = mlw.groupby("sku").apply(hist_margin).rename(f"margen_hist_{d}d").reset_index() if not mlw.empty else pd.DataFrame(columns=["sku", f"margen_hist_{d}d"])
+        hist_d = (
+            mlw.groupby("sku").apply(hist_margin).rename(f"margen_hist_{d}d").reset_index()
+            if not mlw.empty else pd.DataFrame(columns=["sku", f"margen_hist_{d}d"])
+        )
 
         out[d] = base.merge(buyer_df, on="sku", how="outer").merge(hist_d, on="sku", how="outer")
     return out, total_hist, ml_sales
