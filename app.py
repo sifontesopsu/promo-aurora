@@ -469,48 +469,104 @@ def classify_margin_delta_pp(delta_pp):
     return "ESTABLE"
 
 
-def classify_ads_state(row, target_margin_pct: float = 15.0):
+def classify_ads_reason(row, target_margin_pct: float = ADS_TARGET_MARGIN_PCT, global_acos_alert_pct: float = ADS_GLOBAL_ACOS_ALERT_PCT, min_roas: float = ADS_GLOBAL_ROAS_MIN):
     ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
     ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
     ads_clicks = safe_float(row.get("ads_clics"), 0.0)
+    ads_ventas = safe_float(row.get("ads_ventas"), 0.0)
     ads_active = (ads_inversion > 0) or (ads_ingresos > 0) or (ads_clicks > 0)
-    if not ads_active:
-        return "SIN ADS"
 
+    margen_base = safe_float(row.get("margen_ads_base_pct", row.get("margen_ml_actual")), np.nan)
     margen_con_ads = safe_float(row.get("margen_ml_con_ads"), np.nan)
     acos_real = safe_float(row.get("ads_acos"), np.nan)
     acos_max = safe_float(row.get("acos_max_permitido_pct"), np.nan)
-    brecha_obj = safe_float(row.get("brecha_ads_objetivo_pp"), np.nan)
+    roas_real = safe_float(row.get("ads_roas"), np.nan)
 
-    if pd.notna(ads_inversion) and ads_inversion > 0 and (pd.isna(ads_ingresos) or ads_ingresos <= 0):
+    if pd.notna(margen_base) and margen_base < target_margin_pct:
+        return "Margen base bajo objetivo"
+    if not ads_active:
+        if pd.notna(margen_base) and margen_base >= target_margin_pct + 5:
+            return "Sin Ads y con holgura para probar"
+        return "Sin Ads activos"
+    if ads_inversion > 0 and ads_ingresos <= 0:
+        return "Inversión sin ingresos"
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct:
+        return "Margen con Ads bajo objetivo"
+    if pd.notna(acos_real) and pd.notna(acos_max) and acos_real > acos_max:
+        return "ACOS sobre máximo permitido"
+    if pd.notna(roas_real) and roas_real < min_roas:
+        return "ROAS bajo mínimo"
+    if ads_clicks >= 15 and ads_ventas <= 0:
+        return "Clicks altos sin ventas Ads"
+    if pd.notna(acos_real) and acos_real > global_acos_alert_pct:
+        return "ACOS sobre alerta global"
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct + 3:
+        return "Margen con Ads muy ajustado"
+    if pd.notna(roas_real) and roas_real < 12:
+        return "ROAS ajustado"
+    if pd.notna(acos_real) and pd.notna(margen_con_ads) and pd.notna(roas_real) and acos_real <= global_acos_alert_pct and roas_real >= 12 and margen_con_ads >= max(target_margin_pct + 5, 25):
+        return "Escalable con margen holgado"
+    return "Bajo control"
+
+
+def classify_ads_state(row, target_margin_pct: float = ADS_TARGET_MARGIN_PCT, global_acos_alert_pct: float = ADS_GLOBAL_ACOS_ALERT_PCT, min_roas: float = ADS_GLOBAL_ROAS_MIN):
+    ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
+    ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
+    ads_clicks = safe_float(row.get("ads_clics"), 0.0)
+    ads_ventas = safe_float(row.get("ads_ventas"), 0.0)
+    ads_active = (ads_inversion > 0) or (ads_ingresos > 0) or (ads_clicks > 0)
+
+    margen_base = safe_float(row.get("margen_ads_base_pct", row.get("margen_ml_actual")), np.nan)
+    margen_con_ads = safe_float(row.get("margen_ml_con_ads"), np.nan)
+    acos_real = safe_float(row.get("ads_acos"), np.nan)
+    acos_max = safe_float(row.get("acos_max_permitido_pct"), np.nan)
+    roas_real = safe_float(row.get("ads_roas"), np.nan)
+
+    if pd.notna(margen_base) and margen_base < target_margin_pct:
+        return "NO USAR ADS"
+    if not ads_active:
+        if pd.notna(margen_base) and margen_base >= target_margin_pct + 5:
+            return "OPORTUNIDAD"
+        return "SIN ADS"
+    if ads_inversion > 0 and ads_ingresos <= 0:
         return "CRÍTICO"
-    if pd.notna(margen_con_ads) and margen_con_ads < 0:
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct:
         return "CRÍTICO"
     if pd.notna(acos_real) and pd.notna(acos_max) and acos_real > acos_max:
         return "CRÍTICO"
-    if pd.notna(brecha_obj) and brecha_obj < 0:
+    if pd.notna(roas_real) and roas_real < min_roas:
+        return "CRÍTICO"
+    if ads_clicks >= 15 and ads_ventas <= 0:
+        return "CRÍTICO"
+    if pd.notna(acos_real) and acos_real > global_acos_alert_pct:
         return "ALERTA"
-    if pd.notna(acos_real) and acos_real <= 10 and pd.notna(margen_con_ads) and margen_con_ads >= max(target_margin_pct + 10, 25):
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct + 3:
+        return "ALERTA"
+    if pd.notna(roas_real) and roas_real < 12:
+        return "ALERTA"
+    if pd.notna(acos_real) and pd.notna(margen_con_ads) and pd.notna(roas_real) and acos_real <= global_acos_alert_pct and roas_real >= 12 and margen_con_ads >= max(target_margin_pct + 5, 25):
         return "OPORTUNIDAD"
     return "OK"
 
 
-def suggest_ads_action(row, target_margin_pct: float = 15.0):
+def suggest_ads_action(row, target_margin_pct: float = ADS_TARGET_MARGIN_PCT):
     estado_ads = str(row.get("estado_ads", "")).upper()
     ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
     ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
+    if estado_ads == "NO USAR ADS":
+        return "NO INVERTIR / APAGAR"
     if estado_ads == "SIN ADS":
-        if pd.notna(safe_float(row.get("margen_ml_reportado"), np.nan)) and safe_float(row.get("margen_ml_reportado"), np.nan) >= max(target_margin_pct + 10, 25):
-            return "PROBAR ESCALA ADS"
         return "SIN ACCIÓN ADS"
+    if estado_ads == "OPORTUNIDAD":
+        if ads_inversion > 0 and ads_ingresos > 0:
+            return "ESCALAR PRESUPUESTO"
+        return "PROBAR ADS"
     if estado_ads == "CRÍTICO":
         if ads_inversion > 0 and ads_ingresos <= 0:
             return "PAUSAR / CORTAR GASTO"
         return "BAJAR PUJA O REVISAR PRECIO"
     if estado_ads == "ALERTA":
         return "OPTIMIZAR ADS"
-    if estado_ads == "OPORTUNIDAD":
-        return "ESCALAR ADS"
     return "MANTENER ADS"
 
 
@@ -2375,6 +2431,34 @@ with tabs[2]:
         for _col, _default in required_ads_cols.items():
             if _col not in ads_work.columns:
                 ads_work[_col] = _default
+
+        if ads_work["margen_ads_base_pct"].isna().all() and {"costo_maestra", "monto_sim"}.issubset(set(ads_work.columns)):
+            ads_work["monto_sim_neto"] = np.where(ads_work["monto_sim"].notna(), ads_work["monto_sim"] / 1.19, np.nan)
+            ads_work["margen_ads_base_pct"] = ads_work.apply(lambda r: calc_margin_from_monto_sim(r.get("costo_maestra"), r.get("monto_sim")), axis=1)
+        if ads_work["margen_ml_con_ads"].isna().all() and "margen_ads_base_pct" in ads_work.columns:
+            ads_work["margen_ml_con_ads"] = np.where(
+                ads_work["margen_ads_base_pct"].notna() & ads_work["ads_acos"].notna(),
+                ads_work["margen_ads_base_pct"] - ads_work["ads_acos"],
+                ads_work["margen_ads_base_pct"],
+            )
+        if ads_work["acos_max_permitido_pct"].isna().all() and "margen_ads_base_pct" in ads_work.columns:
+            ads_work["acos_max_permitido_pct"] = np.where(
+                ads_work["margen_ads_base_pct"].notna(),
+                ads_work["margen_ads_base_pct"] - ADS_TARGET_MARGIN_PCT,
+                np.nan,
+            )
+        if ads_work["gap_acos_pct"].isna().all() and {"ads_acos", "acos_max_permitido_pct"}.issubset(set(ads_work.columns)):
+            ads_work["gap_acos_pct"] = np.where(
+                ads_work["ads_acos"].notna() & ads_work["acos_max_permitido_pct"].notna(),
+                ads_work["ads_acos"] - ads_work["acos_max_permitido_pct"],
+                np.nan,
+            )
+        if ads_work["motivo_ads"].astype(str).eq("Sin datos suficientes").all():
+            ads_work["motivo_ads"] = ads_work.apply(classify_ads_reason, axis=1)
+        if ads_work["estado_ads"].astype(str).eq("SIN ADS").all() or ads_work["estado_ads"].isna().all():
+            ads_work["estado_ads"] = ads_work.apply(classify_ads_state, axis=1)
+        if ads_work["accion_ads"].astype(str).isin(["Sin acción", "SIN ACCIÓN ADS"]).all() or ads_work["accion_ads"].isna().all():
+            ads_work["accion_ads"] = ads_work.apply(suggest_ads_action, axis=1)
 
         if ads_state_filter:
             ads_work = ads_work[ads_work["estado_ads"].isin(ads_state_filter)]
