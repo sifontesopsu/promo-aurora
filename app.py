@@ -2410,6 +2410,31 @@ with tabs[2]:
         sort_mode = y4.selectbox("Orden", ["Mayor criticidad", "Mayor inversión", "Peor margen con Ads", "Mayor gap ACOS", "Mejor oportunidad"], key="ads_module_sort")
 
         ads_work = ads_table.copy()
+        required_ads_cols = {
+            "sku": "",
+            "descripcion": "",
+            "mlc_principal": "",
+            "estado_ads": "SIN ADS",
+            "motivo_ads": "Sin datos suficientes",
+            "accion_ads": "Sin acción",
+            "ads_inversion": np.nan,
+            "ads_ingresos": np.nan,
+            "ads_acos": np.nan,
+            "ads_roas": np.nan,
+            "ads_clics": np.nan,
+            "ads_impresiones": np.nan,
+            "margen_ads_base_pct": np.nan,
+            "margen_ml_con_ads": np.nan,
+            "acos_max_permitido_pct": np.nan,
+            "gap_acos_pct": np.nan,
+            "precio_ml_actual": np.nan,
+            "monto_sim": np.nan,
+            "monto_sim_neto": np.nan,
+            "ads_score": np.nan,
+        }
+        for _col, _default in required_ads_cols.items():
+            if _col not in ads_work.columns:
+                ads_work[_col] = _default
         if ads_state_filter:
             ads_work = ads_work[ads_work["estado_ads"].isin(ads_state_filter)]
         if ads_action_filter:
