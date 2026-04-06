@@ -1714,6 +1714,59 @@ def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_byte
     return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
 
 
+
+
+def get_model_or_loaded_df(model: dict, resolved_files: dict, key: str) -> pd.DataFrame:
+    df = model.get(key) if isinstance(model, dict) else None
+    if isinstance(df, pd.DataFrame):
+        return df
+    rf = resolved_files.get(key) if isinstance(resolved_files, dict) else None
+    if rf is None:
+        return pd.DataFrame()
+    try:
+        data = rf.getvalue()
+        if key == "ventas":
+            return load_sales(data)
+        if key == "compras":
+            return load_purchases(data)
+        if key == "pubs":
+            return load_publications(data)
+        if key == "ads":
+            return load_product_ads(data)
+        if key == "keywords":
+            return load_keywords(data)
+    except Exception:
+        return pd.DataFrame()
+    return pd.DataFrame()
+
+
+def get_purchase_history_for_sku(model: dict, resolved_files: dict, sku: str) -> pd.DataFrame:
+    purchase_map = model.get("purchase_map") if isinstance(model, dict) else None
+    if isinstance(purchase_map, dict):
+        hist = purchase_map.get(sku, pd.DataFrame())
+        return hist.copy() if isinstance(hist, pd.DataFrame) else pd.DataFrame()
+    compras_df = get_model_or_loaded_df(model, resolved_files, "compras")
+    if compras_df.empty or "sku" not in compras_df.columns:
+        return pd.DataFrame()
+    return compras_df[compras_df["sku"] == sku].copy()
+
+
+def get_publications_for_sku(model: dict, resolved_files: dict, sku: str) -> pd.DataFrame:
+    pub_map = model.get("pub_map") if isinstance(model, dict) else None
+    if isinstance(pub_map, dict):
+        pubs = pub_map.get(sku, pd.DataFrame())
+        return pubs.copy() if isinstance(pubs, pd.DataFrame) else pd.DataFrame()
+    pubs_df = get_model_or_loaded_df(model, resolved_files, "pubs")
+    if pubs_df.empty or "sku" not in pubs_df.columns:
+        return pd.DataFrame()
+    return pubs_df[pubs_df["sku"] == sku].copy()
+
+
+def get_sales_for_sku(model: dict, resolved_files: dict, sku: str) -> pd.DataFrame:
+    ventas_df = get_model_or_loaded_df(model, resolved_files, "ventas")
+    if ventas_df.empty or "sku" not in ventas_df.columns:
+        return pd.DataFrame()
+    return ventas_df[ventas_df["sku"] == sku].copy()
 def build_shared_model(resolved_files: dict):
     return build_model_cached(
         resolved_files["master"].getvalue() if resolved_files.get("master") else None,
@@ -2152,7 +2205,7 @@ with tabs[1]:
             c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
             c3.metric("Proveedor", pr["ultimo_proveedor"])
             c4.metric("Brecha maestra vs última compra", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
-            hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
+            hist = get_purchase_history_for_sku(model, resolved_files, sku)
             if not hist.empty:
                 hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
                 hist_show.columns = ["Fecha", "Proveedor", "Cantidad", "Precio Unitario", "Documento", "Folio"]
@@ -2184,7 +2237,7 @@ with tabs[1]:
                 st.write(f"P90 personas: {fmt_int(srow.get(f'p90_unidades_persona_{default_period}d'))} unidades")
 
         st.markdown("### Datos de Publicación ML")
-        pr = choose_primary_publication(model["pub_map"].get(sku, pd.DataFrame()))
+        pr = choose_primary_publication(get_publications_for_sku(model, resolved_files, sku))
         if pr is None:
             st.info("No encontré publicación principal para este SKU.")
         else:
@@ -2200,7 +2253,7 @@ with tabs[1]:
             st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
 
         st.markdown("### Historial de ventas")
-        sales_sku = model["ventas"][model["ventas"]["sku"] == sku].copy()
+        sales_sku = get_sales_for_sku(model, resolved_files, sku)
         if sales_sku.empty:
             st.info("No encontré ventas para este SKU.")
         else:
