@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
 
 
 st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide")
@@ -358,15 +359,6 @@ def norm_mlc(value) -> str:
     s = str(value).strip().upper().replace(" ", "")
     if not s or s == "NAN":
         return ""
-    if s.endswith(".0"):
-        s = s[:-2]
-    if re.fullmatch(r"\d+(\.\d+)?", s):
-        try:
-            f = float(s.replace(",", "."))
-            if int(f) == f:
-                s = str(int(f))
-        except Exception:
-            pass
     if s.isdigit():
         s = f"MLC{s}"
     return s
@@ -422,7 +414,7 @@ def _find_sheet(sheet_names, wanted):
 def _canon_label(value: str) -> str:
     s = str(value or "").strip().upper()
     replacements = {
-        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U", "Ñ": "N",
+        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U",
         "(": "", ")": "", ".": "", ",": "", ":": "", ";": "", "-": " ", "_": " "
     }
     for k, v in replacements.items():
@@ -909,8 +901,12 @@ def build_validation_layers(master, ventas, compras, pubs, product_ads, promos, 
     multi_active = multi_active.groupby("sku").filter(lambda g: len(g) > 1) if not multi_active.empty else pd.DataFrame()
     register("Múltiples publicaciones activas por SKU", "ALERTA" if not multi_active.empty else "OK", multi_active[[c for c in ["sku", "mlc", "titulo", "precio_final", "ventas_hist_pub"] if c in multi_active.columns]], "Puede existir estrategia multilistado, pero se debe revisar porque afecta la publicación principal y el pricing.")
 
-    promo_issues = promos[(promos.get("mlc", pd.Series(dtype=str)).astype(str).str.strip().eq(""))] if not promos.empty else pd.DataFrame()
-    register("Promociones incompletas", "ALERTA" if not promo_issues.empty else "OK", promo_issues[[c for c in ["sku", "slot", "mlc", "precio_b2c", "comentario"] if c in promo_issues.columns]], "Las promos deben tener al menos MLC asociado en la maestra.")
+    promo_issues = promos[
+        (promos.get("mlc", pd.Series(dtype=str)).astype(str).str.strip().eq("")) &
+        (promos.get("mlc_sync", pd.Series(dtype=str)).astype(str).str.strip().eq("")) &
+        (promos.get("precio_b2c", pd.Series(dtype=float)).isna())
+    ] if not promos.empty else pd.DataFrame()
+    register("Slots Meli incompletos", "ALERTA" if not promo_issues.empty else "OK", promo_issues[[c for c in ["sku", "slot", "mlc", "mlc_sync", "precio_b2c", "comentario"] if c in promo_issues.columns]], "Se detectaron slots configurados sin MLC ni precio B2C. La hoja CONTROL DE PROMOCIONES no se usa.")
 
     ads_orphan = product_ads[~product_ads.get("mlc", pd.Series(dtype=str)).isin(pub_mlcs)].sort_values("mlc") if not product_ads.empty else pd.DataFrame()
     register("Ads sin publicación asociada", "ALERTA" if not ads_orphan.empty else "OK", ads_orphan[[c for c in ["mlc", "campana", "titulo", "inversion_ads", "ingresos_ads"] if c in ads_orphan.columns]], "Product Ads trae publicaciones que hoy no están en el reporte maestro ML.")
@@ -997,15 +993,107 @@ def calc_price_for_target_ml_margin(cost, fee_pct, fixed_charge=0.0, target_marg
 # Loaders
 # =========================================================
 
+def _safe_excel_bytes(file_bytes):
+    if file_bytes is None:
+        raise ValueError("No se recibió archivo Excel para la maestra.")
+    if isinstance(file_bytes, (bytes, bytearray)):
+        data = bytes(file_bytes)
+    else:
+        raise ValueError("La maestra no llegó como bytes válidos.")
+    if len(data) < 20:
+        raise ValueError("El archivo Excel de la maestra está vacío o incompleto.")
+    return data
+
+
+def _worksheet_to_df(ws, header=True):
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return pd.DataFrame()
+    if header:
+        header_row = [("" if v is None else str(v)) for v in rows[0]]
+        data_rows = rows[1:]
+        width = max(len(header_row), max((len(r) for r in data_rows), default=0))
+        header_row = list(header_row) + [""] * max(0, width - len(header_row))
+        out_rows = []
+        for r in data_rows:
+            rr = list(r) + [None] * max(0, width - len(r))
+            out_rows.append(rr)
+        cols = []
+        unnamed_count = 0
+        seen = {}
+        for c in header_row:
+            name = str(c).strip()
+            if name == "" or name.lower() == "none":
+                name = f"Unnamed: {unnamed_count}"
+                unnamed_count += 1
+            if name in seen:
+                seen[name] += 1
+                name = f"{name}.{seen[name]}"
+            else:
+                seen[name] = 0
+            cols.append(name)
+        return pd.DataFrame(out_rows, columns=cols)
+    width = max(len(r) for r in rows)
+    return pd.DataFrame([list(r) + [None] * (width - len(r)) for r in rows])
+
+
+def _slot_column_candidates(slot: int) -> dict:
+    if slot == 1:
+        return {
+            "margen": ["MARGEN MELI 1"],
+            "neto": [" NETO MELI 1", "NETO MELI 1"],
+            "venta_bruto": ["MONTO EN SIMULACIÓN", "VENTA BRUTO MELI 1"],
+            "campana": ["CAMPAÑA PADS"],
+            "mlc": ["MLC"],
+            "mlc_sync": ["MLC SINCRON.", "MLC SINCRONIZADO", "MLC SINCRONIZADO 1"],
+            "dcto": [" DCTO", "DCTO"],
+            "precio_b2c": ["PRECIO B2C PUBLICADO ", "PRECIO B2C PUBLICADO", "PRECIO B2C"],
+            "comentario": ["COMENTARIO"],
+        }
+    if slot == 2:
+        return {
+            "margen": ["MARGEN MELI 2"],
+            "neto": ["NETO MELI 2"],
+            "venta_bruto": ["VENTA BRUTO MELI 2"],
+            "campana": ["CAMPAÑA PADS.1", "CAMPAÑA PADS 2"],
+            "mlc": ["MLC.1", "MLC 2"],
+            "mlc_sync": ["MLC SINCRONIZADO", "MLC SINCRONIZADO.1", "MLC SINCRONIZADO 2"],
+            "dcto": [" DCTO.1", "DCTO.1", "DCTO 2"],
+            "precio_b2c": ["PRECIO B2C"],
+            "comentario": ["COMENTARIO.1"],
+        }
+    if slot == 3:
+        return {
+            "margen": ["MARGEN MELI 3"],
+            "neto": ["NETO MELI 3"],
+            "venta_bruto": ["VENTA BRUTO MELI 3"],
+            "campana": ["CAMPAÑA PADS.2", "CAMPAÑA PADS 3"],
+            "mlc": ["MLC 3", "MLC.2"],
+            "mlc_sync": ["MLC SINCRONIZADO 3", "MLC SINCRONIZADO.2"],
+            "dcto": [" DCTO.2", "DCTO.2", "DCTO 3"],
+            "precio_b2c": ["PRECIO B2C.1", "PRECIO B2C 3"],
+            "comentario": ["COMENTARIO.2", "COMENTARIO 3"],
+        }
+    return {
+        "margen": ["MARGEN MELI 4"],
+        "neto": ["NETO MELI 4"],
+        "venta_bruto": ["VENTA BRUTO MELI 4"],
+        "campana": ["CAMPAÑA PADS.3", "CAMPAÑA PADS 4"],
+        "mlc": ["MLC 4", "MLC.3"],
+        "mlc_sync": ["MLC SINCRONIZADO 4", "MLC SINCRONIZADO.3"],
+        "dcto": [" DCTO.3", "DCTO.3", "DCTO 4"],
+        "precio_b2c": ["PRECIO B2C.2", "PRECIO B2C 4"],
+        "comentario": ["COMENTARIO.3", "COMENTARIO 4"],
+    }
+
+
+def _first_existing_column(df: pd.DataFrame, names: list[str]):
+    return pick_existing_column(df, *names)
 @st.cache_data(show_spinner=False)
 def load_master_workbook(file_bytes: bytes):
-    if not file_bytes:
-        raise ValueError("La maestra está vacía o no se pudo leer.")
-    try:
-        xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
-    except Exception as e:
-        raise ValueError(f"No pude abrir la maestra como Excel válido: {e}")
-    names = xls.sheet_names
+    file_bytes = _safe_excel_bytes(file_bytes)
+    wb = load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True, keep_links=False)
+    names = list(wb.sheetnames)
     maestra_name = _find_sheet(names, "MAESTRA de precios")
     bridge_name = _find_sheet(names, "MLC -SKU")
     rel_name = _find_sheet(names, "Relampago mi pagina")
@@ -1013,9 +1101,9 @@ def load_master_workbook(file_bytes: bytes):
     if not maestra_name:
         raise ValueError("No encontré la hoja 'MAESTRA de precios'.")
 
-    master_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=maestra_name, engine="openpyxl")
-    bridge_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=bridge_name, engine="openpyxl") if bridge_name else pd.DataFrame()
-    rel_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=rel_name, header=None, engine="openpyxl") if rel_name else pd.DataFrame()
+    master_df = _worksheet_to_df(wb[maestra_name], header=True)
+    bridge_df = _worksheet_to_df(wb[bridge_name], header=True) if bridge_name else pd.DataFrame()
+    rel_df = _worksheet_to_df(wb[rel_name], header=False) if rel_name else pd.DataFrame()
 
     return {
         "sheet_names": names,
@@ -1030,62 +1118,24 @@ def load_master_workbook(file_bytes: bytes):
 
 
 
-
 def normalize_master(master_df, bridge_df):
     df = master_df.copy()
 
-    alias_sets = {
+    base_alias_sets = {
         "SKU": ["SKU", "CODIGO", "CÓDIGO", "COD SKU"],
         "DESCRIPCIÓN": ["DESCRIPCIÓN", "DESCRIPCION", "PRODUCTO", "ARTICULO", "ARTÍCULO", "DETALLE", "NOMBRE"],
         "UBIC": ["UBIC", "UBICACION", "UBICACIÓN"],
+        "T-L": ["T-L", "TL"],
+        "CAMBIO DE PRECIO": ["CAMBIO DE PRECIO"],
         "ÚLTIMO COSTO": ["ÚLTIMO COSTO", "ULTIMO COSTO", "COSTO", "ULT COSTO"],
-        "PRECIO BRUTO": ["PRECIO BRUTO", "PRECIO VENTA", "PVP", "PRECIO"],
-        "PRECIO NETO": ["PRECIO NETO", "NETO"],
+        "Medidas": ["Medidas", "MEDIDAS"],
+        "ACTUALIZACIÓN 13/04": ["ACTUALIZACIÓN 13/04", "ACTUALIZACION 13/04", "ACTUALIZACIÓN", "ACTUALIZACION"],
         "MARGEN LOCAL": ["MARGEN LOCAL"],
+        "PRECIO NETO": ["PRECIO NETO", "NETO"],
+        "PRECIO BRUTO": ["PRECIO BRUTO", "PRECIO VENTA", "PVP", "PRECIO"],
         "MONTO EN SIMULACIÓN": ["MONTO EN SIMULACIÓN", "MONTO EN SIMULACION", "MONTO SIMULACION", "MONTO SIMULADO"],
-
-        "MARGEN MELI 1": ["MARGEN MELI 1"],
-        "NETO MELI 1": ["NETO MELI 1", " NETO MELI 1"],
-        "CAMPAÑA PADS": ["CAMPAÑA PADS"],
-        "MLC": ["MLC"],
-        "MLC SINCRONIZADO": ["MLC SINCRONIZADO", "MLC SINCRON.", "MLC SINCRON"],
-        "PRECIO B2C PUBLICADO ": ["PRECIO B2C PUBLICADO ", "PRECIO B2C PUBLICADO", "PRECIO B2C 1"],
-        "COMENTARIO": ["COMENTARIO"],
-
-        "MARGEN MELI 2": ["MARGEN MELI 2"],
-        "NETO MELI 2": ["NETO MELI 2"],
-        "VENTA BRUTO MELI 2": ["VENTA BRUTO MELI 2"],
-        "CAMPAÑA PADS.1": ["CAMPAÑA PADS.1", "CAMPAÑA PADS 2"],
-        "MLC.1": ["MLC.1", "MLC 2"],
-        "MLC SINCRONIZADO.1": ["MLC SINCRONIZADO.1", "MLC SINCRONIZADO 2", "MLC SINCRON. 2", "MLC SINCRON 2"],
-        "PRECIO B2C": ["PRECIO B2C", "PRECIO B2C 2"],
-        "COMENTARIO.1": ["COMENTARIO.1", "COMENTARIO 2"],
-
-        "MARGEN MELI 3": ["MARGEN MELI 3"],
-        "NETO MELI 3": ["NETO MELI 3"],
-        "VENTA BRUTO MELI 3": ["VENTA BRUTO MELI 3"],
-        "CAMPAÑA PADS.2": ["CAMPAÑA PADS.2", "CAMPAÑA PADS 3"],
-        "MLC 3": ["MLC 3", "MLC.2"],
-        "MLC SINCRONIZADO 3": ["MLC SINCRONIZADO 3", "MLC SINCRON. 3", "MLC SINCRON 3"],
-        "PRECIO B2C.1": ["PRECIO B2C.1", "PRECIO B2C 3"],
-        "COMENTARIO.2": ["COMENTARIO.2", "COMENTARIO 3"],
-
-        "MARGEN MELI 4": ["MARGEN MELI 4"],
-        "NETO MELI 4": ["NETO MELI 4"],
-        "VENTA BRUTO MELI 4": ["VENTA BRUTO MELI 4"],
-        "CAMPAÑA PADS.3": ["CAMPAÑA PADS.3", "CAMPAÑA PADS 4"],
-        "MLC 4": ["MLC 4", "MLC.3"],
-        "MLC SINCRONIZADO 4": ["MLC SINCRONIZADO 4", "MLC SINCRON. 4", "MLC SINCRON 4"],
-        "PRECIO B2C.2": ["PRECIO B2C.2", "PRECIO B2C 4"],
-        "COMENTARIO.3": ["COMENTARIO.3", "COMENTARIO 4"],
-
-        "FECHA VENCI": ["FECHA VENCI", "VENCIMIENTO"],
-        "FECHA VENCI.1": ["FECHA VENCI.1", "FECHA VENCI 2"],
-        "FECHA VENCI.2": ["FECHA VENCI.2", "FECHA VENCI 3"],
-        "FECHA VENCI.3": ["FECHA VENCI.3", "FECHA VENCI 4"],
     }
-
-    for target, aliases in alias_sets.items():
+    for target, aliases in base_alias_sets.items():
         found = pick_existing_column(df, *aliases)
         if found is None:
             df[target] = np.nan
@@ -1094,47 +1144,43 @@ def normalize_master(master_df, bridge_df):
 
     df["sku"] = df["SKU"].map(norm_sku)
     df["descripcion"] = df["DESCRIPCIÓN"].fillna("").astype(str)
+    df["ubic"] = df["UBIC"]
+    df["cambio_precio"] = df["CAMBIO DE PRECIO"].map(safe_float)
     df["costo_maestra"] = df["ÚLTIMO COSTO"].map(safe_float)
+    df["medidas_maestra"] = df["Medidas"].fillna("")
+    df["actualizacion_maestra"] = df["ACTUALIZACIÓN 13/04"].fillna("")
     df["precio_bruto"] = df["PRECIO BRUTO"].map(safe_float)
     df["precio_neto"] = df["PRECIO NETO"].map(safe_float)
     df["monto_sim"] = df["MONTO EN SIMULACIÓN"].map(safe_float)
+    df["margen_local_maestra"] = df["MARGEN LOCAL"].map(lambda x: safe_float(x) * 100 if abs(safe_float(x, np.nan)) <= 2 else safe_float(x))
 
-    for margin_col, out_col in [
-        ("MARGEN LOCAL", "margen_local_maestra"),
-        ("MARGEN MELI 1", "margen_meli1_maestra"),
-        ("MARGEN MELI 2", "margen_meli2_maestra"),
-        ("MARGEN MELI 3", "margen_meli3_maestra"),
-        ("MARGEN MELI 4", "margen_meli4_maestra"),
-    ]:
-        df[out_col] = df[margin_col].map(lambda x: safe_float(x) * 100 if abs(safe_float(x, np.nan)) <= 2 else safe_float(x))
+    slots = []
+    for slot in [1, 2, 3, 4]:
+        cfg = _slot_column_candidates(slot)
+        resolved = {k: _first_existing_column(df, v) for k, v in cfg.items()}
+        margin_col = resolved["margen"]
+        neto_col = resolved["neto"]
+        venta_col = resolved["venta_bruto"]
+        camp_col = resolved["campana"]
+        mlc_col = resolved["mlc"]
+        sync_col = resolved["mlc_sync"]
+        dcto_col = resolved["dcto"]
+        p_b2c_col = resolved["precio_b2c"]
+        com_col = resolved["comentario"]
 
-    for c in ["FECHA VENCI", "FECHA VENCI.1", "FECHA VENCI.2", "FECHA VENCI.3"]:
-        if c not in df.columns:
-            df[c] = pd.NaT
-        df[c] = pd.to_datetime(df[c], errors="coerce").dt.normalize()
-
-    slot_defs = [
-        (1, "MLC", "MLC SINCRONIZADO", "CAMPAÑA PADS", "PRECIO B2C PUBLICADO ", "COMENTARIO", "FECHA VENCI"),
-        (2, "MLC.1", "MLC SINCRONIZADO.1", "CAMPAÑA PADS.1", "PRECIO B2C", "COMENTARIO.1", "FECHA VENCI.1"),
-        (3, "MLC 3", "MLC SINCRONIZADO 3", "CAMPAÑA PADS.2", "PRECIO B2C.1", "COMENTARIO.2", "FECHA VENCI.2"),
-        (4, "MLC 4", "MLC SINCRONIZADO 4", "CAMPAÑA PADS.3", "PRECIO B2C.2", "COMENTARIO.3", "FECHA VENCI.3"),
-    ]
-
-    for slot, mlc_col, sync_col, pads_col, price_col, comment_col, date_col in slot_defs:
-        df[f"mlc_{slot}"] = df[mlc_col].map(norm_mlc) if mlc_col in df.columns else ""
-        df[f"mlc_sync_{slot}"] = df[sync_col].map(norm_mlc) if sync_col in df.columns else ""
-        if pads_col not in df.columns:
-            df[pads_col] = ""
-        if price_col not in df.columns:
-            df[price_col] = np.nan
-        if comment_col not in df.columns:
-            df[comment_col] = ""
-        if date_col not in df.columns:
-            df[date_col] = pd.NaT
+        df[f"margen_meli{slot}_maestra"] = df[margin_col].map(lambda x: safe_float(x) * 100 if abs(safe_float(x, np.nan)) <= 2 else safe_float(x)) if margin_col else np.nan
+        df[f"neto_meli_{slot}"] = df[neto_col].map(safe_float) if neto_col else np.nan
+        df[f"venta_bruto_meli_{slot}"] = df[venta_col].map(safe_float) if venta_col else np.nan
+        df[f"campana_pads_{slot}"] = df[camp_col].fillna("").astype(str) if camp_col else ""
+        df[f"mlc_{slot}"] = df[mlc_col].map(norm_mlc) if mlc_col else ""
+        df[f"mlc_sync_{slot}"] = df[sync_col].map(norm_mlc) if sync_col else ""
+        df[f"dcto_{slot}"] = df[dcto_col].map(safe_float) if dcto_col else np.nan
+        df[f"precio_b2c_{slot}"] = df[p_b2c_col].map(safe_float) if p_b2c_col else np.nan
+        df[f"comentario_{slot}"] = df[com_col].fillna("").astype(str) if com_col else ""
 
     df["ads_flag"] = False
-    for _, _, _, pads_col, _, _, _ in slot_defs:
-        df["ads_flag"] = df["ads_flag"] | (df[pads_col].fillna("").astype(str).str.strip().apply(lambda x: _canon_label(x) not in ("", "CAMPANA PADS")))
+    for slot in [1, 2, 3, 4]:
+        df["ads_flag"] = df["ads_flag"] | (df[f"campana_pads_{slot}"].astype(str).str.strip().ne("") & ~df[f"campana_pads_{slot}"].astype(str).str.upper().isin(["", "NAN", "CAMPAÑA PADS", "CAMPAÑA PADS"]))
 
     mlc_bridge = {}
     if bridge_df is not None and not bridge_df.empty:
@@ -1144,180 +1190,163 @@ def normalize_master(master_df, bridge_df):
         tmp["sku"] = tmp[sku_col].map(norm_sku)
         tmp["mlc"] = tmp[mlc_col].map(norm_mlc)
         tmp = tmp[(tmp["sku"] != "") & (tmp["mlc"] != "")]
-        mlc_bridge = tmp.groupby("sku")["mlc"].apply(lambda s: sorted(set(s))).to_dict()
+        mlc_bridge = tmp.groupby("sku")["mlc"].apply(lambda s: sorted(set([x for x in s if x]))).to_dict()
 
     all_mlcs = []
     for _, row in df.iterrows():
         vals = []
-        for slot, *_rest in slot_defs:
-            vals.append(row.get(f"mlc_{slot}", ""))
-            vals.append(row.get(f"mlc_sync_{slot}", ""))
+        for slot in [1, 2, 3, 4]:
+            vals.extend([row.get(f"mlc_{slot}", ""), row.get(f"mlc_sync_{slot}", "")])
         vals.extend(mlc_bridge.get(row["sku"], []))
         vals = [v for v in vals if isinstance(v, str) and v.strip()]
         all_mlcs.append(sorted(set(vals)))
     df["mlcs"] = all_mlcs
 
-    promos = []
+    slot_rows = []
     for idx, row in df.iterrows():
-        for slot, _mlc_col, _sync_col, pads_col, price_col, comment_col, date_col in slot_defs:
+        for slot in [1, 2, 3, 4]:
             mlc = row.get(f"mlc_{slot}", "")
-            pads = "" if pd.isna(row.get(pads_col, "")) else str(row.get(pads_col, "")).strip()
-            if _canon_label(pads) == "CAMPANA PADS":
-                pads = ""
-            price = safe_float(row.get(price_col), np.nan)
-            dt = row.get(date_col, pd.NaT)
-            comment = "" if pd.isna(row.get(comment_col, "")) else str(row.get(comment_col, "")).strip()
-            if mlc or (pads != "") or (pd.notna(price) and price > 0) or (comment != ""):
-                promos.append({
-                    "master_index": idx,
-                    "sku": row["sku"],
-                    "descripcion": row["descripcion"],
-                    "slot": slot,
-                    "mlc": mlc,
-                    "campana_ads": pads if pd.notna(pads) else "",
-                    "precio_b2c": price,
-                    "fecha_venci": dt,
-                    "comentario": comment if pd.notna(comment) else "",
-                })
+            mlc_sync = row.get(f"mlc_sync_{slot}", "")
+            camp = row.get(f"campana_pads_{slot}", "")
+            dcto = row.get(f"dcto_{slot}", np.nan)
+            precio_b2c = row.get(f"precio_b2c_{slot}", np.nan)
+            comentario = row.get(f"comentario_{slot}", "")
+            margen = row.get(f"margen_meli{slot}_maestra", np.nan)
+            neto = row.get(f"neto_meli_{slot}", np.nan)
+            venta_bruto = row.get(f"venta_bruto_meli_{slot}", np.nan)
 
-    promos_df = pd.DataFrame(promos)
-    if not promos_df.empty:
-        status_info = promos_df["fecha_venci"].apply(lambda x: pd.Series(promo_status(x), index=["status","status_order"]))
-        promos_df = pd.concat([promos_df, status_info], axis=1)
-    else:
-        promos_df = pd.DataFrame(columns=["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
+            has_signal = any([
+                bool(str(mlc).strip()),
+                bool(str(mlc_sync).strip()),
+                pd.notna(precio_b2c),
+                pd.notna(dcto),
+                bool(str(comentario).strip()),
+                bool(str(camp).strip()) and str(camp).strip().upper() not in ["CAMPAÑA PADS", "CAMPANA PADS"],
+                pd.notna(margen),
+                pd.notna(neto),
+                pd.notna(venta_bruto),
+            ])
+            if not has_signal:
+                continue
 
+            if str(camp).strip().upper() in ["CAMPAÑA PADS", "CAMPANA PADS"]:
+                camp = ""
+
+            slot_rows.append({
+                "master_index": idx,
+                "sku": row["sku"],
+                "descripcion": row["descripcion"],
+                "slot": slot,
+                "mlc": mlc,
+                "mlc_sync": mlc_sync,
+                "campana_ads": camp,
+                "dcto": dcto,
+                "precio_b2c": precio_b2c,
+                "comentario": comentario,
+                "margen_meli": margen,
+                "neto_meli": neto,
+                "venta_bruto_meli": venta_bruto,
+                "fecha_venci": pd.NaT,
+                "status": "Configurada" if (mlc or mlc_sync or pd.notna(precio_b2c)) else "Borrador",
+                "status_order": 1 if (mlc or mlc_sync or pd.notna(precio_b2c)) else 2,
+            })
+
+    promos_df = pd.DataFrame(slot_rows)
+    if promos_df.empty:
+        promos_df = pd.DataFrame(columns=[
+            "master_index","sku","descripcion","slot","mlc","mlc_sync","campana_ads","dcto","precio_b2c",
+            "comentario","margen_meli","neto_meli","venta_bruto_meli","fecha_venci","status","status_order"
+        ])
     return df[df["sku"] != ""].copy(), promos_df
 
 
 
 def ensure_promos_schema(promos_df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "master_index","sku","descripcion","slot","mlc","mlc_sync","campana_ads","dcto","precio_b2c",
+        "comentario","margen_meli","neto_meli","venta_bruto_meli","fecha_venci","status","status_order"
+    ]
     if promos_df is None or not isinstance(promos_df, pd.DataFrame):
-        return pd.DataFrame(columns=["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
+        return pd.DataFrame(columns=cols)
     df = promos_df.copy()
     rename_map = {
-        "STATUS": "status",
-        "STATUS_ORDER": "status_order",
-        "SKU_norm": "sku",
-        "DESCRIPCIÓN": "descripcion",
         "MLC": "mlc",
+        "MLC_SYNC": "mlc_sync",
         "PRECIO_B2C": "precio_b2c",
-        "FECHA_VENCI": "fecha_venci",
         "COMENTARIO": "comentario",
     }
-    df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns and v not in df.columns})
-    required = ["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario"]
-    for col in required:
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns and v not in df.columns})
+    for col in cols:
         if col not in df.columns:
-            df[col] = np.nan if col not in ["descripcion","mlc","campana_ads","comentario"] else ""
-    if "status" not in df.columns or "status_order" not in df.columns:
-        status_info = df["fecha_venci"].apply(lambda x: pd.Series(promo_status(x), index=["status","status_order"]))
-        for col in ["status","status_order"]:
-            df[col] = status_info[col]
-    return df
+            df[col] = np.nan if col not in ["sku","descripcion","mlc","mlc_sync","campana_ads","comentario","status"] else ""
+    if "status" not in df.columns:
+        df["status"] = np.where(df["mlc"].astype(str).str.strip().ne("") | df["mlc_sync"].astype(str).str.strip().ne("") | df["precio_b2c"].notna(), "Configurada", "Borrador")
+    if "status_order" not in df.columns:
+        df["status_order"] = np.where(df["status"].eq("Configurada"), 1, 2)
+    return df[cols]
 
 
 def promo_status(dt):
-    dt = to_date_only(dt)
-    if pd.isna(dt):
-        return "Sin fecha", 999
-    today = pd.Timestamp(date.today())
-    delta = (dt - today).days
-    if delta < 0:
-        return "Vencidas", -1
-    if delta == 0:
-        return "Vencen hoy", 0
-    if delta == 1:
-        return "Vencen mañana", 1
-    if delta == 2:
-        return "Vencen pasado mañana", 2
-    if delta <= 7:
-        return "Vencen en 7 días", 7
-    if delta <= 15:
-        return "Vencen en 15 días", 15
-    return "Vencen en 1 mes", 30
-    today = pd.Timestamp(date.today())
-    delta = (dt - today).days
-    if delta < 0:
-        return "Vencidas", -1
-    if delta == 0:
-        return "Vencen hoy", 0
-    if delta == 1:
-        return "Vencen mañana", 1
-    if delta == 2:
-        return "Vencen pasado mañana", 2
-    if delta <= 7:
-        return "Vencen en 7 días", 7
-    if delta <= 15:
-        return "Vencen en 15 días", 15
-    return "Vencen en 1 mes", 30
-
+    return "Configurada", 1
 
 
 def rebuild_promos_from_master(master: pd.DataFrame) -> pd.DataFrame:
-    promos = []
     if master is None or master.empty:
-        return pd.DataFrame(columns=["master_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
-
-    slot_defs = [
-        (1, "mlc_1", "CAMPAÑA PADS", "PRECIO B2C PUBLICADO ", "COMENTARIO", "FECHA VENCI"),
-        (2, "mlc_2", "CAMPAÑA PADS.1", "PRECIO B2C", "COMENTARIO.1", "FECHA VENCI.1"),
-        (3, "mlc_3", "CAMPAÑA PADS.2", "PRECIO B2C.1", "COMENTARIO.2", "FECHA VENCI.2"),
-        (4, "mlc_4", "CAMPAÑA PADS.3", "PRECIO B2C.2", "COMENTARIO.3", "FECHA VENCI.3"),
-    ]
-
+        return ensure_promos_schema(pd.DataFrame())
+    rows = []
     for idx, row in master.iterrows():
-        for slot, mlc_col, pads_col, price_col, comment_col, date_col in slot_defs:
-            mlc = row.get(mlc_col, "")
-            pads = "" if pd.isna(row.get(pads_col, "")) else str(row.get(pads_col, "")).strip()
-            if _canon_label(pads) == "CAMPANA PADS":
-                pads = ""
-            price = safe_float(row.get(price_col), np.nan)
-            dt = row.get(date_col, pd.NaT)
-            comment = "" if pd.isna(row.get(comment_col, "")) else str(row.get(comment_col, "")).strip()
-            if mlc or (pads != "") or (pd.notna(price) and price > 0) or (comment != ""):
-                status, order = promo_status(dt)
-                promos.append({
-                    "master_index": idx,
-                    "sku": row.get("sku",""),
-                    "descripcion": row.get("descripcion",""),
-                    "slot": slot,
-                    "mlc": mlc,
-                    "campana_ads": pads if pd.notna(pads) else "",
-                    "precio_b2c": price,
-                    "fecha_venci": dt,
-                    "comentario": comment if pd.notna(comment) else "",
-                    "status": status,
-                    "status_order": order,
-                })
-    return pd.DataFrame(promos)
-
+        for slot in [1, 2, 3, 4]:
+            mlc = row.get(f"mlc_{slot}", "")
+            mlc_sync = row.get(f"mlc_sync_{slot}", "")
+            camp = row.get(f"campana_pads_{slot}", "")
+            dcto = row.get(f"dcto_{slot}", np.nan)
+            precio_b2c = row.get(f"precio_b2c_{slot}", np.nan)
+            comentario = row.get(f"comentario_{slot}", "")
+            margen = row.get(f"margen_meli{slot}_maestra", np.nan)
+            neto = row.get(f"neto_meli_{slot}", np.nan)
+            venta_bruto = row.get(f"venta_bruto_meli_{slot}", np.nan)
+            has_signal = any([
+                bool(str(mlc).strip()), bool(str(mlc_sync).strip()), pd.notna(precio_b2c), pd.notna(dcto),
+                bool(str(comentario).strip()), bool(str(camp).strip()), pd.notna(margen), pd.notna(neto), pd.notna(venta_bruto)
+            ])
+            if not has_signal:
+                continue
+            rows.append({
+                "master_index": idx,
+                "sku": row.get("sku",""),
+                "descripcion": row.get("descripcion",""),
+                "slot": slot,
+                "mlc": mlc,
+                "mlc_sync": mlc_sync,
+                "campana_ads": camp if str(camp).strip().upper() not in ["CAMPAÑA PADS","CAMPANA PADS"] else "",
+                "dcto": dcto,
+                "precio_b2c": precio_b2c,
+                "comentario": comentario,
+                "margen_meli": margen,
+                "neto_meli": neto,
+                "venta_bruto_meli": venta_bruto,
+                "fecha_venci": pd.NaT,
+                "status": "Configurada" if (mlc or mlc_sync or pd.notna(precio_b2c)) else "Borrador",
+                "status_order": 1 if (mlc or mlc_sync or pd.notna(precio_b2c)) else 2,
+            })
+    return ensure_promos_schema(pd.DataFrame(rows))
 
 
 def update_single_promo(model: dict, master_index: int, slot: int, price, dt, comment):
     master = model["master"]
-    slot_map = {
-        1: ("PRECIO B2C PUBLICADO ", "FECHA VENCI", "COMENTARIO"),
-        2: ("PRECIO B2C", "FECHA VENCI.1", "COMENTARIO.1"),
-        3: ("PRECIO B2C.1", "FECHA VENCI.2", "COMENTARIO.2"),
-        4: ("PRECIO B2C.2", "FECHA VENCI.3", "COMENTARIO.3"),
-    }
-    price_col, date_col, comment_col = slot_map.get(int(slot), ("PRECIO B2C PUBLICADO ", "FECHA VENCI", "COMENTARIO"))
-    if price_col not in master.columns:
-        master[price_col] = np.nan
-    if comment_col not in master.columns:
-        master[comment_col] = ""
-    if date_col not in master.columns:
-        master[date_col] = pd.NaT
-
-    master.at[master_index, price_col] = safe_float(price, np.nan)
-    master.at[master_index, comment_col] = comment
-    # La nueva maestra no depende de FECHA VENCI; solo se conserva si existe.
-    if pd.notna(master.at[master_index, date_col]) and dt:
-        master.at[master_index, date_col] = pd.to_datetime(dt).normalize()
-
+    price_col = f"precio_b2c_{slot}"
+    comment_col = f"comentario_{slot}"
+    if price_col in master.columns:
+        master.at[master_index, price_col] = safe_float(price, np.nan)
+    if comment_col in master.columns:
+        master.at[master_index, comment_col] = comment
+    raw_price_col_map = {1: "PRECIO B2C PUBLICADO ", 2: "PRECIO B2C", 3: "PRECIO B2C.1", 4: "PRECIO B2C.2"}
+    raw_comment_col_map = {1: "COMENTARIO", 2: "COMENTARIO.1", 3: "COMENTARIO.2", 4: "COMENTARIO.3"}
+    if raw_price_col_map.get(slot) in master.columns:
+        master.at[master_index, raw_price_col_map[slot]] = safe_float(price, np.nan)
+    if raw_comment_col_map.get(slot) in master.columns:
+        master.at[master_index, raw_comment_col_map[slot]] = comment
     model["promos"] = rebuild_promos_from_master(master)
-
 
 def normalize_rel(rel_df):
     if rel_df is None or rel_df.empty:
@@ -1680,10 +1709,16 @@ def keywords_summary(keywords):
 
 
 def build_action_table(master, sales_windows, total_hist, purchase_summary, publications, ads_by_sku):
-    base = master[[
+    base_cols = [
         "sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim",
-        "margen_local_maestra", "margen_meli1_maestra", "ads_flag", "mlcs"
-    ]].copy()
+        "margen_local_maestra", "margen_meli1_maestra", "margen_meli2_maestra", "margen_meli3_maestra", "margen_meli4_maestra",
+        "cambio_precio", "medidas_maestra", "actualizacion_maestra", "ads_flag", "mlcs"
+    ]
+    for col in base_cols:
+        if col not in master.columns:
+            master[col] = np.nan
+    base = master[base_cols].copy()
+    base["margen_meli_principal_maestra"] = base[["margen_meli1_maestra", "margen_meli2_maestra", "margen_meli3_maestra", "margen_meli4_maestra"]].bfill(axis=1).iloc[:, 0]
 
     sw30 = sales_windows.get(30, pd.DataFrame(columns=["sku"]))
     sw90 = sales_windows.get(90, pd.DataFrame(columns=["sku"]))
@@ -1847,28 +1882,36 @@ def rel_to_sheet_df(rel_df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, original_bytes: bytes, maestra_name: str, rel_name: str):
-    xls = pd.ExcelFile(io.BytesIO(original_bytes))
+    original_bytes = _safe_excel_bytes(original_bytes)
+    wb = load_workbook(io.BytesIO(original_bytes))
+    if maestra_name in wb.sheetnames:
+        ws = wb[maestra_name]
+        wb.remove(ws)
+        ws = wb.create_sheet(maestra_name)
+        safe_drop = [
+            "sku", "descripcion", "ubic", "cambio_precio", "medidas_maestra", "actualizacion_maestra",
+            "costo_maestra", "precio_bruto", "precio_neto", "monto_sim", "margen_local_maestra",
+            "margen_meli1_maestra", "margen_meli2_maestra", "margen_meli3_maestra", "margen_meli4_maestra",
+            "margen_meli_principal_maestra", "ads_flag", "mlcs"
+        ]
+        safe_drop += [f"{p}_{s}" for s in [1,2,3,4] for p in ["mlc","mlc_sync","campana_pads","dcto","precio_b2c","comentario","neto_meli","venta_bruto_meli"]]
+        export_df = master_df.drop(columns=[c for c in safe_drop if c in master_df.columns], errors="ignore")
+        for row in [list(export_df.columns)] + export_df.replace({np.nan: None}).values.tolist():
+            ws.append(list(row))
+    if rel_name and rel_name in wb.sheetnames:
+        wsr = wb[rel_name]
+        wb.remove(wsr)
+        wsr = wb.create_sheet(rel_name)
+        rel_sheet = rel_to_sheet_df(rel_df).replace({np.nan: None})
+        for row in rel_sheet.values.tolist():
+            wsr.append(list(row))
+    # preserve original sheet order as much as possible
+    desired = []
+    for name in [maestra_name, rel_name]:
+        if name and name in wb.sheetnames:
+            desired.append(name)
     out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        for sheet in xls.sheet_names:
-            if sheet == maestra_name:
-                drop_cols = [
-                    "sku", "descripcion", "costo_maestra", "precio_bruto", "precio_neto", "monto_sim",
-                    "margen_local_maestra", "margen_meli1_maestra", "margen_meli2_maestra", "margen_meli3_maestra", "margen_meli4_maestra",
-                    "mlc_1", "mlc_2", "mlc_3", "mlc_4",
-                    "mlc_sync_1", "mlc_sync_2", "mlc_sync_3", "mlc_sync_4",
-                    "ads_flag", "mlcs"
-                ]
-                master_df.drop(columns=[c for c in drop_cols if c in master_df.columns], errors="ignore").to_excel(writer, sheet_name=sheet, index=False)
-            elif rel_name and sheet == rel_name:
-                rel_to_sheet_df(rel_df).to_excel(writer, sheet_name=sheet, index=False, header=False)
-            else:
-                pd.read_excel(io.BytesIO(original_bytes), sheet_name=sheet, header=None if "relampago" in sheet.lower() else 0).to_excel(
-                    writer,
-                    sheet_name=sheet,
-                    index=False,
-                    header=not ("relampago" in sheet.lower())
-                )
+    wb.save(out)
     return out.getvalue()
 
 
@@ -1876,9 +1919,15 @@ def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, original
 # Model
 # =========================================================
 def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None, keywords_up=None):
-    wb = load_master_workbook(master_up.getvalue())
+    if master_up is None:
+        raise ValueError("Falta cargar la maestra.")
+    if ventas_up is None:
+        raise ValueError("Falta cargar el reporte de ventas.")
+    master_bytes = master_up.getvalue() if hasattr(master_up, "getvalue") else master_up
+    wb = load_master_workbook(master_bytes)
     master, promos = normalize_master(wb["master_df"], wb["bridge_df"])
     rel = normalize_rel(wb["rel_df"])
+    meli_slots = ensure_promos_schema(promos)
 
     ventas = load_sales(ventas_up.getvalue()) if ventas_up else pd.DataFrame()
     compras = load_purchases(compras_up.getvalue()) if compras_up else pd.DataFrame()
@@ -1891,7 +1940,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
     action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
-    validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos, action_table)
+    validations = build_validation_layers(master, ventas, compras, pubs, product_ads, meli_slots, action_table)
 
     product_options = action_table["sku"].dropna().tolist()
     sku_desc = action_table.set_index("sku")["descripcion"].to_dict()
@@ -1899,7 +1948,8 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     return {
         "wb": wb,
         "master": master,
-        "promos": promos,
+        "promos": meli_slots,
+        "meli_slots": meli_slots,
         "rel": rel,
         "ventas": ventas,
         "compras": compras,
@@ -1922,6 +1972,10 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
 
 @st.cache_data(show_spinner=False)
 def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None):
+    if not master_bytes:
+        raise ValueError("No hay bytes válidos para la maestra activa.")
+    if not ventas_bytes:
+        raise ValueError("No hay bytes válidos para ventas.")
     master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
     ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ventas_bytes)
     compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), compras_bytes) if compras_bytes else None
@@ -2761,7 +2815,6 @@ if False:
         left, right = st.columns([1, 2])
         with left:
             status_options = [
-                "Sin fecha",
                 "Vencidas",
                 "Vencen hoy",
                 "Vencen mañana",
@@ -2773,7 +2826,7 @@ if False:
             status_filter = st.multiselect(
                 "Estado",
                 status_options,
-                default=st.session_state.get("promo_status_filter_v3", ["Sin fecha", "Vencidas", "Vencen hoy"]),
+                default=st.session_state.get("promo_status_filter_v3", ["Vencidas", "Vencen hoy"]),
                 key="promo_status_filter_v3",
             )
             text_filter = st.text_input("Buscar por SKU / descripción / MLC", key="promo_search_v3")
