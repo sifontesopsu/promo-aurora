@@ -988,8 +988,34 @@ def calc_price_for_target_ml_margin(cost, fee_pct, fixed_charge=0.0, target_marg
 # Loaders
 # =========================================================
 @st.cache_data(show_spinner=False)
+def _coerce_excel_bytes(file_bytes, label: str = "archivo Excel") -> bytes:
+    if file_bytes is None:
+        raise ValueError(f"No se recibió {label}.")
+    if hasattr(file_bytes, "getvalue"):
+        file_bytes = file_bytes.getvalue()
+    if isinstance(file_bytes, memoryview):
+        file_bytes = file_bytes.tobytes()
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        raise ValueError(f"{label}: tipo no soportado ({type(file_bytes).__name__}).")
+    file_bytes = bytes(file_bytes)
+    if not file_bytes:
+        raise ValueError(f"{label}: archivo vacío.")
+    return file_bytes
+
+
 def load_master_workbook(file_bytes: bytes):
-    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    file_bytes = _coerce_excel_bytes(file_bytes, "la maestra")
+    bio = io.BytesIO(file_bytes)
+
+    try:
+        xls = pd.ExcelFile(bio, engine="openpyxl")
+    except Exception as e:
+        head = file_bytes[:24]
+        raise ValueError(
+            "No pude abrir la maestra como Excel válido (.xlsx). "
+            f"Cabecera detectada: {head!r}. Error original: {e}"
+        ) from e
+
     names = xls.sheet_names
     maestra_name = _find_sheet(names, "MAESTRA de precios")
     bridge_name = _find_sheet(names, "MLC -SKU")
@@ -999,10 +1025,10 @@ def load_master_workbook(file_bytes: bytes):
     if not maestra_name:
         raise ValueError("No encontré la hoja 'MAESTRA de precios'.")
 
-    master_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=maestra_name)
-    bridge_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=bridge_name) if bridge_name else pd.DataFrame()
-    rel_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=rel_name, header=None) if rel_name else pd.DataFrame()
-    control_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=control_name) if control_name else pd.DataFrame()
+    master_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=maestra_name, engine="openpyxl")
+    bridge_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=bridge_name, engine="openpyxl") if bridge_name else pd.DataFrame()
+    rel_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=rel_name, header=None, engine="openpyxl") if rel_name else pd.DataFrame()
+    control_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=control_name, engine="openpyxl") if control_name else pd.DataFrame()
 
     return {
         "sheet_names": names,
@@ -1751,7 +1777,7 @@ def rel_to_sheet_df(rel_df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, control_df: pd.DataFrame, original_bytes: bytes, maestra_name: str, rel_name: str, control_name: str | None = None):
-    xls = pd.ExcelFile(io.BytesIO(original_bytes))
+    xls = pd.ExcelFile(io.BytesIO(_coerce_excel_bytes(original_bytes, "la maestra original")), engine="openpyxl")
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
         for sheet in xls.sheet_names:
@@ -1767,7 +1793,7 @@ def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, control_
             elif control_name and sheet == control_name:
                 control_promos_to_sheet_df(control_df).to_excel(writer, sheet_name=sheet, index=False)
             else:
-                pd.read_excel(io.BytesIO(original_bytes), sheet_name=sheet, header=None if "relampago" in sheet.lower() else 0).to_excel(
+                pd.read_excel(io.BytesIO(_coerce_excel_bytes(original_bytes, "la maestra original")), sheet_name=sheet, header=None if "relampago" in sheet.lower() else 0, engine="openpyxl").to_excel(
                     writer,
                     sheet_name=sheet,
                     index=False,
@@ -1828,6 +1854,8 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
 
 @st.cache_data(show_spinner=False)
 def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None):
+    master_bytes = _coerce_excel_bytes(master_bytes, "la maestra")
+    ventas_bytes = _coerce_excel_bytes(ventas_bytes, "el reporte de ventas")
     master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
     ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ventas_bytes)
     compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), compras_bytes) if compras_bytes else None
