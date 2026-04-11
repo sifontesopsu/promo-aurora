@@ -987,9 +987,27 @@ def calc_price_for_target_ml_margin(cost, fee_pct, fixed_charge=0.0, target_marg
 # =========================================================
 # Loaders
 # =========================================================
+def ensure_excel_bytes(file_obj_or_bytes, file_label: str = "archivo Excel") -> bytes:
+    if isinstance(file_obj_or_bytes, (bytes, bytearray)):
+        data = bytes(file_obj_or_bytes)
+    elif hasattr(file_obj_or_bytes, "getvalue"):
+        data = file_obj_or_bytes.getvalue()
+    else:
+        data = file_obj_or_bytes
+    if data is None:
+        raise ValueError(f"Falta cargar {file_label}.")
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError(f"{file_label} no se pudo leer correctamente.")
+    data = bytes(data)
+    if len(data) == 0:
+        raise ValueError(f"{file_label} está vacío.")
+    return data
+
+
 @st.cache_data(show_spinner=False)
 def load_master_workbook(file_bytes: bytes):
-    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+    file_bytes = ensure_excel_bytes(file_bytes, "la maestra")
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
     names = xls.sheet_names
     maestra_name = _find_sheet(names, "MAESTRA de precios")
     bridge_name = _find_sheet(names, "MLC -SKU")
@@ -999,10 +1017,10 @@ def load_master_workbook(file_bytes: bytes):
     if not maestra_name:
         raise ValueError("No encontré la hoja 'MAESTRA de precios'.")
 
-    master_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=maestra_name)
-    bridge_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=bridge_name) if bridge_name else pd.DataFrame()
-    rel_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=rel_name, header=None) if rel_name else pd.DataFrame()
-    control_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=control_name) if control_name else pd.DataFrame()
+    master_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=maestra_name, engine="openpyxl")
+    bridge_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=bridge_name, engine="openpyxl") if bridge_name else pd.DataFrame()
+    rel_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=rel_name, header=None, engine="openpyxl") if rel_name else pd.DataFrame()
+    control_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=control_name, engine="openpyxl") if control_name else pd.DataFrame()
 
     return {
         "sheet_names": names,
@@ -1479,7 +1497,8 @@ def normalize_rel(rel_df):
 
 @st.cache_data(show_spinner=False)
 def load_sales(file_bytes: bytes):
-    raw = pd.read_excel(io.BytesIO(file_bytes))
+    file_bytes = ensure_excel_bytes(file_bytes, "el reporte de ventas")
+    raw = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
     raw = raw.copy()
     for col in ["SKU", "Fecha", "Vendedor", "Documento", "Cantidad", "Precio Un.", "Total Línea", "Producto", "Rut", "Razón Social"]:
         if col not in raw.columns:
@@ -1500,7 +1519,8 @@ def load_sales(file_bytes: bytes):
 
 @st.cache_data(show_spinner=False)
 def load_purchases(file_bytes: bytes):
-    raw = pd.read_excel(io.BytesIO(file_bytes))
+    file_bytes = ensure_excel_bytes(file_bytes, "el reporte de compras")
+    raw = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
     raw = raw.copy()
     for col in ["SKU", "Fecha", "Razón Social", "Precio Un.", "Cantidad", "Documento", "Folio"]:
         if col not in raw.columns:
@@ -1518,7 +1538,8 @@ def load_purchases(file_bytes: bytes):
 
 @st.cache_data(show_spinner=False)
 def load_publications(file_bytes: bytes):
-    raw = pd.read_excel(io.BytesIO(file_bytes))
+    file_bytes = ensure_excel_bytes(file_bytes, "el maestro de publicaciones")
+    raw = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
     raw = raw.copy()
     rename = {
         "Id": "mlc",
@@ -1568,7 +1589,8 @@ def load_publications(file_bytes: bytes):
 
 @st.cache_data(show_spinner=False)
 def load_product_ads(file_bytes: bytes):
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por anuncios", header=1)
+    file_bytes = ensure_excel_bytes(file_bytes, "el reporte Product Ads")
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por anuncios", header=1, engine="openpyxl")
     df = df.copy()
     cols = {
         "Campaña": "campana",
@@ -1595,7 +1617,8 @@ def load_product_ads(file_bytes: bytes):
 
 @st.cache_data(show_spinner=False)
 def load_keywords(file_bytes: bytes):
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por palabras clave", header=1)
+    file_bytes = ensure_excel_bytes(file_bytes, "el reporte Keywords")
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por palabras clave", header=1, engine="openpyxl")
     df = df.copy()
     cols = {
         "Campaña": "campana",
@@ -2017,7 +2040,11 @@ def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, original
 # Model
 # =========================================================
 def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None, keywords_up=None):
-    wb = load_master_workbook(master_up.getvalue())
+    if master_up is None:
+        raise ValueError("Falta cargar la maestra activa.")
+    if ventas_up is None:
+        raise ValueError("Falta cargar el reporte de ventas activo.")
+    wb = load_master_workbook(master_up)
     master, promos = normalize_master(wb["master_df"], wb["bridge_df"], wb.get("control_df"))
     rel = normalize_rel(wb["rel_df"])
     control_promos = normalize_control_promos(wb.get("control_df"))
@@ -2065,12 +2092,12 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
 
 @st.cache_data(show_spinner=False)
 def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None):
-    master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
-    ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ventas_bytes)
-    compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), compras_bytes) if compras_bytes else None
-    pubs_up = StoredUploadedFile(Path(FILE_SPECS["pubs"]["filename"]), pubs_bytes) if pubs_bytes else None
-    ads_up = StoredUploadedFile(Path(FILE_SPECS["ads"]["filename"]), ads_bytes) if ads_bytes else None
-    keywords_up = StoredUploadedFile(Path(FILE_SPECS["keywords"]["filename"]), keywords_bytes) if keywords_bytes else None
+    master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), ensure_excel_bytes(master_bytes, "la maestra")) if master_bytes is not None else None
+    ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ensure_excel_bytes(ventas_bytes, "el reporte de ventas")) if ventas_bytes is not None else None
+    compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), ensure_excel_bytes(compras_bytes, "el reporte de compras")) if compras_bytes else None
+    pubs_up = StoredUploadedFile(Path(FILE_SPECS["pubs"]["filename"]), ensure_excel_bytes(pubs_bytes, "el maestro de publicaciones")) if pubs_bytes else None
+    ads_up = StoredUploadedFile(Path(FILE_SPECS["ads"]["filename"]), ensure_excel_bytes(ads_bytes, "el reporte Product Ads")) if ads_bytes else None
+    keywords_up = StoredUploadedFile(Path(FILE_SPECS["keywords"]["filename"]), ensure_excel_bytes(keywords_bytes, "el reporte Keywords")) if keywords_bytes else None
     return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up)
 
 
