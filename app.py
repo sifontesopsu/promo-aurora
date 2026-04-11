@@ -66,11 +66,26 @@ def backup_file_path(file_key: str) -> Path:
     return BACKUP_FILES_DIR / f"{active.stem}_prev{active.suffix}"
 
 
+def _looks_like_excel_bytes(data: bytes) -> bool:
+    if not isinstance(data, (bytes, bytearray)):
+        return False
+    if len(data) < 32:
+        return False
+    # XLSX/XLSM are ZIP containers starting with PK
+    return bytes(data[:2]) == b"PK"
+
+
 def load_active_file(file_key: str):
     path = active_file_path(file_key)
     if not path.exists():
         return None
-    data = path.read_bytes()
+    try:
+        data = path.read_bytes()
+    except Exception:
+        return None
+    # No tratar archivos truncados o corruptos como activos válidos.
+    if not _looks_like_excel_bytes(data):
+        return None
     return StoredUploadedFile(path=path, data=data, original_name=path.name)
 
 
@@ -1000,8 +1015,10 @@ def _safe_excel_bytes(file_bytes):
         data = bytes(file_bytes)
     else:
         raise ValueError("La maestra no llegó como bytes válidos.")
-    if len(data) < 20:
+    if len(data) < 32:
         raise ValueError("El archivo Excel de la maestra está vacío o incompleto.")
+    if not _looks_like_excel_bytes(data):
+        raise ValueError("La maestra activa no es un Excel válido. Vuelve a subir el archivo desde la barra lateral y presiona 'Validar y reemplazar'.")
     return data
 
 
