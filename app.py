@@ -1186,6 +1186,27 @@ def ensure_promos_schema(promos_df: pd.DataFrame) -> pd.DataFrame:
     return df[cols]
 
 
+
+def promo_status(dt):
+    dt = to_date_only(dt)
+    if pd.isna(dt):
+        return "Vencen en 1 mes", 30
+    today = pd.Timestamp(date.today())
+    delta = int((dt - today).days)
+    if delta < 0:
+        return "Vencidas", -1
+    if delta == 0:
+        return "Vencen hoy", 0
+    if delta == 1:
+        return "Vencen mañana", 1
+    if delta == 2:
+        return "Vencen pasado mañana", 2
+    if delta <= 7:
+        return "Vencen en 7 días", 7
+    if delta <= 15:
+        return "Vencen en 15 días", 15
+    return "Vencen en 1 mes", 30
+
 def normalize_control_promos(control_df: pd.DataFrame) -> pd.DataFrame:
     cols = ["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"]
     if control_df is None or control_df.empty:
