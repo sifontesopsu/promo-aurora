@@ -900,8 +900,8 @@ def build_validation_layers(master, ventas, compras, pubs, product_ads, promos, 
     multi_active = multi_active.groupby("sku").filter(lambda g: len(g) > 1) if not multi_active.empty else pd.DataFrame()
     register("Múltiples publicaciones activas por SKU", "ALERTA" if not multi_active.empty else "OK", multi_active[[c for c in ["sku", "mlc", "titulo", "precio_final", "ventas_hist_pub"] if c in multi_active.columns]], "Puede existir estrategia multilistado, pero se debe revisar porque afecta la publicación principal y el pricing.")
 
-    promo_issues = promos[(promos.get("mlc", pd.Series(dtype=str)).astype(str).str.strip().eq("")) | (pd.isna(promos.get("fecha_venci")))] if not promos.empty else pd.DataFrame()
-    register("Promociones incompletas", "ALERTA" if not promo_issues.empty else "OK", promo_issues[[c for c in ["sku", "slot", "mlc", "precio_b2c", "fecha_venci", "comentario"] if c in promo_issues.columns]], "Las promos deben tener MLC y fecha de vencimiento para ser operables.")
+    promo_summary = promos.copy() if not promos.empty else pd.DataFrame()
+    register("Promociones detectadas desde publicaciones ML", "OK", promo_summary[[c for c in ["sku", "slot", "mlc", "precio_b2c", "status", "comentario"] if c in promo_summary.columns]], "Vista informativa basada solo en la maestra publicaciones ML; no depende de CONTROL DE PROMOCIONES.")
 
     ads_orphan = product_ads[~product_ads.get("mlc", pd.Series(dtype=str)).isin(pub_mlcs)].sort_values("mlc") if not product_ads.empty else pd.DataFrame()
     register("Ads sin publicación asociada", "ALERTA" if not ads_orphan.empty else "OK", ads_orphan[[c for c in ["mlc", "campana", "titulo", "inversion_ads", "ingresos_ads"] if c in ads_orphan.columns]], "Product Ads trae publicaciones que hoy no están en el reporte maestro ML.")
@@ -1020,26 +1020,23 @@ def load_master_workbook(file_bytes: bytes):
     maestra_name = _find_sheet(names, "MAESTRA de precios")
     bridge_name = _find_sheet(names, "MLC -SKU")
     rel_name = _find_sheet(names, "Relampago mi pagina")
-    control_name = _find_sheet(names, "CONTROL DE PROMOCIONES")
-
     if not maestra_name:
         raise ValueError("No encontré la hoja 'MAESTRA de precios'.")
 
     master_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=maestra_name, engine="openpyxl")
     bridge_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=bridge_name, engine="openpyxl") if bridge_name else pd.DataFrame()
     rel_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=rel_name, header=None, engine="openpyxl") if rel_name else pd.DataFrame()
-    control_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=control_name, engine="openpyxl") if control_name else pd.DataFrame()
 
     return {
         "sheet_names": names,
         "maestra_name": maestra_name,
         "bridge_name": bridge_name,
         "rel_name": rel_name,
-        "control_name": control_name,
+        "control_name": None,
         "master_df": master_df,
         "bridge_df": bridge_df,
         "rel_df": rel_df,
-        "control_df": control_df,
+        "control_df": pd.DataFrame(),
         "file_bytes": file_bytes,
     }
 
@@ -1175,6 +1172,43 @@ def normalize_master(master_df, bridge_df):
 
 
 
+def normalize_promos_from_publications(pubs_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"]
+    if pubs_df is None or not isinstance(pubs_df, pd.DataFrame) or pubs_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df = pubs_df.copy()
+    for col in ["sku", "mlc", "titulo", "precio_oferta", "precio_base", "precio_final", "status"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["sku"] = df["sku"].map(norm_sku)
+    df["mlc"] = df["mlc"].map(norm_mlc)
+    df["precio_oferta"] = df["precio_oferta"].map(safe_float)
+    df["precio_base"] = df["precio_base"].map(safe_float)
+    df["precio_final"] = df["precio_final"].map(safe_float)
+
+    has_offer = df["precio_oferta"].notna() & (df["precio_oferta"] > 0)
+    lower_than_base = df["precio_base"].notna() & (df["precio_oferta"] < df["precio_base"])
+    lower_than_final = df["precio_final"].notna() & (df["precio_oferta"] < df["precio_final"])
+    promos = df[has_offer & (lower_than_base | lower_than_final)].copy()
+
+    if promos.empty:
+        return pd.DataFrame(columns=cols)
+
+    promos = promos.sort_values(["sku", "mlc"]).reset_index(drop=True)
+    promos["promo_index"] = promos.index.astype(int)
+    promos["descripcion"] = promos["titulo"].fillna("").astype(str)
+    promos["slot"] = 1
+    promos["campana_ads"] = ""
+    promos["precio_b2c"] = promos["precio_oferta"]
+    promos["fecha_venci"] = pd.NaT
+    promos["comentario"] = "Promo detectada desde publicaciones ML"
+    promos["status"] = np.where(promos["status"].astype(str).str.upper().eq("ACTIVA"), "Activa en publicaciones ML", "Promo en publicaciones ML")
+    promos["status_order"] = 0
+    return promos[cols].copy()
+
+
 def ensure_promos_schema(promos_df: pd.DataFrame) -> pd.DataFrame:
     cols = ["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"]
     if promos_df is None or not isinstance(promos_df, pd.DataFrame):
@@ -1188,86 +1222,15 @@ def ensure_promos_schema(promos_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def promo_status(dt):
-    dt = to_date_only(dt)
-    if pd.isna(dt):
-        return "Vencen en 1 mes", 30
-    today = pd.Timestamp(date.today())
-    delta = int((dt - today).days)
-    if delta < 0:
-        return "Vencidas", -1
-    if delta == 0:
-        return "Vencen hoy", 0
-    if delta == 1:
-        return "Vencen mañana", 1
-    if delta == 2:
-        return "Vencen pasado mañana", 2
-    if delta <= 7:
-        return "Vencen en 7 días", 7
-    if delta <= 15:
-        return "Vencen en 15 días", 15
-    return "Vencen en 1 mes", 30
+    return "No usado", 0
+
 
 def normalize_control_promos(control_df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"]
-    if control_df is None or control_df.empty:
-        return pd.DataFrame(columns=cols)
-
-    df = control_df.copy()
-    rename_candidates = {
-        "sku_raw": [" ", "SKU", "Cod", "Codigo", "Código"],
-        "mlc_raw": ["N° Publicación", "N° Publicacion", "Numero de publicacion", "Número de publicación", "MLC"],
-        "descripcion": ["Descripción", "DESCRIPCIÓN", "Descripcion"],
-        "precio_promocional": ["Precio promocional", "PRECIO PROMOCIONAL", "PRECIO B2C"],
-        "comentario": ["Ads/Comentario", "ADS/COMENTARIO", "Comentario", "COMENTARIO"],
-        "campana_1": ["Campaña 1"],
-        "campana_2": ["Campaña 2"],
-        "campana_3": ["Campaña 3"],
-        "campana_4": ["Campaña 4"],
-    }
-    mapped = {}
-    for target, aliases in rename_candidates.items():
-        found = pick_existing_column(df, *aliases)
-        mapped[target] = found
-        if found is None:
-            df[target] = np.nan
-        elif found != target:
-            df[target] = df[found]
-
-    df["sku"] = df["sku_raw"].map(norm_sku)
-    df["descripcion"] = df["descripcion"].fillna("").astype(str)
-    df["precio_promocional"] = df["precio_promocional"].map(safe_float)
-    df["comentario"] = df["comentario"].fillna("").astype(str)
-
-    rows = []
-    for idx, row in df.iterrows():
-        mlcs = parse_mlc_cell_list(row.get("mlc_raw"))
-        if not mlcs:
-            mlcs = [""]
-        for slot in range(1, 5):
-            dt = pd.to_datetime(row.get(f"campana_{slot}"), errors="coerce")
-            if pd.isna(dt):
-                continue
-            dt = dt.normalize()
-            status, order = promo_status(dt)
-            for mlc in mlcs:
-                rows.append({
-                    "promo_index": idx,
-                    "sku": row.get("sku", ""),
-                    "descripcion": row.get("descripcion", ""),
-                    "slot": slot,
-                    "mlc": mlc,
-                    "campana_ads": f"Campaña {slot}",
-                    "precio_b2c": row.get("precio_promocional", np.nan),
-                    "fecha_venci": dt,
-                    "comentario": row.get("comentario", ""),
-                    "status": status,
-                    "status_order": order,
-                })
-    return pd.DataFrame(rows, columns=cols)
+    return ensure_promos_schema(pd.DataFrame())
 
 
 def control_promos_to_sheet_df(control_df: pd.DataFrame) -> pd.DataFrame:
-    return control_df.copy() if isinstance(control_df, pd.DataFrame) else pd.DataFrame()
+    return pd.DataFrame()
 
 
 def normalize_rel(rel_df):
@@ -1797,7 +1760,7 @@ def rel_to_sheet_df(rel_df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, control_df: pd.DataFrame, original_bytes: bytes, maestra_name: str, rel_name: str, control_name: str | None = None):
+def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, original_bytes: bytes, maestra_name: str, rel_name: str):
     xls = pd.ExcelFile(io.BytesIO(_coerce_excel_bytes(original_bytes, "la maestra original")), engine="openpyxl")
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
@@ -1811,8 +1774,6 @@ def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, control_
                 master_df.drop(columns=[c for c in drop_cols if c in master_df.columns], errors="ignore").to_excel(writer, sheet_name=sheet, index=False)
             elif rel_name and sheet == rel_name:
                 rel_to_sheet_df(rel_df).to_excel(writer, sheet_name=sheet, index=False, header=False)
-            elif control_name and sheet == control_name:
-                control_promos_to_sheet_df(control_df).to_excel(writer, sheet_name=sheet, index=False)
             else:
                 pd.read_excel(io.BytesIO(_coerce_excel_bytes(original_bytes, "la maestra original")), sheet_name=sheet, header=None if "relampago" in sheet.lower() else 0, engine="openpyxl").to_excel(
                     writer,
@@ -1830,13 +1791,14 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     wb = load_master_workbook(master_up.getvalue())
     master, _ = normalize_master(wb["master_df"], wb["bridge_df"])
     rel = normalize_rel(wb["rel_df"])
-    promos = normalize_control_promos(wb.get("control_df"))
+    promos = ensure_promos_schema(pd.DataFrame())
 
     ventas = load_sales(ventas_up.getvalue()) if ventas_up else pd.DataFrame()
     compras = load_purchases(compras_up.getvalue()) if compras_up else pd.DataFrame()
     pubs = load_publications(pubs_up.getvalue()) if pubs_up else pd.DataFrame()
     product_ads = load_product_ads(ads_up.getvalue()) if ads_up else pd.DataFrame()
     keywords = load_keywords(keywords_up.getvalue()) if keywords_up else pd.DataFrame()
+    promos = normalize_promos_from_publications(pubs)
 
     sales_windows, total_hist, ml_sales = summarize_sales_windows(ventas, master, compras, days_list=(7, 15, 30, 90))
     purchase_summary, purchase_map = summarize_purchases(compras)
@@ -1900,7 +1862,7 @@ def build_shared_model(resolved_files: dict):
 def persist_current_master_workbook(model: dict, note: str = "maestra actualizada desde app"):
     ensure_storage_dirs()
     wb = model["wb"]
-    output_bytes = build_download_bytes(model["master"], model["rel"], model.get("control_df", pd.DataFrame()), wb["file_bytes"], wb["maestra_name"], wb["rel_name"], wb.get("control_name"))
+    output_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
     active_path = active_file_path("master")
     archived_path = archive_existing_active_file("master")
     active_path.write_bytes(output_bytes)
@@ -2831,7 +2793,7 @@ if False:
 if False:
     st.subheader("Descargar maestra actualizada")
     wb = model["wb"]
-    download_bytes = build_download_bytes(model["master"], model["rel"], model.get("control_df", pd.DataFrame()), wb["file_bytes"], wb["maestra_name"], wb["rel_name"], wb.get("control_name"))
+    download_bytes = build_download_bytes(model["master"], model["rel"], wb["file_bytes"], wb["maestra_name"], wb["rel_name"])
     st.download_button(
         "Descargar workbook actualizado",
         data=download_bytes,
