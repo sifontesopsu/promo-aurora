@@ -37,8 +37,6 @@ FILE_SPECS = {
     "pubs": {"label": "Maestro publicaciones ML", "filename": "publicaciones_ml.xlsx", "required": True},
     "ads": {"label": "Product Ads", "filename": "product_ads.xlsx", "required": False},
     "keywords": {"label": "Keywords / Brand Ads", "filename": "keywords.xlsx", "required": False},
-    "problemas": {"label": "Ventas con problemas", "filename": "ventas_con_problemas.xlsx", "required": False},
-
     "postventa": {"label": "Ventas con problemas", "filename": "ventas_con_problemas.xlsx", "required": False},
 }
 
@@ -406,6 +404,21 @@ def fmt_pct(value, decimals=1) -> str:
     if np.isnan(x):
         return "—"
     return f"{x:.{decimals}f}%"
+
+def promo_status(dt):
+    dt = to_date_only(dt)
+    if pd.isna(dt):
+        return "SIN USO", 999
+    today = pd.Timestamp(date.today())
+    delta = (dt - today).days
+    if delta < 0:
+        return "VENCIDA", -1
+    if delta == 0:
+        return "HOY", 0
+    if delta <= 7:
+        return "PRÓXIMA", 7
+    return "FUTURA", 30
+
 
 
 def _find_sheet(sheet_names, wanted):
@@ -1196,61 +1209,7 @@ def ensure_promos_schema(promos_df: pd.DataFrame) -> pd.DataFrame:
 
 def normalize_control_promos(control_df: pd.DataFrame) -> pd.DataFrame:
     cols = ["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"]
-    if control_df is None or control_df.empty:
-        return pd.DataFrame(columns=cols)
-
-    df = control_df.copy()
-    rename_candidates = {
-        "sku_raw": [" ", "SKU", "Cod", "Codigo", "Código"],
-        "mlc_raw": ["N° Publicación", "N° Publicacion", "Numero de publicacion", "Número de publicación", "MLC"],
-        "descripcion": ["Descripción", "DESCRIPCIÓN", "Descripcion"],
-        "precio_promocional": ["Precio promocional", "PRECIO PROMOCIONAL", "PRECIO B2C"],
-        "comentario": ["Ads/Comentario", "ADS/COMENTARIO", "Comentario", "COMENTARIO"],
-        "campana_1": ["Campaña 1"],
-        "campana_2": ["Campaña 2"],
-        "campana_3": ["Campaña 3"],
-        "campana_4": ["Campaña 4"],
-    }
-    mapped = {}
-    for target, aliases in rename_candidates.items():
-        found = pick_existing_column(df, *aliases)
-        mapped[target] = found
-        if found is None:
-            df[target] = np.nan
-        elif found != target:
-            df[target] = df[found]
-
-    df["sku"] = df["sku_raw"].map(norm_sku)
-    df["descripcion"] = df["descripcion"].fillna("").astype(str)
-    df["precio_promocional"] = df["precio_promocional"].map(safe_float)
-    df["comentario"] = df["comentario"].fillna("").astype(str)
-
-    rows = []
-    for idx, row in df.iterrows():
-        mlcs = parse_mlc_cell_list(row.get("mlc_raw"))
-        if not mlcs:
-            mlcs = [""]
-        for slot in range(1, 5):
-            dt = pd.to_datetime(row.get(f"campana_{slot}"), errors="coerce")
-            if pd.isna(dt):
-                continue
-            dt = dt.normalize()
-            status, order = promo_status(dt)
-            for mlc in mlcs:
-                rows.append({
-                    "promo_index": idx,
-                    "sku": row.get("sku", ""),
-                    "descripcion": row.get("descripcion", ""),
-                    "slot": slot,
-                    "mlc": mlc,
-                    "campana_ads": f"Campaña {slot}",
-                    "precio_b2c": row.get("precio_promocional", np.nan),
-                    "fecha_venci": dt,
-                    "comentario": row.get("comentario", ""),
-                    "status": status,
-                    "status_order": order,
-                })
-    return pd.DataFrame(rows, columns=cols)
+    return pd.DataFrame(columns=cols)
 
 
 def control_promos_to_sheet_df(control_df: pd.DataFrame) -> pd.DataFrame:
@@ -1817,7 +1776,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     wb = load_master_workbook(master_up.getvalue())
     master, _ = normalize_master(wb["master_df"], wb["bridge_df"])
     rel = normalize_rel(wb["rel_df"])
-    promos = normalize_control_promos(wb.get("control_df"))
+    promos = pd.DataFrame(columns=["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
 
     ventas = load_sales(ventas_up.getvalue()) if ventas_up else pd.DataFrame()
     compras = load_purchases(compras_up.getvalue()) if compras_up else pd.DataFrame()
@@ -1841,7 +1800,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
         "wb": wb,
         "master": master,
         "promos": promos,
-        "control_df": wb.get("control_df", pd.DataFrame()).copy(),
+        "control_df": pd.DataFrame(),
         "rel": rel,
         "ventas": ventas,
         "compras": compras,
