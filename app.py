@@ -1346,6 +1346,239 @@ def load_product_ads(file_bytes: bytes):
     return out
 
 
+
+
+@st.cache_data(show_spinner=False)
+def load_postventa(file_bytes: bytes):
+    file_bytes = _coerce_excel_bytes(file_bytes, "el reporte de ventas con problemas")
+    # Mercado Libre suele exportar este archivo con dos filas previas y header real en la fila 3
+    df = pd.read_excel(io.BytesIO(file_bytes), header=2)
+    df = df.copy()
+    rename_map = {
+        "Fecha de la venta": "fecha_venta_raw",
+        "# de la venta": "nro_venta",
+        "Título de la publicación": "titulo_publicacion",
+        "Variable": "variable",
+        "Tipo de problema": "tipo_problema",
+        "Detalle del problema": "detalle_problema",
+        "Número de reclamo": "nro_reclamo",
+        "Fecha del reclamo": "fecha_reclamo_raw",
+        "Reputación": "reputacion",
+        "Exclusión": "exclusion",
+    }
+    for src_col, dst_col in rename_map.items():
+        if src_col in df.columns:
+            df[dst_col] = df[src_col]
+        elif dst_col not in df.columns:
+            df[dst_col] = np.nan
+
+    # Quitar filas basura si quedaron encabezados repetidos
+    df = df[df["nro_venta"].astype(str).str.upper().ne("# DE LA VENTA")].copy()
+
+    meses = {
+        "ene": "Jan", "feb": "Feb", "mar": "Mar", "abr": "Apr", "may": "May", "jun": "Jun",
+        "jul": "Jul", "ago": "Aug", "sep": "Sep", "oct": "Oct", "nov": "Nov", "dic": "Dec"
+    }
+
+    def parse_ml_datetime(value):
+        if pd.isna(value):
+            return pd.NaT
+        s = str(value).strip()
+        if not s:
+            return pd.NaT
+        s = re.sub(r"^(Lunes|Martes|Miércoles|Miercoles|Jueves|Viernes|Sábado|Sabado|Domingo)\s+", "", s, flags=re.I)
+        s = s.replace("hs", "").replace("  ", " ").strip()
+        for es, en in meses.items():
+            s = re.sub(rf"\b{es}\b", en, s, flags=re.I)
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        return dt
+
+    df["fecha_venta"] = df["fecha_venta_raw"].apply(parse_ml_datetime)
+    df["fecha_reclamo"] = df["fecha_reclamo_raw"].apply(parse_ml_datetime)
+    df["titulo_publicacion"] = df["titulo_publicacion"].fillna("").astype(str)
+    df["detalle_problema"] = df["detalle_problema"].fillna("").astype(str)
+    df["tipo_problema"] = df["tipo_problema"].fillna("").astype(str)
+    df["reputacion"] = df["reputacion"].fillna("").astype(str)
+    df["exclusion"] = df["exclusion"].fillna("").astype(str)
+    df["variable"] = df["variable"].fillna("").astype(str)
+    df["nro_venta"] = df["nro_venta"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+    df["nro_reclamo"] = df["nro_reclamo"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+
+    # Tipo de caso base
+    df["tipo_caso"] = np.where(df["nro_reclamo"].str.strip().eq("") | df["nro_reclamo"].str.lower().eq("nan"), "Cancelación", "Reclamo")
+
+    rep_upper = df["reputacion"].str.upper()
+    exc_upper = df["exclusion"].str.upper()
+    df["afecta_reputacion"] = (
+        rep_upper.str.contains("AFECTA", na=False)
+        & ~rep_upper.str.contains("NO AFECTA", na=False)
+        & ~exc_upper.str.contains("NO AFECTA", na=False)
+    )
+
+    df["dias_activacion"] = (df["fecha_reclamo"] - df["fecha_venta"]).dt.total_seconds() / 86400.0
+    df["dias_activacion"] = df["dias_activacion"].where(df["dias_activacion"] >= 0, np.nan)
+
+    keep_cols = [
+        "fecha_venta", "nro_venta", "titulo_publicacion", "variable", "tipo_caso",
+        "tipo_problema", "detalle_problema", "nro_reclamo", "fecha_reclamo",
+        "reputacion", "exclusion", "afecta_reputacion", "dias_activacion"
+    ]
+    out = df[keep_cols].copy()
+    out = out[~out["nro_venta"].astype(str).str.strip().eq("")].copy()
+    return out
+
+
+def _normalize_title_for_match(value: str) -> str:
+    s = str(value or "").upper()
+    repl = {
+        "Á":"A","É":"E","Í":"I","Ó":"O","Ú":"U","Ñ":"N",
+        "-":" ","_":" ","/":" ","(":" ",")":" ","[":" ","]":" ",
+        ".":" ",",":" ",":":" ",";":" "
+    }
+    for a,b in repl.items():
+        s = s.replace(a,b)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _classify_evitabilidad(tipo_problema: str, detalle: str):
+    t = str(tipo_problema or "").upper()
+    d = str(detalle or "").upper()
+    txt = f"{t} {d}"
+
+    if any(k in txt for k in [
+        "ARREPINT", "NO LO QUIERO", "NO ERA LO QUE BUSCABA", "COMPRO POR ERROR", "NO RECONOZCO LA COMPRA"
+    ]):
+        return "BAJA", "Decisión del cliente", "Monitorear ficha y expectativas; no es prioridad operativa", "CLIENTE"
+
+    if any(k in txt for k in [
+        "FALTA", "FALTANTE", "LLEGARON MENOS", "MENOS UNIDADES", "INCOMPLETO",
+        "PRODUCTO EQUIVOCADO", "DIFERENTE AL PUBLICADO", "DIFERENTE AL COMPRADO",
+        "NO FUNCIONA", "DEFECTUOS", "ROTO", "QUEBRADO", "ABOLLADO", "DANAD", "DAÑAD",
+        "SIN TORNILLOS", "SIN PIEZAS", "PAQUETE VACIO", "VACIO", "PREPARAR LA VENTA", "GESTIONAR O PREPARAR"
+    ]):
+        return "ALTA", "Falla interna / producto / preparación", "Revisar picking, embalaje, control de calidad y ficha", "INTERNO"
+
+    if any(k in txt for k in [
+        "DESPACH", "ENTREGA", "DEMORA", "ATRASO", "NO LLEGO", "TRANSPORTE", "LOGIST"
+    ]):
+        return "MEDIA", "Logística / última milla", "Revisar modalidad logística, embalaje y promesa de entrega", "LOGISTICA"
+
+    if any(k in txt for k in ["OTROS MOTIVOS", "POR OTROS MOTIVOS"]):
+        return "MEDIA", "Causa no estructurada", "Revisar detalle y reclasificar en lote", "OTRO"
+
+    return "MEDIA", "Sin clasificar claramente", "Revisar detalle del caso", "OTRO"
+
+
+def build_postventa_module(postventa: pd.DataFrame, pubs: pd.DataFrame) -> dict:
+    empty = {
+        "enriched": pd.DataFrame(),
+        "resumen": {},
+        "evitabilidad": pd.DataFrame(),
+        "reincidencias": pd.DataFrame(),
+        "publicaciones": pd.DataFrame(),
+    }
+    if postventa is None or not isinstance(postventa, pd.DataFrame) or postventa.empty:
+        return empty
+
+    pv = postventa.copy()
+    pv["titulo_norm"] = pv["titulo_publicacion"].apply(_normalize_title_for_match)
+
+    pubs_work = pubs.copy() if isinstance(pubs, pd.DataFrame) else pd.DataFrame()
+    if pubs_work.empty:
+        pv["sku"] = ""
+        pv["mlc"] = ""
+        pv["status_pub"] = ""
+        pv["entrega_pub"] = ""
+        pv["full_pub"] = np.nan
+        pv["precio_final_pub"] = np.nan
+        pv["match_publicacion"] = False
+    else:
+        pubs_work["titulo_norm"] = pubs_work["titulo"].fillna("").astype(str).apply(_normalize_title_for_match)
+        pubs_work["ventas_hist_pub"] = pd.to_numeric(pubs_work.get("ventas_hist_pub"), errors="coerce").fillna(0)
+        pubs_work["status_rank"] = np.where(pubs_work.get("status", pd.Series(dtype=str)).astype(str).str.upper().eq("ACTIVA"), 0, 1)
+        pubs_work = pubs_work.sort_values(["titulo_norm", "status_rank", "ventas_hist_pub"], ascending=[True, True, False])
+        pubs_match = pubs_work.drop_duplicates(subset=["titulo_norm"], keep="first")[
+            ["titulo_norm", "sku", "mlc", "status", "entrega", "full_stock", "precio_final"]
+        ].copy()
+        pubs_match = pubs_match.rename(columns={
+            "status": "status_pub",
+            "entrega": "entrega_pub",
+            "full_stock": "full_pub",
+            "precio_final": "precio_final_pub",
+        })
+        pv = pv.merge(pubs_match, on="titulo_norm", how="left")
+        for col in ["sku", "mlc", "status_pub", "entrega_pub"]:
+            if col not in pv.columns:
+                pv[col] = ""
+            pv[col] = pv[col].fillna("").astype(str)
+        pv["match_publicacion"] = pv["mlc"].astype(str).str.strip().ne("")
+
+    clasif = pv.apply(lambda r: pd.Series(_classify_evitabilidad(r.get("tipo_problema"), r.get("detalle_problema")),
+                                          index=["evitabilidad", "causa_probable", "accion_sugerida", "familia_problema"]), axis=1)
+    pv = pd.concat([pv, clasif], axis=1)
+
+    # Reincidencia por venta
+    casos_por_venta = pv.groupby("nro_venta").size().rename("casos_por_venta").reset_index()
+    pv = pv.merge(casos_por_venta, on="nro_venta", how="left")
+    pv["es_reincidente"] = pv["casos_por_venta"].fillna(0) > 1
+
+    resumen = {
+        "casos_totales": int(len(pv)),
+        "pct_reputacion": float(pv["afecta_reputacion"].mean() * 100) if len(pv) else np.nan,
+        "dias_activacion": float(pv["dias_activacion"].dropna().mean()) if pv["dias_activacion"].notna().any() else np.nan,
+        "pct_reincidencia": float(pv["es_reincidente"].mean() * 100) if len(pv) else np.nan,
+        "pct_evitabilidad_alta": float(pv["evitabilidad"].eq("ALTA").mean() * 100) if len(pv) else np.nan,
+        "pct_match_publicaciones": float(pv["match_publicacion"].mean() * 100) if len(pv) else np.nan,
+    }
+
+    evit = (
+        pv.groupby(["evitabilidad", "familia_problema", "causa_probable", "accion_sugerida"], dropna=False)
+          .agg(
+              casos=("nro_venta", "size"),
+              pct_reputacion=("afecta_reputacion", lambda s: float(s.mean()*100) if len(s) else np.nan),
+              dias_activacion=("dias_activacion", "mean"),
+              pct_match=("match_publicacion", lambda s: float(s.mean()*100) if len(s) else np.nan),
+          )
+          .reset_index()
+          .sort_values(["casos", "pct_reputacion"], ascending=[False, False])
+    )
+
+    reinc = (
+        pv.groupby(["nro_venta", "titulo_publicacion"], dropna=False)
+          .agg(
+              casos=("nro_venta", "size"),
+              tipos=("tipo_problema", lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:3])),
+              detalles=("detalle_problema", lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:2])),
+              reputacion=("afecta_reputacion", lambda s: "Sí" if s.any() else "No"),
+              mlc=("mlc", lambda s: pd.Series(s).dropna().astype(str).iloc[0] if pd.Series(s).dropna().size else ""),
+              sku=("sku", lambda s: pd.Series(s).dropna().astype(str).iloc[0] if pd.Series(s).dropna().size else ""),
+          )
+          .reset_index()
+    )
+    reinc = reinc[reinc["casos"] > 1].sort_values(["casos", "titulo_publicacion"], ascending=[False, True])
+
+    pubs_rank = (
+        pv.groupby(["titulo_publicacion", "mlc", "sku", "status_pub", "entrega_pub"], dropna=False)
+          .agg(
+              casos=("nro_venta", "size"),
+              pct_reputacion=("afecta_reputacion", lambda s: float(s.mean()*100) if len(s) else np.nan),
+              pct_evitabilidad_alta=("evitabilidad", lambda s: float(pd.Series(s).eq("ALTA").mean()*100) if len(s) else np.nan),
+              dias_activacion=("dias_activacion", "mean"),
+          )
+          .reset_index()
+          .sort_values(["pct_evitabilidad_alta", "casos", "pct_reputacion"], ascending=[False, False, False])
+    )
+
+    return {
+        "enriched": pv,
+        "resumen": resumen,
+        "evitabilidad": evit,
+        "reincidencias": reinc,
+        "publicaciones": pubs_rank,
+    }
+
+
 @st.cache_data(show_spinner=False)
 def load_keywords(file_bytes: bytes):
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por palabras clave", header=1)
