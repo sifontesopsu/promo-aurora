@@ -1585,6 +1585,104 @@ def build_postventa_module(postventa: pd.DataFrame, pubs: pd.DataFrame) -> dict:
     }
 
 
+
+
+@st.cache_data(show_spinner=False)
+def load_politicas_ml(file_bytes: bytes):
+    file_bytes = _coerce_excel_bytes(file_bytes, "el archivo de políticas ML 2026")
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+    sheet = None
+    for wanted in ["ANALISIS_2026", "ANALISIS 2026", "ANALISIS", "ANÁLISIS_2026"]:
+        found = _find_sheet(xls.sheet_names, wanted)
+        if found:
+            sheet = found
+            break
+    if not sheet:
+        raise ValueError("No encontré la hoja 'ANALISIS_2026' en el archivo de políticas ML.")
+
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, engine="openpyxl")
+    df = df.copy()
+
+    # Normalización flexible de columnas
+    alias_map = {
+        "mlc": ["MLC", "Id", "ID", "Número de publicación", "Numero de publicacion", "N° Publicación"],
+        "sku": ["SKU", "Sku", "Cod SKU", "Código", "Codigo"],
+        "titulo_politica": ["Título", "Titulo", "Título de la publicación", "Publicación", "Publicacion"],
+        "metodo_envio_politica": ["Método envío", "Metodo envio", "Método de envío", "Metodo de envio", "Método envío actual"],
+        "precio_venta_politica": ["Precio venta", "Precio de venta", "Precio", "Precio actual"],
+        "costo_total_antiguo": ["Costo total antiguo", "Costo antiguo", "Costo actual", "Costo total actual"],
+        "costo_nuevo_menvios": ["Costo nuevos M.Envíos", "Costo nuevo M.Envíos", "Costo nuevos M.Envios", "Costo nuevo M.Envios"],
+        "costo_nuevo_flex": ["Costo nuevo Flex", "Costo nuevos Flex"],
+        "costo_nuevo_full_flex": ["Costo nuevo Full + Flex", "Costo nuevos Full + Flex", "Costo nuevo Full+Flex"],
+        "costo_nuevo_full_super": ["Costo nuevo Full Súper", "Costo nuevo Full Super", "Costo nuevos Full Súper", "Costo nuevos Full Super"],
+        "diferencia_politica_clp": ["Diferencia $", "Diferencia CLP", "Cambio total $"],
+        "diferencia_politica_pct_precio": ["Diferencia % precio", "Diferencia %", "Cambio % precio"],
+        "impacto_politica": ["Impacto", "Impacto política", "Impacto politica"],
+        "modalidad_recomendada_2026": ["Modalidad recomendada", "Modalidad", "Tramo peso aplicado", "Método recomendado"],
+    }
+
+    canon = {_canon_label(c): c for c in df.columns}
+    for target, aliases in alias_map.items():
+        found = None
+        for a in aliases:
+            if _canon_label(a) in canon:
+                found = canon[_canon_label(a)]
+                break
+        if found is None:
+            df[target] = np.nan
+        elif found != target:
+            df[target] = df[found]
+
+    # Tipos base
+    df["mlc"] = df["mlc"].map(norm_mlc)
+    df["sku"] = df["sku"].map(norm_sku)
+    df["titulo_politica"] = df["titulo_politica"].fillna("").astype(str)
+    df["metodo_envio_politica"] = df["metodo_envio_politica"].fillna("").astype(str)
+    df["impacto_politica"] = df["impacto_politica"].fillna("").astype(str)
+    df["modalidad_recomendada_2026"] = df["modalidad_recomendada_2026"].fillna("").astype(str)
+
+    num_cols = [
+        "precio_venta_politica", "costo_total_antiguo", "costo_nuevo_menvios",
+        "costo_nuevo_flex", "costo_nuevo_full_flex", "costo_nuevo_full_super",
+        "diferencia_politica_clp", "diferencia_politica_pct_precio"
+    ]
+    for c in num_cols:
+        df[c] = df[c].map(safe_float)
+
+    # Costo ML política 2026: tomar el menor costo nuevo disponible como referencia operativa
+    cost_candidates = [
+        "costo_nuevo_menvios", "costo_nuevo_flex",
+        "costo_nuevo_full_flex", "costo_nuevo_full_super"
+    ]
+    df["costo_ml_politica_2026"] = df[cost_candidates].min(axis=1, skipna=True)
+
+    # Ingreso simulado ML 2026: precio venta - costo ML política 2026
+    df["ingreso_simulado_ml_2026"] = np.where(
+        df["precio_venta_politica"].notna() & df["costo_ml_politica_2026"].notna(),
+        df["precio_venta_politica"] - df["costo_ml_politica_2026"],
+        np.nan
+    )
+
+    # Si diferencia % viene en base 0-1, llevar a porcentaje
+    if "diferencia_politica_pct_precio" in df.columns:
+        s = df["diferencia_politica_pct_precio"]
+        mask = s.abs().le(2) & s.notna()
+        df.loc[mask, "diferencia_politica_pct_precio"] = s[mask] * 100
+
+    keep = [
+        "mlc", "sku", "titulo_politica", "metodo_envio_politica", "precio_venta_politica",
+        "costo_total_antiguo", "costo_nuevo_menvios", "costo_nuevo_flex",
+        "costo_nuevo_full_flex", "costo_nuevo_full_super", "diferencia_politica_clp",
+        "diferencia_politica_pct_precio", "impacto_politica", "modalidad_recomendada_2026",
+        "costo_ml_politica_2026", "ingreso_simulado_ml_2026"
+    ]
+    out = df[keep].copy()
+
+    if out.empty:
+        raise ValueError("La hoja ANALISIS_2026 no entregó filas válidas.")
+    return out
+
+
 @st.cache_data(show_spinner=False)
 def load_keywords(file_bytes: bytes):
     df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por palabras clave", header=1)
