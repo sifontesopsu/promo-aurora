@@ -3075,18 +3075,25 @@ with tabs[3]:
             st.caption("No se detectaron ventas con más de un caso en el filtro actual.")
         else:
             st.dataframe(reinc.head(150).rename(columns={
-                "venta_id": "Venta", "titulo_publicacion": "Publicación", "casos": "Casos",
-                "tipos": "Tipos", "detalles": "Detalles", "impacta_reputacion": "Afecta reputación",
-                "evitabilidad_dominante": "Evitabilidad dominante"
+                "nro_venta": "Venta", "titulo_publicacion": "Publicación", "casos": "Casos",
+                "tipos": "Tipos", "detalles": "Detalles", "reputacion": "Afecta reputación",
+                "mlc": "MLC", "sku": "SKU"
             }), use_container_width=True, hide_index=True, height=260)
 
         st.markdown("### Casos detallados")
         detail_cols = [c for c in [
-            "fecha_venta", "fecha_reclamo", "venta_id", "reclamo_id", "titulo_publicacion", "tipo_problema", "detalle_problema",
-            "familia_problema", "evitabilidad", "causa_probable", "accion_sugerida", "impacta_reputacion", "dias_activacion", "mlc", "sku", "status", "entrega", "full_stock"
+            "fecha_venta", "fecha_reclamo", "nro_venta", "nro_reclamo", "titulo_publicacion", "tipo_problema", "detalle_problema",
+            "familia_problema", "evitabilidad", "causa_probable", "accion_sugerida", "afecta_reputacion", "dias_activacion", "mlc", "sku", "status_pub", "entrega_pub", "full_pub"
         ] if c in pv_work.columns]
-        detail = pv_work[detail_cols].copy().sort_values(["evitabilidad", "impacta_reputacion", "fecha_reclamo"], ascending=[True, False, False])
-        st.dataframe(detail, use_container_width=True, hide_index=True, height=380)
+        detail = pv_work[detail_cols].copy()
+        sort_cols = [c for c in ["evitabilidad", "afecta_reputacion", "fecha_reclamo"] if c in detail.columns]
+        asc_map = {"evitabilidad": True, "afecta_reputacion": False, "fecha_reclamo": False}
+        if sort_cols:
+            detail = detail.sort_values(sort_cols, ascending=[asc_map[c] for c in sort_cols])
+        st.dataframe(detail.rename(columns={
+            "nro_venta": "Venta", "nro_reclamo": "Reclamo", "afecta_reputacion": "Afecta reputación",
+            "status_pub": "Status publicación", "entrega_pub": "Entrega", "full_pub": "Full"
+        }), use_container_width=True, hide_index=True, height=380)
 
 if False:
     st.subheader("Historial / snapshots")
