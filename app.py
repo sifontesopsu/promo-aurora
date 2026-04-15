@@ -38,6 +38,7 @@ FILE_SPECS = {
     "ads": {"label": "Product Ads", "filename": "product_ads.xlsx", "required": False},
     "keywords": {"label": "Keywords / Brand Ads", "filename": "keywords.xlsx", "required": False},
     "postventa": {"label": "Ventas con problemas", "filename": "ventas_con_problemas.xlsx", "required": False},
+    "politicas_ml": {"label": "Políticas ML 2026", "filename": "MAESTRA_MEDIDAS_ACTUALIZADA_POLITICAS_ML.xlsx", "required": False},
 }
 
 
@@ -249,6 +250,10 @@ def validate_uploaded_file(file_key: str, stored_file: StoredUploadedFile):
             df = load_postventa(data)
             if df.empty:
                 return False, "El reporte Ventas con problemas no trae filas válidas."
+        elif file_key == "politicas_ml":
+            df = load_politicas_ml(data)
+            if df.empty:
+                return False, "El archivo Políticas ML 2026 no trae filas válidas."
         return True, "OK"
     except Exception as e:
         return False, str(e)
@@ -280,6 +285,7 @@ def apply_uploaded_updates(uploaders: dict):
     load_product_ads.clear()
     load_keywords.clear()
     load_postventa.clear()
+    load_politicas_ml.clear()
     return True, [], updated_labels
 
 
@@ -670,7 +676,7 @@ def format_mlc_list(values) -> str:
 def build_ads_report_detail_for_sku(sku: str, product_ads: pd.DataFrame | None, publications: pd.DataFrame | None) -> pd.DataFrame:
     base_cols = [
         "campana", "mlc", "titulo", "estado", "inversion_ads", "ingresos_ads", "acos", "roas", "ventas_ads", "impresiones", "clics"
-    ]
+        ]
     if not sku or product_ads is None or publications is None:
         return pd.DataFrame(columns=base_cols)
     if not isinstance(product_ads, pd.DataFrame) or not isinstance(publications, pd.DataFrame):
@@ -776,10 +782,10 @@ def save_snapshot_to_db(payload_df, sigs):
     insert_df["run_id"] = run_id
     cols = [
         "run_id", "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct",
-        "precio_bruto", "monto_sim", "precio_ml_actual", "ingreso_estimado_ml", "brecha_precio_pct",
+        "precio_bruto", "monto_sim", "precio_ml_actual", "ingreso_referencia_comercial", "brecha_precio_pct",
         "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
         "delta_margen_30d_pp", "ventas_ml_30d", "ventas_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
-    ]
+        ]
     insert_df = insert_df.reindex(columns=cols)
     insert_df.to_sql("snapshot_producto", conn, if_exists="append", index=False)
     conn.commit()
@@ -1422,7 +1428,7 @@ def load_postventa(file_bytes: bytes):
         "fecha_venta", "nro_venta", "titulo_publicacion", "variable", "tipo_caso",
         "tipo_problema", "detalle_problema", "nro_reclamo", "fecha_reclamo",
         "reputacion", "exclusion", "afecta_reputacion", "dias_activacion"
-    ]
+        ]
     out = df[keep_cols].copy()
     out = out[~out["nro_venta"].astype(str).str.strip().eq("")].copy()
     return out
@@ -1809,7 +1815,7 @@ def keywords_summary(keywords):
     }
 
 
-def build_action_table(master, sales_windows, total_hist, purchase_summary, publications, ads_by_sku):
+def build_action_table(master, sales_windows, total_hist, purchase_summary, publications, ads_by_sku, politicas_ml=None):
     base = master[[
         "sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim",
         "margen_local_maestra", "margen_meli1_maestra", "ads_flag", "mlcs"
@@ -1850,6 +1856,43 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
     pub_primary = pd.DataFrame(pub_primary_rows)
     base = base.merge(pub_primary, on="sku", how="left")
 
+    if politicas_ml is not None and not politicas_ml.empty:
+        pol = politicas_ml.copy()
+        pol_mlc = pol[pol["mlc"].astype(str).str.strip() != ""].copy()
+        if not pol_mlc.empty:
+            pol_mlc = pol_mlc.sort_values(["mlc", "costo_ml_politica_2026"], ascending=[True, True], na_position="last")
+            pol_mlc = pol_mlc.drop_duplicates(subset=["mlc"], keep="first")
+            pol_mlc = pol_mlc.rename(columns={c: f"{c}_mlc" for c in pol_mlc.columns if c != "mlc"})
+            base = base.merge(pol_mlc, left_on="mlc_principal", right_on="mlc", how="left")
+        pol_sku = pol[pol["sku"].astype(str).str.strip() != ""].copy()
+        if not pol_sku.empty:
+            pol_sku = pol_sku.sort_values(["sku", "costo_ml_politica_2026"], ascending=[True, True], na_position="last")
+            pol_sku = pol_sku.drop_duplicates(subset=["sku"], keep="first")
+            pol_sku = pol_sku.rename(columns={c: f"{c}_sku" for c in pol_sku.columns if c != "sku"})
+            base = base.merge(pol_sku, on="sku", how="left")
+        policy_fields = [
+            "precio_venta_politica", "costo_total_antiguo", "costo_nuevo_menvios", "costo_nuevo_flex",
+            "costo_nuevo_full_flex", "costo_nuevo_full_super", "diferencia_politica_clp",
+            "diferencia_politica_pct_precio", "impacto_politica", "metodo_envio_politica",
+            "titulo_politica", "costo_ml_politica_2026", "modalidad_recomendada_2026",
+            "ingreso_simulado_ml_2026"
+        ]
+        for field in policy_fields:
+            mlc_col = f"{field}_mlc"
+            sku_col = f"{field}_sku"
+            base[field] = base[mlc_col] if mlc_col in base.columns else np.nan
+            if sku_col in base.columns:
+                base[field] = base[field].where(base[field].notna(), base[sku_col])
+    else:
+        for field in [
+            "precio_venta_politica", "costo_total_antiguo", "costo_nuevo_menvios", "costo_nuevo_flex",
+            "costo_nuevo_full_flex", "costo_nuevo_full_super", "diferencia_politica_clp",
+            "diferencia_politica_pct_precio", "impacto_politica", "metodo_envio_politica",
+            "titulo_politica", "costo_ml_politica_2026", "modalidad_recomendada_2026",
+            "ingreso_simulado_ml_2026"
+        ]:
+            base[field] = np.nan
+
     base["ads_share_ml_pct"] = np.where(
         base["ingresos_ml_30d"].fillna(0) > 0,
         (base["ads_inversion"].fillna(0) / base["ingresos_ml_30d"].fillna(0)) * 100,
@@ -1885,9 +1928,14 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
         ((base["precio_ml_actual"] - base["precio_bruto"]) / base["precio_bruto"]) * 100,
         np.nan
     )
+    base["ingreso_referencia_comercial"] = np.where(
+        base["ingreso_simulado_ml_2026"].notna(),
+        base["ingreso_simulado_ml_2026"],
+        base["ingreso_estimado_ml"],
+    )
     base["brecha_monto_sim_pct"] = np.where(
-        base["monto_sim"].notna() & base["ingreso_estimado_ml"].notna() & (base["monto_sim"] != 0),
-        ((base["ingreso_estimado_ml"] - base["monto_sim"]) / base["monto_sim"]) * 100,
+        base["monto_sim"].notna() & base["ingreso_referencia_comercial"].notna() & (base["monto_sim"] != 0),
+        ((base["ingreso_referencia_comercial"] - base["monto_sim"]) / base["monto_sim"]) * 100,
         np.nan
     )
     base["delta_margen_30d_pp"] = base["margen_ml_actual"] - base["margen_hist_30d"]
@@ -2005,7 +2053,7 @@ def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, control_
 # =========================================================
 # Model
 # =========================================================
-def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None, keywords_up=None, postventa_up=None):
+def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None, keywords_up=None, postventa_up=None, politicas_ml_up=None):
     wb = load_master_workbook(master_up.getvalue())
     master, _ = normalize_master(wb["master_df"], wb["bridge_df"])
     rel = normalize_rel(wb["rel_df"])
@@ -2017,12 +2065,13 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
     product_ads = load_product_ads(ads_up.getvalue()) if ads_up else pd.DataFrame()
     keywords = load_keywords(keywords_up.getvalue()) if keywords_up else pd.DataFrame()
     postventa = load_postventa(postventa_up.getvalue()) if postventa_up else pd.DataFrame()
+    politicas_ml = load_politicas_ml(politicas_ml_up.getvalue()) if politicas_ml_up else pd.DataFrame()
 
     sales_windows, total_hist, ml_sales = summarize_sales_windows(ventas, master, compras, days_list=(7, 15, 30, 90))
     purchase_summary, purchase_map = summarize_purchases(compras)
     ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
     kw_summary = keywords_summary(keywords)
-    action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku)
+    action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku, politicas_ml)
     validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos, action_table)
     postventa_mod = build_postventa_module(postventa, pubs)
 
@@ -2041,6 +2090,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
         "product_ads": product_ads,
         "keywords": keywords,
         "postventa": postventa,
+        "politicas_ml": politicas_ml,
         "postventa_mod": postventa_mod,
         "kw_summary": kw_summary,
         "sales_windows": sales_windows,
@@ -2057,7 +2107,7 @@ def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None
 
 
 @st.cache_data(show_spinner=False)
-def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None, postventa_bytes=None):
+def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None, postventa_bytes=None, politicas_ml_bytes=None):
     master_bytes = _coerce_excel_bytes(master_bytes, "la maestra")
     ventas_bytes = _coerce_excel_bytes(ventas_bytes, "el reporte de ventas")
     master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
@@ -2067,7 +2117,8 @@ def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_byte
     ads_up = StoredUploadedFile(Path(FILE_SPECS["ads"]["filename"]), ads_bytes) if ads_bytes else None
     keywords_up = StoredUploadedFile(Path(FILE_SPECS["keywords"]["filename"]), keywords_bytes) if keywords_bytes else None
     postventa_up = StoredUploadedFile(Path(FILE_SPECS["postventa"]["filename"]), postventa_bytes) if postventa_bytes else None
-    return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up, postventa_up)
+    politicas_ml_up = StoredUploadedFile(Path(FILE_SPECS["politicas_ml"]["filename"]), politicas_ml_bytes) if politicas_ml_bytes else None
+    return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up, postventa_up, politicas_ml_up)
 
 
 def build_shared_model(resolved_files: dict):
@@ -2079,6 +2130,7 @@ def build_shared_model(resolved_files: dict):
         resolved_files["ads"].getvalue() if resolved_files.get("ads") else None,
         resolved_files["keywords"].getvalue() if resolved_files.get("keywords") else None,
         resolved_files["postventa"].getvalue() if resolved_files.get("postventa") else None,
+        resolved_files["politicas_ml"].getvalue() if resolved_files.get("politicas_ml") else None,
     )
 
 
@@ -2198,10 +2250,10 @@ if master_up and ventas_up and pubs_up and not action_table.empty:
     }
     payload_df = action_table[[
         "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct",
-        "precio_bruto", "monto_sim", "precio_ml_actual", "ingreso_estimado_ml", "brecha_precio_pct",
+        "precio_bruto", "monto_sim", "precio_ml_actual", "ingreso_referencia_comercial", "brecha_precio_pct",
         "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
         "delta_margen_30d_pp", "ingresos_ml_30d", "ingresos_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
-    ]].rename(columns={"ingresos_ml_30d": "ventas_ml_30d", "ingresos_tienda_30d": "ventas_tienda_30d"})
+    ]].rename(columns={"ingreso_referencia_comercial": "ingreso_estimado_ml", "ingresos_ml_30d": "ventas_ml_30d", "ingresos_tienda_30d": "ventas_tienda_30d"})
     current_payload_sig = payload_signature(payload_df, extra=json.dumps({"sigs": sigs, "state": current_state_sig}, sort_keys=True))
     if get_app_meta("last_snapshot_sig", "") != current_payload_sig:
         try:
@@ -2265,7 +2317,7 @@ with tabs[0]:
     display_required_cols = [
         "sku", "descripcion", "estado_general", "brecha_costo_clp", "brecha_costo_pct", "delta_margen_30d_pp",
         "ads_flag", "margen_ml_actual", "margen_hist_30d", "ingresos_ml_30d", "accion_sugerida"
-    ]
+        ]
     for col in display_required_cols:
         if col not in work.columns:
             if col == "ads_flag":
@@ -2357,7 +2409,7 @@ with tabs[0]:
         "sku", "descripcion", "estado_ads", "ads_inversion", "ads_ingresos", "ads_acos",
         "acos_max_permitido_pct", "gap_acos_pct", "margen_ml_reportado", "margen_ml_con_ads",
         "brecha_ads_objetivo_pp", "accion_ads"
-    ]
+        ]
     for col in ads_required_cols:
         if col not in ads_work.columns:
             ads_work[col] = np.nan
@@ -2366,43 +2418,43 @@ with tabs[0]:
         "SKU", "Descripción", "Estado Ads", "Inversión Ads", "Ingresos Ads", "ACOS real",
         "ACOS máx.", "Gap ACOS", "Margen sin Ads", "Margen con Ads",
         "Brecha vs objetivo", "Acción Ads"
-    ]
+        ]
     for c in ["Inversión Ads", "Ingresos Ads"]:
         ads_show[c] = ads_show[c].map(fmt_money)
     for c in ["ACOS real", "ACOS máx.", "Gap ACOS", "Margen sin Ads", "Margen con Ads", "Brecha vs objetivo"]:
         ads_show[c] = ads_show[c].map(fmt_pct)
     st.dataframe(ads_show.head(ads_limit), use_container_width=True, hide_index=True, height=320)
 
-    st.subheader("Brecha comercial real: monto en simulación maestra vs ingreso estimado del reporte ML")
-    st.caption("La brecha comercial principal se mide contra la fuente de verdad operativa: MONTO EN SIMULACIÓN de la maestra versus INGRESO ESTIMADO del reporte de publicaciones.")
+    st.subheader("Brecha comercial real: monto en simulación maestra vs ingreso simulado ML políticas 2026")
+    st.caption("La brecha comercial principal ahora se mide contra la referencia nueva de políticas 2026: MONTO EN SIMULACIÓN de la maestra versus INGRESO SIMULADO ML calculado desde el archivo de políticas. Si no existe referencia 2026 para el SKU/MLC, se usa como respaldo el ingreso estimado del reporte de publicaciones.")
     c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
-    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial", "Mayor ingreso estimado ML", "Mayor monto simulación"], key="commercial_sort")
+    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial", "Mayor ingreso simulado ML 2026", "Mayor monto simulación"], key="commercial_sort")
     only_with_pub = c2.selectbox("Cobertura ML", ["Solo con publicación", "Todos"], key="commercial_pub_filter")
     commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=10000, value=200, step=20, key="commercial_limit"))
 
     commercial = action_table.copy()
     if only_with_pub == "Solo con publicación":
-        commercial = commercial[commercial["ingreso_estimado_ml"].notna()]
+        commercial = commercial[commercial["ingreso_referencia_comercial"].notna()]
     commercial = commercial.sort_values({
         "Mayor brecha comercial": "brecha_monto_sim_pct",
-        "Mayor ingreso estimado ML": "ingreso_estimado_ml",
+        "Mayor ingreso simulado ML 2026": "ingreso_referencia_comercial",
         "Mayor monto simulación": "monto_sim",
     }[commercial_sort], ascending=False, na_position="last")
     commercial_required_cols = [
         "sku", "descripcion", "status_publicacion",
-        "monto_sim", "ingreso_estimado_ml", "brecha_monto_sim_pct",
-        "precio_ml_base", "precio_ml_oferta", "costo_fijo_ml", "margen_ml_reportado"
-    ]
+        "monto_sim", "ingreso_referencia_comercial", "brecha_monto_sim_pct",
+        "modalidad_recomendada_2026", "costo_ml_politica_2026", "impacto_politica", "margen_ml_reportado"
+        ]
     for col in commercial_required_cols:
         if col not in commercial.columns:
             commercial[col] = np.nan
     commercial_show = commercial[commercial_required_cols].copy()
     commercial_show.columns = [
         "SKU", "Descripción", "Status",
-        "Monto simulación maestra", "Ingreso estimado reporte ML", "Brecha comercial %",
-        "Precio base ML", "Precio oferta ML", "Costo fijo ML", "Margen ML reportado"
-    ]
-    for c in ["Monto simulación maestra", "Ingreso estimado reporte ML", "Precio base ML", "Precio oferta ML", "Costo fijo ML"]:
+        "Monto simulación maestra", "Ingreso simulado ML 2026", "Brecha comercial %",
+        "Modalidad recomendada 2026", "Costo ML política 2026", "Impacto política", "Margen ML reportado"
+        ]
+    for c in ["Monto simulación maestra", "Ingreso simulado ML 2026", "Costo ML política 2026"]:
         commercial_show[c] = commercial_show[c].map(fmt_money)
     for c in ["Brecha comercial %", "Margen ML reportado"]:
         commercial_show[c] = commercial_show[c].map(fmt_pct)
@@ -2450,13 +2502,16 @@ with tabs[1]:
             st.write(f"Precio base ML: {fmt_money(row.get('precio_ml_base'))}")
             st.write(f"Precio oferta ML: {fmt_money(row.get('precio_ml_oferta'))}")
             st.write(f"Monto en simulación: {fmt_money(row.get('monto_sim'))}")
-            st.write(f"Ingreso estimado ML: {fmt_money(row.get('ingreso_estimado_ml'))}")
+            st.write(f"Ingreso simulado ML 2026: {fmt_money(row.get('ingreso_referencia_comercial'))}")
             st.write(f"Margen ML actual: {fmt_pct(row.get('margen_ml_actual'))}")
+            st.write(f"Modalidad recomendada 2026: {row.get('modalidad_recomendada_2026', '—') or '—'}")
+            st.write(f"Costo ML política 2026: {fmt_money(row.get('costo_ml_politica_2026'))}")
+            st.write(f"Impacto política 2026: {row.get('impacto_politica', '—') or '—'}")
             st.write(f"Margen histórico ML 30d: {fmt_pct(row.get('margen_hist_30d'))}")
             st.write(f"Margen histórico ML 90d: {fmt_pct(row.get('margen_hist_90d'))}")
             st.write(f"Margen histórico ML total: {fmt_pct(row.get('margen_hist_total'))}")
             st.write(f"Brecha precio ML: {fmt_pct(row.get('brecha_precio_pct'))}")
-            st.write(f"Brecha comercial (monto simulación maestra vs ingreso estimado ML): {fmt_pct(row.get('brecha_monto_sim_pct'))}")
+            st.write(f"Brecha comercial (monto simulación maestra vs ingreso simulado ML 2026): {fmt_pct(row.get('brecha_monto_sim_pct'))}")
         with b:
             st.markdown("#### Tienda")
             st.write(f"Precio bruto tienda: {fmt_money(row.get('precio_bruto'))}")
