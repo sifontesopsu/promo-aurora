@@ -1,3048 +1,3448 @@
+
 import io
-import re
-import html
-import hashlib
-import json
-import hashlib
 import os
+import re
+import json
 import sqlite3
-import threading
-import urllib.request
-import urllib.parse
-from datetime import datetime
+import hashlib
+import shutil
+from datetime import date, timedelta, datetime
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
-APP_TITLE = "Control FULL Aurora"
-DATA_DIR = Path("data")
-DB_PATH = DATA_DIR / "aurora_full_v3.db"
-MAESTRO_PATH = DATA_DIR / "maestro_sku_ean.xlsx"
-DEFAULT_SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzwfCk7ov8fCdX3WoTon-25Q8W-iLZUfWqUTvRSLjOGrkid6J2fNgGSmnSbB7lqUiw/exec"
 
-st.set_page_config(page_title=APP_TITLE, page_icon="📦", layout="wide")
-
-# ============================================================
-# Utilidades
-# ============================================================
-
-def ensure_data_dir():
-    DATA_DIR.mkdir(exist_ok=True)
+st.set_page_config(page_title="Centro de Control Comercial Aurora", layout="wide")
 
 
-def db():
-    ensure_data_dir()
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+# =========================================================
+# Helpers
+# =========================================================
+DB_PATH = "aurora_control_history.sqlite3"
+BASE_DATA_DIR = Path("data")
+ACTIVE_FILES_DIR = BASE_DATA_DIR / "activos"
+BACKUP_FILES_DIR = BASE_DATA_DIR / "respaldo_archivos"
+
+ADS_TARGET_MARGIN_PCT = 20.0
+ADS_GLOBAL_ACOS_ALERT_PCT = 5.09
+ADS_GLOBAL_ROAS_MIN = 10.0
+ADS_OPPORTUNITY_EXTRA_MARGIN_PCT = 5.0
+
+FILE_SPECS = {
+    "master": {"label": "Maestra de precios", "filename": "maestra.xlsx", "required": True},
+    "ventas": {"label": "Reporte de ventas", "filename": "ventas.xlsx", "required": True},
+    "compras": {"label": "Reporte de compras", "filename": "compras.xlsx", "required": False},
+    "pubs": {"label": "Maestro publicaciones ML", "filename": "publicaciones_ml.xlsx", "required": True},
+    "ads": {"label": "Product Ads", "filename": "product_ads.xlsx", "required": False},
+    "keywords": {"label": "Keywords / Brand Ads", "filename": "keywords.xlsx", "required": False},
+    "postventa": {"label": "Ventas con problemas", "filename": "ventas_con_problemas.xlsx", "required": False},
+    "politicas_ml": {"label": "Políticas ML 2026", "filename": "MAESTRA_MEDIDAS_ACTUALIZADA_POLITICAS_ML.xlsx", "required": False},
+}
 
 
-def clean_text(v) -> str:
-    if v is None:
-        return ""
+class StoredUploadedFile:
+    def __init__(self, path: Path, data: bytes, original_name: str | None = None):
+        self.path = Path(path)
+        self._data = data
+        self.name = original_name or self.path.name
+        self.size = len(data)
+
+    def getvalue(self):
+        return self._data
+
+
+def ensure_storage_dirs():
+    ACTIVE_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def active_file_path(file_key: str) -> Path:
+    return ACTIVE_FILES_DIR / FILE_SPECS[file_key]["filename"]
+
+
+def backup_file_path(file_key: str) -> Path:
+    active = Path(FILE_SPECS[file_key]["filename"])
+    return BACKUP_FILES_DIR / f"{active.stem}_prev{active.suffix}"
+
+
+def load_active_file(file_key: str):
+    path = active_file_path(file_key)
+    if not path.exists():
+        return None
+    data = path.read_bytes()
+    return StoredUploadedFile(path=path, data=data, original_name=path.name)
+
+
+def archive_existing_active_file(file_key: str):
+    active_path = active_file_path(file_key)
+    if not active_path.exists():
+        return None
+    backup_path = backup_file_path(file_key)
+    shutil.copy2(active_path, backup_path)
+    return backup_path
+
+
+def ensure_source_files_table():
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS source_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            file_key TEXT NOT NULL,
+            active_filename TEXT NOT NULL,
+            archived_filename TEXT,
+            original_filename TEXT,
+            file_sig TEXT,
+            file_size INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def log_source_file_event(file_key: str, active_filename: str, archived_filename=None, original_filename=None, file_sig: str = "", file_size: int = 0):
+    ensure_source_files_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO source_files (created_at, file_key, active_filename, archived_filename, original_filename, file_sig, file_size)
+        VALUES (datetime('now'), ?, ?, ?, ?, ?, ?)
+        """,
+        (file_key, active_filename, archived_filename or "", original_filename or active_filename, file_sig, int(file_size or 0)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_source_file_events():
+    ensure_source_files_table()
+    conn = sqlite3.connect(DB_PATH)
     try:
-        if pd.isna(v):
-            return ""
-    except Exception:
-        pass
-    s = str(v).replace("\u00a0", " ").strip()
-    if s.lower() in {"nan", "none", "null", "nat"}:
-        return ""
-    return re.sub(r"\s+", " ", s)
+        return pd.read_sql_query("SELECT * FROM source_files ORDER BY id DESC", conn)
+    finally:
+        conn.close()
 
 
-def normalize_header(v) -> str:
-    s = clean_text(v).lower()
-    trans = str.maketrans("áéíóúüñ°º", "aeiouunoo")
-    s = s.translate(trans)
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+def ensure_app_meta_table():
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 
-def norm_code(v) -> str:
-    if v is None:
-        return ""
+def get_app_meta(key: str, default: str = "") -> str:
+    ensure_app_meta_table()
+    conn = sqlite3.connect(DB_PATH)
     try:
-        if pd.isna(v):
-            return ""
-    except Exception:
-        pass
-    if isinstance(v, float):
-        if v.is_integer():
-            return str(int(v))
-        return ("%.0f" % v).strip()
-    s = str(v).strip().replace("\u00a0", "")
-    if s.lower() in {"nan", "none", "null"}:
-        return ""
-    s = re.sub(r"\.0$", "", s)
-    s = re.sub(r"\s+", "", s)
-    return s.upper()
+        row = conn.execute("SELECT value FROM app_meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
 
 
-def to_int(v) -> int:
-    s = clean_text(v)
-    if not s:
-        return 0
-    s = s.replace(".", "").replace(",", ".")
+def set_app_meta(key: str, value: str):
+    ensure_app_meta_table()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        INSERT INTO app_meta (key, value, updated_at)
+        VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+        """,
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def bump_shared_version(reason: str = ""):
+    current = int(get_app_meta("shared_version", "0") or "0")
+    new_version = current + 1
+    set_app_meta("shared_version", str(new_version))
+    set_app_meta("shared_reason", reason or "actualización")
+    set_app_meta("shared_updated_at", datetime.now().isoformat(timespec="seconds"))
+    return new_version
+
+
+def get_shared_version() -> int:
+    return int(get_app_meta("shared_version", "0") or "0")
+
+
+def get_shared_status():
+    return {
+        "version": get_shared_version(),
+        "reason": get_app_meta("shared_reason", "inicio"),
+        "updated_at": get_app_meta("shared_updated_at", ""),
+        "last_snapshot_sig": get_app_meta("last_snapshot_sig", ""),
+    }
+
+
+def persist_uploaded_file(file_key: str, uploaded_file):
+    ensure_storage_dirs()
+    data = uploaded_file.getvalue()
+    active_path = active_file_path(file_key)
+    archived_path = archive_existing_active_file(file_key)
+    active_path.write_bytes(data)
+    stored = StoredUploadedFile(path=active_path, data=data, original_name=getattr(uploaded_file, "name", active_path.name))
+    log_source_file_event(
+        file_key=file_key,
+        active_filename=active_path.name,
+        archived_filename=archived_path.name if archived_path else "",
+        original_filename=getattr(uploaded_file, "name", active_path.name),
+        file_sig=file_signature(stored),
+        file_size=len(data),
+    )
+    bump_shared_version(f"archivo {FILE_SPECS[file_key]['label']} actualizado")
+    return stored
+
+
+
+def staged_uploaded_file(file_key: str, uploaded_file):
+    data = uploaded_file.getvalue()
+    return StoredUploadedFile(
+        path=active_file_path(file_key),
+        data=data,
+        original_name=getattr(uploaded_file, "name", active_file_path(file_key).name),
+    )
+
+
+def validate_uploaded_file(file_key: str, stored_file: StoredUploadedFile):
     try:
-        return int(float(s))
-    except Exception:
-        return 0
+        data = stored_file.getvalue()
+        if not data:
+            return False, "Archivo vacío."
+        if file_key == "master":
+            wb = load_master_workbook(data)
+            master_df, _ = normalize_master(wb["master_df"], wb["bridge_df"])
+            if master_df.empty:
+                return False, "La maestra quedó vacía tras normalizar."
+        elif file_key == "ventas":
+            df = load_sales(data)
+            if df.empty:
+                return False, "El reporte de ventas no trae filas válidas."
+        elif file_key == "compras":
+            df = load_purchases(data)
+            if df.empty:
+                return False, "El reporte de compras no trae filas válidas."
+        elif file_key == "pubs":
+            df = load_publications(data)
+            if df.empty:
+                return False, "El reporte de publicaciones no trae filas válidas."
+        elif file_key == "ads":
+            df = load_product_ads(data)
+            if df.empty:
+                return False, "El reporte Product Ads no trae filas válidas."
+        elif file_key == "keywords":
+            df = load_keywords(data)
+            if df.empty:
+                return False, "El reporte Keywords no trae filas válidas."
+        elif file_key == "postventa":
+            df = load_postventa(data)
+            if df.empty:
+                return False, "El reporte Ventas con problemas no trae filas válidas."
+        elif file_key == "politicas_ml":
+            df = load_politicas_ml(data)
+            if df.empty:
+                return False, "El archivo Políticas ML 2026 no trae filas válidas."
+        return True, "OK"
+    except Exception as e:
+        return False, str(e)
 
 
-def esc(v) -> str:
-    return html.escape(clean_text(v), quote=True)
+def apply_uploaded_updates(uploaders: dict):
+    staged = {}
+    errors = []
+    updated_labels = []
+    for file_key, uploaded in uploaders.items():
+        if uploaded is None:
+            continue
+        staged_file = staged_uploaded_file(file_key, uploaded)
+        ok, msg = validate_uploaded_file(file_key, staged_file)
+        if not ok:
+            errors.append(f"{FILE_SPECS[file_key]['label']}: {msg}")
+        else:
+            staged[file_key] = staged_file
+    if errors:
+        return False, errors, []
+    for file_key, staged_file in staged.items():
+        persist_uploaded_file(file_key, staged_file)
+        updated_labels.append(FILE_SPECS[file_key]["label"])
+    build_model_cached.clear()
+    load_master_workbook.clear()
+    load_sales.clear()
+    load_purchases.clear()
+    load_publications.clear()
+    load_product_ads.clear()
+    load_keywords.clear()
+    load_postventa.clear()
+    load_politicas_ml.clear()
+    return True, [], updated_labels
 
 
-def fmt_dt(v) -> str:
-    s = clean_text(v)
-    if not s:
-        return ""
+
+def resolve_input_file(file_key: str, uploaded_file=None):
+    if uploaded_file is not None:
+        return staged_uploaded_file(file_key, uploaded_file), "pendiente"
+    active = load_active_file(file_key)
+    if active is not None:
+        return active, "activo"
+    return None, "faltante"
+
+
+def storage_status_df():
+    rows = []
+    for file_key, spec in FILE_SPECS.items():
+        active = load_active_file(file_key)
+        backup = backup_file_path(file_key)
+        rows.append({
+            "Archivo": spec["label"],
+            "Estado": "Activo" if active is not None else "Faltante",
+            "Nombre": active.path.name if active is not None else "—",
+            "Última versión": datetime.fromtimestamp(active.path.stat().st_mtime).strftime("%d/%m/%Y %H:%M") if active is not None else "—",
+            "Respaldo": backup.name if backup.exists() else "—",
+        })
+    return pd.DataFrame(rows)
+
+
+
+def file_signature(uploaded_file) -> str:
+    data = uploaded_file.getvalue()
+    return hashlib.md5(data).hexdigest()
+
+
+def payload_signature(df: pd.DataFrame, extra: str = "") -> str:
+    base = df.copy()
+    for col in base.columns:
+        if pd.api.types.is_datetime64_any_dtype(base[col]):
+            base[col] = base[col].astype("string")
+    base = base.replace([np.inf, -np.inf], np.nan).fillna("")
+    csv_bytes = base.sort_values(list(base.columns[:1])).to_csv(index=False).encode("utf-8")
+    return hashlib.md5(csv_bytes + extra.encode("utf-8")).hexdigest()
+
+
+def safe_float(value, default=np.nan):
     try:
-        return datetime.fromisoformat(s).strftime("%d-%m-%Y %H:%M:%S")
+        if value is None:
+            return default
+        if isinstance(value, str):
+            s = value.strip().replace("$", "").replace(".", "").replace(",", ".")
+            if s in ("", "-", "nan", "None"):
+                return default
+            return float(s)
+        if pd.isna(value):
+            return default
+        return float(value)
     except Exception:
-        return s
+        return default
 
 
-def col_exact(columns, aliases):
-    cmap = {normalize_header(c): c for c in columns}
-    for a in aliases:
-        key = normalize_header(a)
-        if key in cmap:
-            return cmap[key]
+def norm_sku(value) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return ""
+    if s.endswith(".0"):
+        s = s[:-2]
+    if re.fullmatch(r"-?\d+(\.\d+)?", s):
+        try:
+            f = float(s.replace(",", "."))
+            if int(f) == f:
+                return str(int(f))
+        except Exception:
+            pass
+    return s
+
+
+def norm_mlc(value) -> str:
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return ""
+    s = str(value).strip().upper().replace(" ", "")
+    if not s or s == "NAN":
+        return ""
+    if s.isdigit():
+        s = f"MLC{s}"
+    return s
+
+
+def to_date_only(value):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return pd.NaT
+    try:
+        return pd.to_datetime(value, errors="coerce", dayfirst=True).normalize()
+    except Exception:
+        return pd.NaT
+
+
+def fmt_date(value) -> str:
+    dt = to_date_only(value)
+    if pd.isna(dt):
+        return "—"
+    return dt.strftime("%d/%m/%Y")
+
+
+def fmt_money(value) -> str:
+    x = safe_float(value, np.nan)
+    if np.isnan(x):
+        return "—"
+    return f"${x:,.0f}".replace(",", ".")
+
+
+def fmt_int(value) -> str:
+    x = safe_float(value, np.nan)
+    if np.isnan(x):
+        return "—"
+    return f"{int(round(x)):,}".replace(",", ".")
+
+
+def fmt_pct(value, decimals=1) -> str:
+    x = safe_float(value, np.nan)
+    if np.isnan(x):
+        return "—"
+    return f"{x:.{decimals}f}%"
+
+def promo_status(dt):
+    dt = to_date_only(dt)
+    if pd.isna(dt):
+        return "SIN USO", 999
+    today = pd.Timestamp(date.today())
+    delta = (dt - today).days
+    if delta < 0:
+        return "VENCIDA", -1
+    if delta == 0:
+        return "HOY", 0
+    if delta <= 7:
+        return "PRÓXIMA", 7
+    return "FUTURA", 30
+
+
+
+def _find_sheet(sheet_names, wanted):
+    for name in sheet_names:
+        if name.lower().strip() == wanted.lower().strip():
+            return name
+    for name in sheet_names:
+        if wanted.lower().strip() in name.lower().strip():
+            return name
     return None
 
 
-def col_required(columns, field_name, aliases):
-    c = col_exact(columns, aliases)
-    if not c:
-        raise ValueError(f"No encontré columna obligatoria para {field_name}. Encabezados leídos: {list(columns)}")
-    return c
-
-
-def split_codes(v):
-    text = clean_text(v)
-    if not text:
-        return []
-    parts = re.split(r"[,;/|\n\t ]+", text)
-    out = []
-    for p in parts:
-        c = norm_code(p)
-        if c:
-            out.append(c)
-    return list(dict.fromkeys(out))
-
-
-def is_supermercado(v) -> bool:
-    return "SUPERMERCADO" in clean_text(v).upper()
-
-
-# ============================================================
-# Base de datos nueva v3
-# ============================================================
-
-def ensure_column(conn, table: str, column: str, definition: str):
-    """Agrega una columna si no existe. Evita romper bases SQLite antiguas."""
-    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column not in cols:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-
-
-def init_db():
-    with db() as c:
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS lotes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nombre TEXT NOT NULL,
-                archivo TEXT,
-                hoja TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER NOT NULL,
-                area TEXT,
-                nro TEXT,
-                codigo_ml TEXT,
-                codigo_universal TEXT,
-                sku TEXT,
-                descripcion TEXT,
-                unidades INTEGER NOT NULL DEFAULT 0,
-                acopiadas INTEGER NOT NULL DEFAULT 0,
-                identificacion TEXT,
-                vence TEXT,
-                dia TEXT,
-                hora TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS scans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER NOT NULL,
-                item_id INTEGER NOT NULL,
-                scan_primario TEXT,
-                scan_secundario TEXT,
-                cantidad INTEGER NOT NULL,
-                modo TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS maestro (
-                code TEXT PRIMARY KEY,
-                sku TEXT NOT NULL,
-                descripcion TEXT,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS backup_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_type TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                attempts INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT,
-                created_at TEXT NOT NULL,
-                sent_at TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS label_prints (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER NOT NULL,
-                item_id INTEGER NOT NULL,
-                codigo_ml TEXT,
-                sku TEXT,
-                descripcion TEXT,
-                cantidad INTEGER NOT NULL DEFAULT 0,
-                print_scope TEXT NOT NULL,
-                print_kind TEXT NOT NULL DEFAULT 'NORMAL',
-                block_index INTEGER,
-                block_key TEXT,
-                is_reprint INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS label_blocks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER NOT NULL,
-                block_index INTEGER NOT NULL,
-                block_key TEXT NOT NULL,
-                products_count INTEGER NOT NULL DEFAULT 0,
-                normal_qty INTEGER NOT NULL DEFAULT 0,
-                separator_qty INTEGER NOT NULL DEFAULT 0,
-                total_qty INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT 'IMPRESO',
-                download_count INTEGER NOT NULL DEFAULT 1,
-                last_printed_at TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS audit_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER,
-                item_id INTEGER,
-                event_type TEXT NOT NULL,
-                detail TEXT,
-                qty INTEGER,
-                codigo_ml TEXT,
-                sku TEXT,
-                mode TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS incidencias (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER NOT NULL,
-                item_id INTEGER,
-                tipo TEXT NOT NULL,
-                cantidad INTEGER NOT NULL DEFAULT 0,
-                comentario TEXT,
-                usuario TEXT,
-                status TEXT NOT NULL DEFAULT 'ABIERTA',
-                created_at TEXT NOT NULL,
-                resolved_at TEXT,
-                resolved_by TEXT,
-                resolution_comment TEXT
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS reimpresiones (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lote_id INTEGER NOT NULL,
-                item_id INTEGER,
-                block_index INTEGER,
-                block_key TEXT,
-                scope TEXT NOT NULL,
-                cantidad INTEGER NOT NULL DEFAULT 0,
-                motivo TEXT NOT NULL,
-                usuario TEXT,
-                created_at TEXT NOT NULL
-            )
-        """)
-        ensure_column(c, "backup_queue", "event_key", "TEXT")
-        ensure_column(c, "audit_events", "event_key", "TEXT")
-        ensure_column(c, "audit_events", "usuario", "TEXT")
-        ensure_column(c, "audit_events", "source_module", "TEXT")
-        ensure_column(c, "audit_events", "before_json", "TEXT")
-        ensure_column(c, "audit_events", "after_json", "TEXT")
-        ensure_column(c, "audit_events", "synced_to_sheets", "INTEGER NOT NULL DEFAULT 0")
-        ensure_column(c, "lotes", "status", "TEXT NOT NULL DEFAULT 'ACTIVO'")
-        ensure_column(c, "lotes", "closed_at", "TEXT")
-        ensure_column(c, "lotes", "closed_by", "TEXT")
-        ensure_column(c, "lotes", "close_note", "TEXT")
-        ensure_column(c, "label_blocks", "last_reprint_reason", "TEXT")
-        ensure_column(c, "label_blocks", "last_reprint_user", "TEXT")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_label_blocks_unique ON label_blocks (lote_id, block_index, block_key)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_items_lote ON items (lote_id)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_items_codigo_ml ON items (lote_id, codigo_ml)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_items_sku ON items (lote_id, sku)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_scans_lote ON scans (lote_id, created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_audit_lote ON audit_events (lote_id, created_at)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_event_key ON audit_events (event_key) WHERE event_key IS NOT NULL AND event_key != ''")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_incidencias_lote ON incidencias (lote_id, status, created_at)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_reimpresiones_lote ON reimpresiones (lote_id, created_at)")
-        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_backup_queue_event_key ON backup_queue (event_key) WHERE event_key IS NOT NULL AND event_key != ''")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_backup_queue_status ON backup_queue (status, id)")
-        c.commit()
-
-
-
-# ============================================================
-# Respaldo externo Google Sheets por webhook
-# ============================================================
-
-def get_backup_webhook_url() -> str:
-    """URL de respaldo externo.
-    Prioridad: Streamlit Secrets, variable de entorno y URL integrada en este app.py.
-    """
-    try:
-        url = st.secrets.get("SHEETS_WEBHOOK_URL", "")
-    except Exception:
-        url = ""
-    if not url:
-        url = os.environ.get("SHEETS_WEBHOOK_URL", "")
-    if not url:
-        url = DEFAULT_SHEETS_WEBHOOK_URL
-    return clean_text(url)
-
-
-def backup_event_key(event_type: str, payload: dict) -> str:
-    """Clave idempotente para que un mismo evento operativo no pueda entrar dos veces a la cola.
-    Esto protege contra doble click, rerun de Streamlit y reintentos de sincronización.
-    """
-    if event_type == "lote_creado":
-        return f"lote_creado:{payload.get('lote_id')}"
-    if event_type == "lote_item":
-        return f"lote_item:{payload.get('lote_id')}:{payload.get('item_id')}"
-    if event_type == "lote_eliminado":
-        return f"lote_eliminado:{payload.get('lote_id')}:{payload.get('deleted_at')}"
-    if event_type in {"scan_agregado", "scan_deshacer"}:
-        # Estos eventos sí pueden repetirse operativamente, por eso llevan timestamp + datos del movimiento.
-        return f"{event_type}:{payload.get('lote_id')}:{payload.get('item_id')}:{payload.get('created_at')}:{payload.get('cantidad')}:{payload.get('scan_primario')}:{payload.get('scan_secundario')}"
-    if event_type == "audit_event":
-        # La auditoría tiene su propia clave única; si llega duplicada por rerun, no entra dos veces.
-        key = clean_text(payload.get("event_key", ""))
-        if key:
-            return key
-    base = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return f"{event_type}:{hashlib.sha1(base.encode('utf-8')).hexdigest()}"
-
-
-def enqueue_backup_event(event_type: str, payload: dict):
-    """Guarda un evento en cola local de forma idempotente.
-    Importante: NO dispara envío en segundo plano; el envío se hace mediante flush_backup_queue()
-    para evitar carreras donde dos hilos mandan los mismos pendientes a Sheets.
-    """
-    now = datetime.now().isoformat(timespec="seconds")
-    safe_payload = json.dumps(payload, ensure_ascii=False, default=str)
-    event_key = backup_event_key(event_type, payload)
-    with db() as c:
-        c.execute(
-            """
-            INSERT OR IGNORE INTO backup_queue
-            (event_type, payload_json, status, attempts, created_at, event_key)
-            VALUES (?, ?, 'pending', 0, ?, ?)
-            """,
-            (event_type, safe_payload, now, event_key),
-        )
-        c.commit()
-
-
-def send_webhook_event(url: str, event: dict) -> tuple[bool, str]:
-    """Envía un evento a Apps Script y valida que la respuesta sea JSON con ok=true.
-    Esto evita marcar como enviado cuando Google responde una página HTML de error/autorización.
-    """
-    body = json.dumps(event, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=12) as resp:
-        status = getattr(resp, "status", None) or resp.getcode()
-        response_text = resp.read().decode("utf-8", errors="replace")
-
-    if status < 200 or status >= 300:
-        return False, f"HTTP {status}: {response_text[:300]}"
-
-    try:
-        parsed = json.loads(response_text)
-    except Exception:
-        return False, f"Respuesta no JSON desde Apps Script: {response_text[:300]}"
-
-    if parsed.get("ok") is True:
-        return True, response_text[:300]
-
-    return False, f"Apps Script respondió ok=false: {response_text[:500]}"
-
-
-
-
-def enqueue_backup_events_batch(events):
-    """Inserta muchos eventos en cola local, sin duplicar claves operativas.
-    No dispara threads: la sincronización se ejecuta de forma controlada con flush_backup_queue().
-    """
-    if not events:
-        return
-    now = datetime.now().isoformat(timespec="seconds")
-    rows = []
-    for et, payload in events:
-        rows.append((et, json.dumps(payload, ensure_ascii=False, default=str), now, backup_event_key(et, payload)))
-    with db() as c:
-        c.executemany(
-            """
-            INSERT OR IGNORE INTO backup_queue
-            (event_type, payload_json, status, attempts, created_at, event_key)
-            VALUES (?, ?, 'pending', 0, ?, ?)
-            """,
-            rows,
-        )
-        c.commit()
-
-
-def get_backup_events_from_sheets():
-    url = get_backup_webhook_url()
-    if not url:
-        return False, [], "No hay URL de respaldo configurada."
-    sep = "&" if "?" in url else "?"
-    read_url = f"{url}{sep}{urllib.parse.urlencode({'action': 'events'})}"
-    try:
-        with urllib.request.urlopen(read_url, timeout=20) as resp:
-            text = resp.read().decode("utf-8", errors="replace")
-        data = json.loads(text)
-        if data.get("ok") is not True:
-            return False, [], f"Apps Script respondió error: {text[:500]}"
-        return True, data.get("events") or [], f"Eventos leídos: {len(data.get('events') or [])}"
-    except Exception as e:
-        return False, [], f"No pude leer respaldo externo: {e}"
-
-
-def local_lotes_count():
-    with db() as c:
-        row = c.execute("SELECT COUNT(*) AS n FROM lotes").fetchone()
-    return int(row["n"] or 0) if row else 0
-
-
-def restore_from_backup_if_empty():
-    """Reconstruye SQLite desde Sheets cuando Streamlit despierta sin base local.
-
-    Sheets se trata como memoria permanente/event log. La reconstrucción es idempotente:
-    ignora eventos repetidos por event_key o por una firma estable del movimiento.
-    """
-    if local_lotes_count() > 0:
-        return False, "Base local con datos; no se restaura."
-    ok, events, msg = get_backup_events_from_sheets()
-    if not ok:
-        return False, msg
-    if not events:
-        return False, "No hay eventos en el respaldo externo."
-
-    lotes = {}
-    items_by_lote = {}
-    deleted_lotes = set()
-    movement_by_item = {}
-    scan_rows = []
-    audit_rows = []
-    incidencias_rows = []
-    lote_status_events = []
-    seen = set()
-    seen_scans = set()
-    seen_audit = set()
-    seen_incid = set()
-
-    def event_signature(ev: dict) -> str:
-        ek = clean_text(ev.get("event_key", ""))
-        if ek:
-            return ek
-        # Firma estable para proteger restauración contra duplicados históricos en Sheets.
-        base = json.dumps(ev, ensure_ascii=False, sort_keys=True, default=str)
-        return hashlib.sha1(base.encode("utf-8")).hexdigest()
-
-    def split_incident_detail(detail: str) -> tuple[str, str]:
-        txt = clean_text(detail)
-        if "·" in txt:
-            a, b = txt.split("·", 1)
-            return clean_text(a), clean_text(b)
-        return txt or "Incidencia", ""
-
-    for ev in events:
-        if not isinstance(ev, dict):
-            continue
-        sig = event_signature(ev)
-        if sig in seen:
-            continue
-        seen.add(sig)
-
-        et = clean_text(ev.get("event_type", ""))
-        try:
-            lote_id = int(ev.get("lote_id"))
-        except Exception:
-            lote_id = None
-
-        if lote_id is None and et not in {"test_webhook"}:
-            continue
-
-        if et == "lote_creado":
-            lotes[lote_id] = {
-                "id": lote_id,
-                "nombre": clean_text(ev.get("lote_nombre", "")) or f"Lote {lote_id}",
-                "archivo": clean_text(ev.get("archivo", "")),
-                "hoja": clean_text(ev.get("hoja", "")),
-                "created_at": clean_text(ev.get("created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds"),
-                "status": "ACTIVO",
-            }
-        elif et == "lote_item":
-            try:
-                item_id = int(ev.get("item_id"))
-            except Exception:
-                continue
-            items_by_lote.setdefault(lote_id, {})[item_id] = {
-                "id": item_id,
-                "lote_id": lote_id,
-                "area": clean_text(ev.get("area", "")),
-                "nro": clean_text(ev.get("nro", "")),
-                "codigo_ml": norm_code(ev.get("codigo_ml", "")),
-                "codigo_universal": norm_code(ev.get("codigo_universal", "")),
-                "sku": norm_code(ev.get("sku", "")),
-                "descripcion": clean_text(ev.get("descripcion", "")),
-                "unidades": to_int(ev.get("unidades", 0)),
-                "acopiadas": 0,
-                "identificacion": clean_text(ev.get("identificacion", "")),
-                "vence": clean_text(ev.get("vence", "")),
-                "dia": clean_text(ev.get("dia", "")),
-                "hora": clean_text(ev.get("hora", "")),
-                "created_at": clean_text(ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
-                "updated_at": clean_text(ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
-            }
-        elif et == "lote_snapshot_chunk":
-            # Compatibilidad con respaldos viejos.
-            items = ev.get("items") or []
-            for item_ev in items:
-                try:
-                    item_id = int(item_ev.get("item_id"))
-                except Exception:
-                    continue
-                items_by_lote.setdefault(lote_id, {})[item_id] = {
-                    "id": item_id,
-                    "lote_id": lote_id,
-                    "area": clean_text(item_ev.get("area", "")),
-                    "nro": clean_text(item_ev.get("nro", "")),
-                    "codigo_ml": norm_code(item_ev.get("codigo_ml", "")),
-                    "codigo_universal": norm_code(item_ev.get("codigo_universal", "")),
-                    "sku": norm_code(item_ev.get("sku", "")),
-                    "descripcion": clean_text(item_ev.get("descripcion", "")),
-                    "unidades": to_int(item_ev.get("unidades", 0)),
-                    "acopiadas": 0,
-                    "identificacion": clean_text(item_ev.get("identificacion", "")),
-                    "vence": clean_text(item_ev.get("vence", "")),
-                    "dia": clean_text(item_ev.get("dia", "")),
-                    "hora": clean_text(item_ev.get("hora", "")),
-                    "created_at": clean_text(item_ev.get("item_created_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
-                    "updated_at": clean_text(item_ev.get("item_updated_at", "")) or clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds"),
-                }
-        elif et == "scan_agregado":
-            try:
-                item_id = int(ev.get("item_id"))
-                qty = int(ev.get("cantidad") or 0)
-            except Exception:
-                continue
-            scan_sig = clean_text(ev.get("event_key", "")) or f"scan_agregado:{lote_id}:{item_id}:{clean_text(ev.get('created_at',''))}:{qty}:{norm_code(ev.get('scan_primario',''))}:{norm_code(ev.get('scan_secundario',''))}"
-            if scan_sig in seen_scans:
-                continue
-            seen_scans.add(scan_sig)
-            movement_by_item[item_id] = movement_by_item.get(item_id, 0) + qty
-            scan_rows.append((lote_id, item_id, norm_code(ev.get("scan_primario", "")), norm_code(ev.get("scan_secundario", "")), qty, clean_text(ev.get("modo", "")), clean_text(ev.get("created_at", "")) or datetime.now().isoformat(timespec="seconds")))
-        elif et == "scan_deshacer":
-            try:
-                item_id = int(ev.get("item_id"))
-                qty = int(ev.get("cantidad") or 0)
-            except Exception:
-                continue
-            undo_sig = clean_text(ev.get("event_key", "")) or f"scan_deshacer:{lote_id}:{item_id}:{clean_text(ev.get('created_at',''))}:{qty}:{norm_code(ev.get('scan_primario',''))}:{norm_code(ev.get('scan_secundario',''))}"
-            if undo_sig in seen_scans:
-                continue
-            seen_scans.add(undo_sig)
-            movement_by_item[item_id] = movement_by_item.get(item_id, 0) - qty
-        elif et == "lote_eliminado":
-            deleted_lotes.add(lote_id)
-        elif et == "audit_event":
-            audit_key = clean_text(ev.get("event_key", "")) or sig
-            if audit_key in seen_audit:
-                continue
-            seen_audit.add(audit_key)
-            audit_type = clean_text(ev.get("audit_type", "")) or clean_text(ev.get("audit_event_type", "")) or "AUDIT_EVENT"
-            created = clean_text(ev.get("created_at", "")) or clean_text(ev.get("audit_created_at", "")) or clean_text(ev.get("queued_at", "")) or datetime.now().isoformat(timespec="seconds")
-            item_id_val = None
-            try:
-                if clean_text(ev.get("item_id", "")):
-                    item_id_val = int(ev.get("item_id"))
-            except Exception:
-                item_id_val = None
-            qty_val = None
-            try:
-                if clean_text(ev.get("qty", "")):
-                    qty_val = int(float(ev.get("qty")))
-            except Exception:
-                qty_val = None
-            audit_rows.append((
-                lote_id, item_id_val, audit_type, clean_text(ev.get("detail", "")), qty_val,
-                norm_code(ev.get("codigo_ml", "")), norm_code(ev.get("sku", "")), clean_text(ev.get("mode", "")), created,
-                audit_key, clean_text(ev.get("usuario", "")), clean_text(ev.get("source_module", "")),
-                clean_text(ev.get("before_json", "")), clean_text(ev.get("after_json", "")), 1,
-            ))
-            if audit_type == "INCIDENCIA_ABIERTA":
-                inc_sig = audit_key
-                if inc_sig not in seen_incid:
-                    seen_incid.add(inc_sig)
-                    tipo, comentario = split_incident_detail(clean_text(ev.get("detail", "")))
-                    incidencias_rows.append((lote_id, item_id_val, tipo, qty_val or 0, comentario, clean_text(ev.get("usuario", "")) or clean_text(ev.get("mode", "")) or "SIN_USUARIO", "ABIERTA", created, None, None, None))
-            elif audit_type == "INCIDENCIA_RESUELTA":
-                # Se refleja de forma conservadora: deja un registro de resolución en auditoría.
-                pass
-            elif audit_type in {"LOTE_CERRADO", "LOTE_REABIERTO"}:
-                lote_status_events.append((created, lote_id, audit_type, clean_text(ev.get("usuario", "")) or clean_text(ev.get("mode", "")), clean_text(ev.get("detail", ""))))
-
-    active_lote_ids = [lid for lid in lotes if lid not in deleted_lotes and items_by_lote.get(lid)]
-    if not active_lote_ids:
-        return False, "No encontré lotes activos con snapshot completo en Sheets. Crea el lote una vez con esta nueva versión para activar restauración automática."
-
-    now = datetime.now().isoformat(timespec="seconds")
-    restored_lotes = 0
-    restored_items = 0
-    with db() as c:
-        for lid in sorted(active_lote_ids):
-            lote = lotes[lid]
-            c.execute("""
-                INSERT OR REPLACE INTO lotes
-                (id, nombre, archivo, hoja, created_at, status, closed_at, closed_by, close_note)
-                VALUES (?, ?, ?, ?, ?, COALESCE((SELECT status FROM lotes WHERE id=?), 'ACTIVO'), NULL, NULL, NULL)
-            """, (lote["id"], lote["nombre"], lote["archivo"], lote["hoja"], lote["created_at"], lote["id"]))
-            restored_lotes += 1
-            for item in items_by_lote[lid].values():
-                qty = max(0, min(int(item["unidades"]), int(movement_by_item.get(int(item["id"]), 0))))
-                item["acopiadas"] = qty
-                item["updated_at"] = now if qty else item["updated_at"]
-                c.execute("""
-                    INSERT OR REPLACE INTO items
-                    (id, lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
-                     identificacion, vence, dia, hora, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (item["id"], item["lote_id"], item["area"], item["nro"], item["codigo_ml"], item["codigo_universal"], item["sku"], item["descripcion"], item["unidades"], item["acopiadas"], item["identificacion"], item["vence"], item["dia"], item["hora"], item["created_at"], item["updated_at"]))
-                restored_items += 1
-        for lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at in scan_rows:
-            if lote_id in active_lote_ids and cantidad > 0:
-                c.execute("INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at))
-        for row in audit_rows:
-            if row[0] in active_lote_ids:
-                c.execute("""
-                    INSERT OR IGNORE INTO audit_events
-                    (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at,
-                     event_key, usuario, source_module, before_json, after_json, synced_to_sheets)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, row)
-        for row in incidencias_rows:
-            if row[0] in active_lote_ids:
-                c.execute("""
-                    INSERT INTO incidencias
-                    (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at, resolved_at, resolved_by, resolution_comment)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, row)
-        for created, lid, typ, user, note in sorted(lote_status_events):
-            if lid not in active_lote_ids:
-                continue
-            if typ == "LOTE_CERRADO":
-                c.execute("UPDATE lotes SET status='CERRADO', closed_at=?, closed_by=?, close_note=? WHERE id=?", (created, user or "SIN_USUARIO", note, lid))
-            elif typ == "LOTE_REABIERTO":
-                c.execute("UPDATE lotes SET status='ACTIVO', closed_at=NULL, closed_by=NULL, close_note=NULL WHERE id=?", (lid,))
-        c.commit()
-    return True, f"Restauración automática completa: {restored_lotes} lote(s), {restored_items} producto(s), {len(audit_rows)} evento(s) de auditoría."
-
-
-def flush_backup_queue(webhook_url: str | None = None, limit: int = 25):
-    """Envía pendientes a Sheets con bloqueo lógico.
-
-    Antes de llamar al webhook, los eventos pasan de pending -> sending dentro de una
-    transacción IMMEDIATE. Así, aunque Streamlit rerunée o el usuario presione otra vez,
-    otro flush no puede tomar las mismas filas. Si falla el envío, vuelven a pending.
-    """
-    url = clean_text(webhook_url or get_backup_webhook_url())
-    if not url:
-        return
-
-    # Reclamo atómico de trabajo pendiente.
-    with db() as c:
-        c.execute("BEGIN IMMEDIATE")
-        ids = [int(r["id"]) for r in c.execute(
-            """
-            SELECT id
-            FROM backup_queue
-            WHERE status='pending'
-            ORDER BY id ASC
-            LIMIT ?
-            """,
-            (int(limit),),
-        ).fetchall()]
-        if not ids:
-            c.commit()
-            return
-        placeholders = ",".join(["?"] * len(ids))
-        c.execute(f"UPDATE backup_queue SET status='sending' WHERE id IN ({placeholders}) AND status='pending'", ids)
-        rows = c.execute(
-            f"""
-            SELECT id, event_type, payload_json, attempts, created_at
-            FROM backup_queue
-            WHERE id IN ({placeholders}) AND status='sending'
-            ORDER BY id ASC
-            """,
-            ids,
-        ).fetchall()
-        c.commit()
-
-    for row in rows:
-        event = {
-            "event_type": row["event_type"],
-            "queue_id": int(row["id"]),
-            "queued_at": row["created_at"],
-            **json.loads(row["payload_json"]),
-        }
-        try:
-            ok, detail = send_webhook_event(url, event)
-            if not ok:
-                raise RuntimeError(detail)
-
-            sent_at = datetime.now().isoformat(timespec="seconds")
-            with db() as c:
-                c.execute(
-                    "UPDATE backup_queue SET status='sent', sent_at=?, last_error=NULL WHERE id=? AND status='sending'",
-                    (sent_at, int(row["id"])),
-                )
-                c.commit()
-
-        except Exception as e:
-            with db() as c:
-                c.execute(
-                    "UPDATE backup_queue SET status='pending', attempts=attempts+1, last_error=? WHERE id=? AND status='sending'",
-                    (str(e)[:500], int(row["id"])),
-                )
-                c.commit()
-
-
-def backup_status():
-    with db() as c:
-        row = c.execute(
-            """
-            SELECT
-                SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
-                SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
-                MAX(sent_at) AS last_sent,
-                MAX(last_error) AS last_error
-            FROM backup_queue
-            """
-        ).fetchone()
-    return dict(row) if row else {"pending": 0, "sent": 0, "last_sent": "", "last_error": ""}
-
-
-def test_backup_webhook() -> tuple[bool, str]:
-    url = get_backup_webhook_url()
-    if not url:
-        return False, "No hay SHEETS_WEBHOOK_URL configurada."
-    event = {
-        "event_type": "test_webhook",
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "lote_id": "TEST",
-        "lote_nombre": "Prueba manual desde Streamlit",
-        "archivo": "test",
-        "hoja": "test",
-        "item_id": "",
-        "sku": "TEST-SKU",
-        "codigo_ml": "TEST-ML",
-        "codigo_universal": "TEST-EAN",
-        "descripcion": "Evento de prueba de respaldo externo",
-        "cantidad": 1,
-        "modo": "TEST",
-        "scan_primario": "TEST",
-        "scan_secundario": "TEST",
-        "operador": "",
-        "dispositivo": "",
+def _canon_label(value: str) -> str:
+    s = str(value or "").strip().upper()
+    replacements = {
+        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U",
+        "(": "", ")": "", ".": "", ",": "", ":": "", ";": "", "-": " ", "_": " "
     }
-    return send_webhook_event(url, event)
+    for k, v in replacements.items():
+        s = s.replace(k, v)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def build_lote_payload(lote_id: int) -> dict:
-    lote = get_lote(lote_id)
-    return {
-        "lote_id": lote_id,
-        "lote_nombre": clean_text(lote.get("nombre", "")),
-        "archivo": clean_text(lote.get("archivo", "")),
-        "hoja": clean_text(lote.get("hoja", "")),
+def pick_existing_column(df: pd.DataFrame, *candidates: str):
+    canon_map = {_canon_label(col): col for col in df.columns}
+    for cand in candidates:
+        col = canon_map.get(_canon_label(cand))
+        if col is not None:
+            return col
+    return None
+
+
+def detect_channel(vendedor: str) -> str:
+    s = str(vendedor).strip().upper()
+    return "ML" if "MERCADO LIBRE" in s else "TIENDA"
+
+
+def detect_buyer_type(documento: str) -> str:
+    s = str(documento).strip().upper()
+    if "FACTURA" in s:
+        return "EMPRESA"
+    if "BOLETA" in s:
+        return "PERSONA"
+    return "OTRO"
+
+
+def classify_cost_gap_pct(pct):
+    if pd.isna(pct):
+        return "SIN DATOS"
+    if pct >= 5:
+        return "CRÍTICO"
+    if pct >= 2:
+        return "ALERTA"
+    if pct <= -2:
+        return "BAJÓ COSTO"
+    return "OK"
+
+
+def classify_margin_delta_pp(delta_pp):
+    if pd.isna(delta_pp):
+        return "SIN HISTÓRICO"
+    if delta_pp <= -5:
+        return "CRÍTICO"
+    if delta_pp <= -2:
+        return "ALERTA"
+    if delta_pp >= 2:
+        return "MEJORA"
+    return "ESTABLE"
+
+
+def classify_ads_reason(row, target_margin_pct: float = ADS_TARGET_MARGIN_PCT, global_acos_alert_pct: float = ADS_GLOBAL_ACOS_ALERT_PCT, min_roas: float = ADS_GLOBAL_ROAS_MIN):
+    ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
+    ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
+    ads_clicks = safe_float(row.get("ads_clics"), 0.0)
+    ads_ventas = safe_float(row.get("ads_ventas"), 0.0)
+    ads_active = (ads_inversion > 0) or (ads_ingresos > 0) or (ads_clicks > 0)
+
+    margen_base = safe_float(row.get("margen_ads_base_pct", row.get("margen_ml_actual")), np.nan)
+    margen_con_ads = safe_float(row.get("margen_ml_con_ads"), np.nan)
+    acos_real = safe_float(row.get("ads_acos"), np.nan)
+    acos_max = safe_float(row.get("acos_max_permitido_pct"), np.nan)
+    roas_real = safe_float(row.get("ads_roas"), np.nan)
+
+    if pd.notna(margen_base) and margen_base < target_margin_pct:
+        return "Margen base bajo objetivo"
+    if not ads_active:
+        if pd.notna(margen_base) and margen_base >= target_margin_pct + 5:
+            return "Sin Ads y con holgura para probar"
+        return "Sin Ads activos"
+    if ads_inversion > 0 and ads_ingresos <= 0:
+        return "Inversión sin ingresos"
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct:
+        return "Margen con Ads bajo objetivo"
+    if pd.notna(acos_real) and pd.notna(acos_max) and acos_real > acos_max:
+        return "ACOS sobre máximo permitido"
+    if pd.notna(roas_real) and roas_real < min_roas:
+        return "ROAS bajo mínimo"
+    if ads_clicks >= 15 and ads_ventas <= 0:
+        return "Clicks altos sin ventas Ads"
+    if pd.notna(acos_real) and acos_real > global_acos_alert_pct:
+        return "ACOS sobre alerta global"
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct + 3:
+        return "Margen con Ads muy ajustado"
+    if pd.notna(roas_real) and roas_real < 12:
+        return "ROAS ajustado"
+    if pd.notna(acos_real) and pd.notna(margen_con_ads) and pd.notna(roas_real) and acos_real <= global_acos_alert_pct and roas_real >= 12 and margen_con_ads >= max(target_margin_pct + 5, 25):
+        return "Escalable con margen holgado"
+    return "Bajo control"
+
+
+def classify_ads_state(row, target_margin_pct: float = ADS_TARGET_MARGIN_PCT, global_acos_alert_pct: float = ADS_GLOBAL_ACOS_ALERT_PCT, min_roas: float = ADS_GLOBAL_ROAS_MIN):
+    ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
+    ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
+    ads_clicks = safe_float(row.get("ads_clics"), 0.0)
+    ads_ventas = safe_float(row.get("ads_ventas"), 0.0)
+    ads_active = (ads_inversion > 0) or (ads_ingresos > 0) or (ads_clicks > 0)
+
+    margen_base = safe_float(row.get("margen_ads_base_pct", row.get("margen_ml_actual")), np.nan)
+    margen_con_ads = safe_float(row.get("margen_ml_con_ads"), np.nan)
+    acos_real = safe_float(row.get("ads_acos"), np.nan)
+    acos_max = safe_float(row.get("acos_max_permitido_pct"), np.nan)
+    roas_real = safe_float(row.get("ads_roas"), np.nan)
+
+    if pd.notna(margen_base) and margen_base < target_margin_pct:
+        return "NO USAR ADS"
+    if not ads_active:
+        if pd.notna(margen_base) and margen_base >= target_margin_pct + 5:
+            return "OPORTUNIDAD"
+        return "SIN ADS"
+    if ads_inversion > 0 and ads_ingresos <= 0:
+        return "CRÍTICO"
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct:
+        return "CRÍTICO"
+    if pd.notna(acos_real) and pd.notna(acos_max) and acos_real > acos_max:
+        return "CRÍTICO"
+    if pd.notna(roas_real) and roas_real < min_roas:
+        return "CRÍTICO"
+    if ads_clicks >= 15 and ads_ventas <= 0:
+        return "CRÍTICO"
+    if pd.notna(acos_real) and acos_real > global_acos_alert_pct:
+        return "ALERTA"
+    if pd.notna(margen_con_ads) and margen_con_ads < target_margin_pct + 3:
+        return "ALERTA"
+    if pd.notna(roas_real) and roas_real < 12:
+        return "ALERTA"
+    if pd.notna(acos_real) and pd.notna(margen_con_ads) and pd.notna(roas_real) and acos_real <= global_acos_alert_pct and roas_real >= 12 and margen_con_ads >= max(target_margin_pct + 5, 25):
+        return "OPORTUNIDAD"
+    return "OK"
+
+
+def suggest_ads_action(row, target_margin_pct: float = ADS_TARGET_MARGIN_PCT):
+    estado_ads = str(row.get("estado_ads", "")).upper()
+    ads_inversion = safe_float(row.get("ads_inversion"), 0.0)
+    ads_ingresos = safe_float(row.get("ads_ingresos"), 0.0)
+    if estado_ads == "NO USAR ADS":
+        return "NO INVERTIR / APAGAR"
+    if estado_ads == "SIN ADS":
+        return "SIN ACCIÓN ADS"
+    if estado_ads == "OPORTUNIDAD":
+        if ads_inversion > 0 and ads_ingresos > 0:
+            return "ESCALAR PRESUPUESTO"
+        return "PROBAR ADS"
+    if estado_ads == "CRÍTICO":
+        if ads_inversion > 0 and ads_ingresos <= 0:
+            return "PAUSAR / CORTAR GASTO"
+        return "BAJAR PUJA O REVISAR PRECIO"
+    if estado_ads == "ALERTA":
+        return "OPTIMIZAR ADS"
+    return "MANTENER ADS"
+
+
+def parse_dimensions(dim_str):
+    out = {
+        "dimensiones": "—",
+        "largo_cm": np.nan,
+        "ancho_cm": np.nan,
+        "alto_cm": np.nan,
+        "peso_grs": np.nan,
+        "peso_volumetrico_kg": np.nan,
     }
-
-
-
-def list_lotes():
-    with db() as c:
-        return pd.read_sql_query("""
-            SELECT l.id, l.nombre, l.archivo, l.hoja, l.created_at, l.status, l.closed_at, l.closed_by,
-                   COALESCE(SUM(i.unidades), 0) unidades,
-                   COALESCE(SUM(i.acopiadas), 0) acopiadas,
-                   COUNT(i.id) lineas
-            FROM lotes l
-            LEFT JOIN items i ON i.lote_id = l.id
-            GROUP BY l.id
-            ORDER BY l.id DESC
-        """, c)
-
-
-def get_lote(lote_id):
-    with db() as c:
-        row = c.execute("SELECT * FROM lotes WHERE id=?", (lote_id,)).fetchone()
-    return dict(row) if row else {}
-
-
-def get_items(lote_id):
-    with db() as c:
-        return pd.read_sql_query(
-            "SELECT * FROM items WHERE lote_id=? ORDER BY area, CAST(nro AS INTEGER), id",
-            c,
-            params=(lote_id,),
-        )
-
-
-def get_last_scans(lote_id):
-    with db() as c:
-        return pd.read_sql_query("""
-            SELECT item_id, MAX(created_at) procesado_at, SUM(cantidad) escaneado_total
-            FROM scans
-            WHERE lote_id=?
-            GROUP BY item_id
-        """, c, params=(lote_id,))
-
-
-def create_lote(nombre, archivo, hoja, df):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO lotes (nombre, archivo, hoja, created_at) VALUES (?, ?, ?, ?)",
-            (nombre, archivo, hoja, now),
-        )
-        lote_id = cur.lastrowid
-        rows = []
-        for r in df.itertuples(index=False):
-            rows.append((
-                lote_id,
-                clean_text(r.area),
-                clean_text(r.nro),
-                norm_code(r.codigo_ml),
-                norm_code(r.codigo_universal),
-                norm_code(r.sku),
-                clean_text(r.descripcion),
-                int(r.unidades),
-                0,
-                clean_text(r.identificacion),
-                clean_text(r.vence),
-                clean_text(r.dia),
-                clean_text(r.hora),
-                now,
-                now,
-            ))
-        c.executemany("""
-            INSERT INTO items
-            (lote_id, area, nro, codigo_ml, codigo_universal, sku, descripcion, unidades, acopiadas,
-             identificacion, vence, dia, hora, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, rows)
-        c.commit()
-
-    lote_payload = build_lote_payload(lote_id)
-    inserted = get_items(lote_id)
-
-    snapshot_items = []
-    for r in inserted.itertuples(index=False):
-        snapshot_items.append({
-            "item_id": int(r.id),
-            "area": clean_text(r.area),
-            "nro": clean_text(r.nro),
-            "codigo_ml": norm_code(r.codigo_ml),
-            "codigo_universal": norm_code(r.codigo_universal),
-            "sku": norm_code(r.sku),
-            "descripcion": clean_text(r.descripcion),
-            "unidades": int(r.unidades),
-            "identificacion": clean_text(r.identificacion),
-            "vence": clean_text(r.vence),
-            "dia": clean_text(r.dia),
-            "hora": clean_text(r.hora),
-            "item_created_at": clean_text(r.created_at),
-            "item_updated_at": clean_text(r.updated_at),
-        })
-
-    events = [("lote_creado", {
-        **lote_payload,
-        "created_at": now,
-        "total_lineas": int(len(df)),
-        "total_unidades": int(df["unidades"].sum()) if "unidades" in df.columns else 0,
-        "snapshot_mode": "lote_item",
-    })]
-
-    # Respaldo de snapshot producto a producto.
-    # Esto es más largo en Sheets, pero es mucho más seguro y fácil de auditar/restaurar.
-    for item in snapshot_items:
-        events.append(("lote_item", {
-            **lote_payload,
-            "created_at": now,
-            **item,
-        }))
-
-    enqueue_backup_events_batch(events)
-    flush_backup_queue(limit=max(1000, len(events) + 10))
-    log_audit_event(lote_id, event_type="LOTE_CREADO", detail=f"Lote creado desde {archivo} / {hoja}", qty=int(df["unidades"].sum()) if "unidades" in df.columns else 0)
-    return lote_id
-
-def delete_lote(lote_id):
-    lote_payload = build_lote_payload(lote_id)
-    items_count = len(get_items(lote_id))
-    with db() as c:
-        c.execute("DELETE FROM scans WHERE lote_id=?", (lote_id,))
-        c.execute("DELETE FROM items WHERE lote_id=?", (lote_id,))
-        c.execute("DELETE FROM lotes WHERE id=?", (lote_id,))
-        c.commit()
-
-    enqueue_backup_event("lote_eliminado", {
-        **lote_payload,
-        "items_eliminados": int(items_count),
-        "deleted_at": datetime.now().isoformat(timespec="seconds"),
-    })
-    flush_backup_queue(limit=50)
-    log_audit_event(lote_id, event_type="LOTE_ELIMINADO", detail="Lote eliminado", qty=int(items_count))
-
-
-def add_acopio(lote_id, item_id, cantidad, scan_primario, scan_secundario, modo):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as c:
-        item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (item_id, lote_id)).fetchone()
-        if not item:
-            return False, "Producto no encontrado."
-        pendiente = int(item["unidades"]) - int(item["acopiadas"])
-        if pendiente <= 0:
-            return False, "Este producto ya está completo."
-        if cantidad <= 0:
-            return False, "La cantidad debe ser mayor a cero."
-        if cantidad > pendiente:
-            return False, f"No puedes agregar {cantidad}. Solo quedan {pendiente} pendientes."
-        c.execute("UPDATE items SET acopiadas=acopiadas+?, updated_at=? WHERE id=?", (cantidad, now, item_id))
-        c.execute("""
-            INSERT INTO scans (lote_id, item_id, scan_primario, scan_secundario, cantidad, modo, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (lote_id, item_id, norm_code(scan_primario), norm_code(scan_secundario), cantidad, modo, now))
-        c.commit()
-
-    enqueue_backup_event("scan_agregado", {
-        **build_lote_payload(lote_id),
-        "item_id": int(item_id),
-        "sku": clean_text(item["sku"]),
-        "codigo_ml": clean_text(item["codigo_ml"]),
-        "codigo_universal": clean_text(item["codigo_universal"]),
-        "descripcion": clean_text(item["descripcion"]),
-        "cantidad": int(cantidad),
-        "modo": clean_text(modo),
-        "scan_primario": norm_code(scan_primario),
-        "scan_secundario": norm_code(scan_secundario),
-        "created_at": now,
-    })
-    flush_backup_queue(limit=50)
-    log_audit_event(lote_id, item_id, "SKU_ESCANEADO", clean_text(item["descripcion"]), int(cantidad), item["codigo_ml"], item["sku"], modo)
-    return True, "Cantidad agregada."
-
-
-def undo_last_scan(lote_id):
-    with db() as c:
-        row = c.execute("SELECT * FROM scans WHERE lote_id=? ORDER BY id DESC LIMIT 1", (lote_id,)).fetchone()
-        if not row:
-            return False, "No hay escaneos para deshacer."
-        now = datetime.now().isoformat(timespec="seconds")
-        item = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(row["item_id"]), lote_id)).fetchone()
-        c.execute("UPDATE items SET acopiadas=MAX(acopiadas-?,0), updated_at=? WHERE id=?", (int(row["cantidad"]), now, int(row["item_id"])))
-        c.execute("DELETE FROM scans WHERE id=?", (int(row["id"]),))
-        c.commit()
-
-    item_payload = dict(item) if item else {}
-    enqueue_backup_event("scan_deshacer", {
-        **build_lote_payload(lote_id),
-        "item_id": int(row["item_id"]),
-        "sku": clean_text(item_payload.get("sku", "")),
-        "codigo_ml": clean_text(item_payload.get("codigo_ml", "")),
-        "codigo_universal": clean_text(item_payload.get("codigo_universal", "")),
-        "descripcion": clean_text(item_payload.get("descripcion", "")),
-        "cantidad": int(row["cantidad"]),
-        "modo": clean_text(row["modo"]),
-        "scan_primario": norm_code(row["scan_primario"]),
-        "scan_secundario": norm_code(row["scan_secundario"]),
-        "created_at": now,
-    })
-    flush_backup_queue(limit=50)
-    log_audit_event(lote_id, int(row["item_id"]), "SCAN_DESHECHO", clean_text(item_payload.get("descripcion", "")), int(row["cantidad"]), item_payload.get("codigo_ml", ""), item_payload.get("sku", ""), row["modo"])
-    return True, "Último escaneo deshecho."
-
-
-# ============================================================
-# Lectura Excel: UNA hoja por lote, sin mezclar formatos históricos
-# ============================================================
-
-def sheet_names(uploaded_file):
-    xls = pd.ExcelFile(uploaded_file)
-    return xls.sheet_names
-
-
-def read_full_excel_sheet(uploaded_file, sheet_name):
-    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=object)
-    raw = raw.dropna(how="all")
-    if raw.empty:
-        return pd.DataFrame(), ["La hoja seleccionada está vacía."]
-
-    raw.columns = [clean_text(c) for c in raw.columns]
-    cols = list(raw.columns)
-
-    warnings = []
-
-    area_col = col_exact(cols, ["Area.", "Area", "AREA"])
-    nro_col = col_exact(cols, ["Nº", "N°", "n°", "NRO", "Numero", "Número"])
-    codigo_ml_col = col_required(cols, "Código ML", ["Código ML", "Codigo ML", "CODIGO ML", "COD ML", "Cod ML"])
-    codigo_universal_col = col_exact(cols, ["Código Universal", "Codigo Universal", "COD UNIVERSAL", "Codigo de barras", "EAN"])
-    sku_col = col_required(cols, "SKU", ["SKU", "SKU ML"])
-    descripcion_col = col_required(cols, "Descripción", ["Descripción", "Descripcion", "DESCRIPCION", "Producto", "Título", "Titulo"])
-    unidades_col = col_required(cols, "Unidades", ["Unidades", "CANT", "Cant", "Cantidad"])
-
-    # Separación estricta: Identificación y Vence son columnas independientes.
-    identificacion_col = col_exact(cols, ["Identificación", "Identificacion", "ETIQUETA", "ETIQ"])
-    vence_col = col_exact(cols, ["Vence", "VCTO", "Vencimiento", "Fecha vencimiento", "Fecha de vencimiento"])
-    dia_col = col_exact(cols, ["Dia", "Día"])
-    hora_col = col_exact(cols, ["Hora"])
-
-    if not identificacion_col:
-        warnings.append("No encontré columna de Identificación/ETIQUETA/ETIQ en esta hoja. Se cargará vacía.")
-    if not vence_col:
-        warnings.append("No encontré columna Vence/VCTO en esta hoja. Se cargará vacía.")
-
-    df = pd.DataFrame({
-        "area": raw[area_col] if area_col else "",
-        "nro": raw[nro_col] if nro_col else "",
-        "codigo_ml": raw[codigo_ml_col],
-        "codigo_universal": raw[codigo_universal_col] if codigo_universal_col else "",
-        "sku": raw[sku_col],
-        "descripcion": raw[descripcion_col],
-        "unidades": raw[unidades_col],
-        "identificacion": raw[identificacion_col] if identificacion_col else "",
-        "vence": raw[vence_col] if vence_col else "",
-        "dia": raw[dia_col] if dia_col else "",
-        "hora": raw[hora_col] if hora_col else "",
-    })
-
-    for k in ["area", "nro", "descripcion", "identificacion", "vence", "dia", "hora"]:
-        df[k] = df[k].map(clean_text)
-    for k in ["codigo_ml", "codigo_universal", "sku"]:
-        df[k] = df[k].map(norm_code)
-    df["unidades"] = df["unidades"].map(to_int)
-
-    df = df[(df["unidades"] > 0) & ((df["sku"] != "") | (df["codigo_ml"] != "") | (df["codigo_universal"] != ""))]
-    return df.reset_index(drop=True), warnings
-
-
-# ============================================================
-# Maestro SKU/EAN desde repo
-# ============================================================
-
-def parse_maestro(file_or_path):
-    if not Path(file_or_path).exists():
-        return pd.DataFrame(columns=["code", "sku", "descripcion"])
-    xls = pd.ExcelFile(file_or_path)
-    frames = []
-    for sh in xls.sheet_names:
-        raw = pd.read_excel(xls, sheet_name=sh, dtype=object).dropna(how="all")
-        if raw.empty:
-            continue
-        raw.columns = [clean_text(c) for c in raw.columns]
-        cols = list(raw.columns)
-        sku_col = col_exact(cols, ["SKU", "SKU ML", "sku_ml"])
-        desc_col = col_exact(cols, ["Descripción", "Descripcion", "Producto", "Title", "Titulo"])
-        if not sku_col:
-            continue
-        barcode_cols = []
-        for c in cols:
-            h = normalize_header(c)
-            if any(x in h for x in ["ean", "barra", "barcode", "codigo universal", "cod universal", "codigo de barras"]):
-                barcode_cols.append(c)
-        if sku_col not in barcode_cols:
-            barcode_cols.append(sku_col)
-        rows = []
-        for _, r in raw.iterrows():
-            sku = norm_code(r.get(sku_col, ""))
-            if not sku:
-                continue
-            desc = clean_text(r.get(desc_col, "")) if desc_col else ""
-            codes = {sku}
-            for bc in barcode_cols:
-                for code in split_codes(r.get(bc, "")):
-                    codes.add(code)
-            for code in codes:
-                rows.append({"code": code, "sku": sku, "descripcion": desc})
-        if rows:
-            frames.append(pd.DataFrame(rows))
-    if not frames:
-        return pd.DataFrame(columns=["code", "sku", "descripcion"])
-    return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["code"])
-
-
-def load_maestro_from_repo():
-    df = parse_maestro(MAESTRO_PATH)
-    if df.empty:
-        return 0
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as c:
-        c.execute("DELETE FROM maestro")
-        c.executemany("INSERT OR REPLACE INTO maestro (code, sku, descripcion, updated_at) VALUES (?, ?, ?, ?)",
-                      [(norm_code(r.code), norm_code(r.sku), clean_text(r.descripcion), now) for r in df.itertuples(index=False)])
-        c.commit()
-    return len(df)
-
-
-def maestro_lookup(code):
-    cn = norm_code(code)
-    if not cn:
-        return ""
-    with db() as c:
-        row = c.execute("SELECT sku FROM maestro WHERE code=?", (cn,)).fetchone()
-    return clean_text(row["sku"]) if row else ""
-
-
-# ============================================================
-# Matching
-# ============================================================
-
-def pending_items(items):
-    if items.empty:
-        return items
-    p = items.copy()
-    p["pendiente"] = (p["unidades"].astype(int) - p["acopiadas"].astype(int)).clip(lower=0)
-    return p[p["pendiente"] > 0]
-
-
-def match_ml(items, code):
-    cn = norm_code(code)
-    p = pending_items(items)
-    return p[p["codigo_ml"].map(norm_code) == cn] if cn else p.iloc[0:0]
-
-
-def match_secondary(items, code, only_super=None):
-    cn = norm_code(code)
-    if not cn:
-        return items.iloc[0:0]
-    sku_master = norm_code(maestro_lookup(cn))
-    p = pending_items(items)
-    if only_super is True:
-        p = p[p["identificacion"].map(is_supermercado)]
-    elif only_super is False:
-        p = p[~p["identificacion"].map(is_supermercado)]
-    mask = (p["sku"].map(norm_code) == cn) | (p["codigo_universal"].map(norm_code) == cn)
-    if sku_master:
-        mask = mask | (p["sku"].map(norm_code) == sku_master)
-    return p[mask]
-
-
-def best_match(df):
-    if df.empty:
-        return None
-    m = df.copy()
-    m["pendiente"] = (m["unidades"].astype(int) - m["acopiadas"].astype(int)).clip(lower=0)
-    return m.sort_values(["pendiente", "id"], ascending=[False, True]).iloc[0]
-
-
-def reset_scan_state():
-    """Limpia el flujo de escaneo sin modificar directamente widgets ya creados."""
-    st.session_state["primary_validated"] = False
-    st.session_state["primary_code"] = ""
-    st.session_state["candidate_id"] = None
-    st.session_state["candidate_mode"] = ""
-    st.session_state["_clear_scan_inputs_next_run"] = True
-
-
-def clear_scan_inputs_if_needed():
-    """Se ejecuta antes de crear los inputs de escaneo/cantidad."""
-    if st.session_state.get("_clear_scan_inputs_next_run", False):
-        st.session_state["scan_primary"] = ""
-        st.session_state["scan_secondary"] = ""
-        st.session_state["scan_qty_input"] = ""
-        st.session_state["_clear_scan_inputs_next_run"] = False
-
-
-def get_item_row(items, item_id):
-    try:
-        iid = int(item_id)
-    except Exception:
-        return None
-    m = items[items["id"].astype(int) == iid]
-    return None if m.empty else m.iloc[0]
-
-
-# ============================================================
-# Etiquetas Zebra ZPL 50x30 mm (módulo independiente)
-# ============================================================
-
-ROLL_CAPACITY_DEFAULT = 2500
-LABEL_SEPARATOR_PER_PRODUCT = 2  # INICIO + FIN
-
-
-def zpl_safe(v) -> str:
-    """Limpia texto para ZPL evitando caracteres que suelen romper impresión."""
-    s = clean_text(v)
-    repl = {
-        "Á": "A", "É": "E", "Í": "I", "Ó": "O", "Ú": "U", "Ü": "U", "Ñ": "N",
-        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ü": "u", "ñ": "n",
-        "^": "", "~": "", "\n": " ", "\r": " ",
-    }
-    for a, b in repl.items():
-        s = s.replace(a, b)
-    return re.sub(r"\s+", " ", s).strip()
-
-
-def split_desc_2_lines(desc: str, max_len: int = 34) -> tuple[str, str]:
-    text = zpl_safe(desc)
-    if len(text) <= max_len:
-        return text, ""
-    cut = text.rfind(" ", 0, max_len + 1)
-    if cut < 12:
-        cut = max_len
-    line1 = text[:cut].strip()
-    rest = text[cut:].strip()
-    if len(rest) <= max_len:
-        return line1, rest
-    cut2 = rest.rfind(" ", 0, max_len + 1)
-    if cut2 < 12:
-        cut2 = max_len
-    return line1, rest[:cut2].strip()
-
-
-def zpl_ml_label_50x30(codigo_ml, sku, descripcion, copies=1) -> str:
-    codigo = zpl_safe(codigo_ml)
-    sku = zpl_safe(sku)
-    line1, line2 = split_desc_2_lines(descripcion, 34)
-    copies = max(1, int(copies or 1))
-    return f"""^XA
-^PW400
-^LL240
-^LH0,0
-^PQ{copies}
-
-^FO15,12^BY2,2,55
-^BCN,55,N,N,N
-^FD{codigo}^FS
-
-^FO120,78^A0N,28,28
-^FD{codigo}^FS
-
-^FO15,118^A0N,21,21
-^FD{line1}^FS
-
-^FO15,145^A0N,21,21
-^FD{line2}^FS
-
-^FO15,195^A0N,25,25
-^FDSKU: {sku}^FS
-
-^XZ
-"""
-
-
-def zpl_separator_50x30(tipo: str, codigo_ml, sku, descripcion) -> str:
-    tipo = "INICIO" if clean_text(tipo).upper() == "INICIO" else "FIN"
-    codigo = zpl_safe(codigo_ml)
-    sku = zpl_safe(sku)
-    line1, line2 = split_desc_2_lines(descripcion, 28)
-    return f"""^XA
-^PW400
-^LL240
-^LH0,0
-
-^FO25,20^A0N,44,44
-^FD{tipo} PRODUCTO^FS
-
-^FO25,78^A0N,32,32
-^FD{codigo}^FS
-
-^FO25,118^A0N,22,22
-^FD{line1}^FS
-^FO25,145^A0N,22,22
-^FD{line2}^FS
-
-^FO25,190^A0N,26,26
-^FDSKU: {sku}^FS
-
-^XZ
-"""
-
-
-def zpl_for_item_with_separators(row, copies=None) -> str:
-    qty = int(copies if copies is not None else row.get("unidades", 0))
-    qty = max(1, qty)
-    return (
-        zpl_separator_50x30("INICIO", row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""))
-        + zpl_ml_label_50x30(row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""), qty)
-        + zpl_separator_50x30("FIN", row.get("codigo_ml", ""), row.get("sku", ""), row.get("descripcion", ""))
-    )
-
-
-def get_label_print_summary(lote_id: int) -> pd.DataFrame:
-    with db() as c:
-        df = pd.read_sql_query(
-            """
-            SELECT item_id,
-                   SUM(CASE WHEN print_kind='NORMAL' THEN cantidad ELSE 0 END) AS printed_normal,
-                   SUM(CASE WHEN print_kind!='NORMAL' THEN cantidad ELSE 0 END) AS printed_separators,
-                   SUM(CASE WHEN is_reprint=1 THEN cantidad ELSE 0 END) AS reprinted_qty,
-                   MAX(created_at) AS last_label_printed_at
-            FROM label_prints
-            WHERE lote_id=?
-            GROUP BY item_id
-            """,
-            c,
-            params=(lote_id,),
-        )
-    if df.empty:
-        return pd.DataFrame(columns=["item_id", "printed_normal", "printed_separators", "reprinted_qty", "last_label_printed_at"])
-    for col in ["printed_normal", "printed_separators", "reprinted_qty"]:
-        df[col] = df[col].fillna(0).astype(int)
-    return df
-
-
-def label_control_view(lote_id: int) -> pd.DataFrame:
-    items = get_items(lote_id)
-    if items.empty:
-        return items
-    summary = get_label_print_summary(lote_id)
-    view = items.merge(summary, left_on="id", right_on="item_id", how="left")
-    for col in ["printed_normal", "printed_separators", "reprinted_qty"]:
-        view[col] = view[col].fillna(0).astype(int)
-    view["label_pending"] = (view["unidades"].astype(int) - view["printed_normal"].astype(int)).clip(lower=0)
-
-    def status_row(r):
-        req = int(r["unidades"])
-        printed = int(r["printed_normal"])
-        if printed == 0:
-            return "SIN IMPRIMIR"
-        if printed < req:
-            return "PARCIAL"
-        if printed == req:
-            return "COMPLETO"
-        return "SOBREIMPRESO"
-
-    view["label_status"] = view.apply(status_row, axis=1)
-    return view
-
-
-def item_label_total(row) -> int:
-    return int(row.get("unidades", 0)) + LABEL_SEPARATOR_PER_PRODUCT
-
-
-def build_label_blocks(items: pd.DataFrame, capacity: int = ROLL_CAPACITY_DEFAULT) -> list[dict]:
-    blocks = []
-    current = []
-    current_total = 0
-    capacity = max(1, int(capacity or ROLL_CAPACITY_DEFAULT))
-
-    for _, row in items.iterrows():
-        qty = item_label_total(row)
-        # Si un solo producto excede el rollo, se deja solo en un bloque y se advierte en UI.
-        if current and current_total + qty > capacity:
-            blocks.append({"items": current, "total_qty": current_total})
-            current = []
-            current_total = 0
-        current.append(row.to_dict())
-        current_total += qty
-
-    if current:
-        blocks.append({"items": current, "total_qty": current_total})
-
-    out = []
-    for idx, b in enumerate(blocks, start=1):
-        normal = sum(int(x.get("unidades", 0)) for x in b["items"])
-        separators = len(b["items"]) * LABEL_SEPARATOR_PER_PRODUCT
-        key_raw = "|".join(f"{int(x.get('id'))}:{int(x.get('unidades',0))}" for x in b["items"])
-        block_key = hashlib.sha1(key_raw.encode("utf-8")).hexdigest()[:16]
-        out.append({
-            "block_index": idx,
-            "block_key": block_key,
-            "items": b["items"],
-            "products_count": len(b["items"]),
-            "normal_qty": normal,
-            "separator_qty": separators,
-            "total_qty": normal + separators,
-            "over_capacity": (normal + separators) > capacity,
-        })
+    if not isinstance(dim_str, str) or not dim_str.strip():
+        return out
+    s = dim_str.lower().replace("cms", "cm").replace(" ", "")
+    m = re.search(r"(\d+(?:[.,]\d+)?)x(\d+(?:[.,]\d+)?)x(\d+(?:[.,]\d+)?)cm", s)
+    if m:
+        a, b, c = [float(x.replace(",", ".")) for x in m.groups()]
+        out["alto_cm"], out["ancho_cm"], out["largo_cm"] = a, b, c
+        out["dimensiones"] = f"{a:g} x {b:g} x {c:g} cm"
+        out["peso_volumetrico_kg"] = (a * b * c) / 4000.0
+    m2 = re.search(r"(\d+(?:[.,]\d+)?)(grs|g|kg)", s)
+    if m2:
+        val = float(m2.group(1).replace(",", "."))
+        unit = m2.group(2)
+        out["peso_grs"] = val * 1000 if unit == "kg" else val
     return out
 
 
-def zpl_for_block(block: dict) -> str:
-    chunks = []
-    for item in block["items"]:
-        chunks.append(zpl_for_item_with_separators(item, int(item.get("unidades", 0))))
-    return "".join(chunks)
+def calc_margin_from_bruto(cost, bruto):
+    cost = safe_float(cost, np.nan)
+    bruto = safe_float(bruto, np.nan)
+    if np.isnan(cost) or np.isnan(bruto) or bruto <= 0:
+        return np.nan
+    neto = bruto / 1.19
+    if neto <= 0:
+        return np.nan
+    return ((neto - cost) / neto) * 100
 
 
-def get_label_block_record(lote_id: int, block_index: int, block_key: str) -> dict:
-    with db() as c:
-        row = c.execute(
-            "SELECT * FROM label_blocks WHERE lote_id=? AND block_index=? AND block_key=?",
-            (int(lote_id), int(block_index), clean_text(block_key)),
-        ).fetchone()
-    return dict(row) if row else {}
+def calc_margin_from_monto_sim(cost, monto_sim):
+    cost = safe_float(cost, np.nan)
+    monto_sim = safe_float(monto_sim, np.nan)
+    if np.isnan(cost) or np.isnan(monto_sim) or monto_sim <= 0:
+        return np.nan
+    neto = monto_sim / 1.19
+    if neto <= 0:
+        return np.nan
+    return ((neto - cost) / neto) * 100
 
 
-def register_block_download(lote_id: int, block: dict):
-    now = datetime.now().isoformat(timespec="seconds")
-    existing = get_label_block_record(lote_id, block["block_index"], block["block_key"])
-    is_reprint = 1 if existing else 0
-    status = "REIMPRESO" if is_reprint else "IMPRESO"
-
-    with db() as c:
-        if existing:
-            c.execute(
-                """
-                UPDATE label_blocks
-                SET status=?, download_count=download_count+1, last_printed_at=?, updated_at=?
-                WHERE lote_id=? AND block_index=? AND block_key=?
-                """,
-                (status, now, now, int(lote_id), int(block["block_index"]), clean_text(block["block_key"])),
-            )
-        else:
-            c.execute(
-                """
-                INSERT INTO label_blocks
-                (lote_id, block_index, block_key, products_count, normal_qty, separator_qty, total_qty,
-                 status, download_count, last_printed_at, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'IMPRESO', 1, ?, ?, ?)
-                """,
-                (
-                    int(lote_id), int(block["block_index"]), clean_text(block["block_key"]), int(block["products_count"]),
-                    int(block["normal_qty"]), int(block["separator_qty"]), int(block["total_qty"]), now, now, now,
-                ),
-            )
-        rows = []
-        for item in block["items"]:
-            rows.append((
-                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
-                int(block["block_index"]), clean_text(block["block_key"]), is_reprint, now,
-            ))
-            rows.append((
-                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
-                int(block["block_index"]), clean_text(block["block_key"]), is_reprint, now,
-            ))
-        c.executemany(
-            """
-            INSERT INTO label_prints
-            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-             block_index, block_key, is_reprint, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        c.commit()
-    log_audit_event(lote_id, event_type="ZPL_REIMPRESO" if is_reprint else "ZPL_DESCARGADO", detail=f"Bloque {int(block['block_index'])}", qty=int(block.get("total_qty", 0)), mode="BLOQUE")
+def choose_primary_publication(df):
+    if df is None or df.empty:
+        return None
+    tmp = df.copy()
+    tmp["status_rank"] = np.where(tmp["status"].astype(str).str.upper().eq("ACTIVA"), 0, 1)
+    tmp["ventas_rank"] = pd.to_numeric(tmp["ventas_hist_pub"], errors="coerce").fillna(0)
+    tmp = tmp.sort_values(["status_rank", "ventas_rank"], ascending=[True, False])
+    return tmp.iloc[0]
 
 
-def register_individual_download(lote_id: int, item: dict, qty: int):
-    now = datetime.now().isoformat(timespec="seconds")
-    qty = max(1, int(qty or 1))
-    summary = get_label_print_summary(lote_id)
-    already = 0
-    if not summary.empty:
-        m = summary[summary["item_id"].astype(int) == int(item.get("id"))]
-        if not m.empty:
-            already = int(m.iloc[0].get("printed_normal", 0))
-    is_reprint = 1 if already >= int(item.get("unidades", 0)) else 0
-    with db() as c:
-        rows = [
-            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), qty, "INDIVIDUAL", "NORMAL", None, None, is_reprint, now),
-            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, is_reprint, now),
+def format_mlc_list(values) -> str:
+    if not isinstance(values, list) or not values:
+        return "—"
+    cleaned = []
+    for v in values:
+        s = str(v).strip().upper().replace(" ", "")
+        if not s or s == "NAN":
+            continue
+        s = re.sub(r"\.0$", "", s)
+        if s.isdigit():
+            s = f"MLC{s}"
+        elif s.startswith("MLC") and s[3:].isdigit():
+            s = f"MLC{s[3:]}"
+        cleaned.append(s)
+    cleaned = list(dict.fromkeys(cleaned))
+    return ", ".join(cleaned) if cleaned else "—"
+
+
+def build_ads_report_detail_for_sku(sku: str, product_ads: pd.DataFrame | None, publications: pd.DataFrame | None) -> pd.DataFrame:
+    base_cols = [
+        "campana", "mlc", "titulo", "estado", "inversion_ads", "ingresos_ads", "acos", "roas", "ventas_ads", "impresiones", "clics"
         ]
-        c.executemany(
-            """
-            INSERT INTO label_prints
-            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-             block_index, block_key, is_reprint, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
+    if not sku or product_ads is None or publications is None:
+        return pd.DataFrame(columns=base_cols)
+    if not isinstance(product_ads, pd.DataFrame) or not isinstance(publications, pd.DataFrame):
+        return pd.DataFrame(columns=base_cols)
+    if product_ads.empty or publications.empty or "mlc" not in product_ads.columns:
+        return pd.DataFrame(columns=base_cols)
+
+    pubs_sku = publications[publications.get("sku", pd.Series(dtype=str)) == sku].copy()
+    if pubs_sku.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    ads = product_ads.copy()
+    if "mlc" not in ads.columns:
+        return pd.DataFrame(columns=base_cols)
+
+    ads = ads[ads["mlc"].isin(pubs_sku["mlc"].dropna().astype(str).tolist())].copy()
+    if ads.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    for col in base_cols:
+        if col not in ads.columns:
+            ads[col] = np.nan
+
+    ads = ads[base_cols].copy()
+    ads = ads.sort_values(["inversion_ads", "ingresos_ads", "campana", "mlc"], ascending=[False, False, True, True], na_position="last")
+    return ads
+
+
+def ensure_history_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            master_sig TEXT,
+            ventas_sig TEXT,
+            compras_sig TEXT,
+            pubs_sig TEXT,
+            ads_sig TEXT,
+            keywords_sig TEXT,
+            notes TEXT
         )
-        c.commit()
-    log_audit_event(lote_id, int(item.get("id")), "ZPL_INDIVIDUAL", clean_text(item.get("descripcion", "")), int(qty), item.get("codigo_ml", ""), item.get("sku", ""), "INDIVIDUAL")
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshot_producto (
+            run_id INTEGER,
+            sku TEXT,
+            descripcion TEXT,
+            costo_maestra REAL,
+            ultimo_costo_compra REAL,
+            brecha_costo_pct REAL,
+            precio_bruto REAL,
+            monto_sim REAL,
+            precio_ml_actual REAL,
+            ingreso_estimado_ml REAL,
+            brecha_precio_pct REAL,
+            brecha_monto_sim_pct REAL,
+            margen_ml_actual REAL,
+            margen_hist_30d REAL,
+            margen_hist_90d REAL,
+            margen_hist_total REAL,
+            delta_margen_30d_pp REAL,
+            ventas_ml_30d REAL,
+            ventas_tienda_30d REAL,
+            ads_inversion REAL,
+            ads_ingresos REAL,
+            ads_acos REAL,
+            PRIMARY KEY (run_id, sku)
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-# ============================================================
-# Auditoría operacional Fase 1
-# ============================================================
 
-def log_audit_event(lote_id=None, item_id=None, event_type="", detail="", qty=None, codigo_ml="", sku="", mode="", usuario="", source_module="", before=None, after=None, sync=True):
-    """Registra una acción operacional en SQLite y la deja en cola para Sheets.
+def save_snapshot_to_db(payload_df, sigs):
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO runs (created_at, master_sig, ventas_sig, compras_sig, pubs_sig, ads_sig, keywords_sig, notes)
+        VALUES (datetime('now'), ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            sigs.get("master_sig", ""),
+            sigs.get("ventas_sig", ""),
+            sigs.get("compras_sig", ""),
+            sigs.get("pubs_sig", ""),
+            sigs.get("ads_sig", ""),
+            sigs.get("keywords_sig", ""),
+            "snapshot automático",
+        ),
+    )
+    run_id = cur.lastrowid
+    insert_df = payload_df.copy()
+    insert_df["sku"] = insert_df["sku"].map(norm_sku)
+    insert_df = insert_df[insert_df["sku"] != ""].copy()
+    if "ventas_ml_30d" in insert_df.columns:
+        insert_df = insert_df.sort_values(["sku", "ventas_ml_30d"], ascending=[True, False])
+    insert_df = insert_df.drop_duplicates(subset=["sku"], keep="first")
+    insert_df = insert_df.replace([np.inf, -np.inf], np.nan)
+    insert_df = insert_df.where(pd.notnull(insert_df), None)
+    insert_df["run_id"] = run_id
+    cols = [
+        "run_id", "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_pct",
+        "precio_bruto", "monto_sim", "precio_ml_actual", "ingreso_referencia_comercial", "brecha_precio_pct",
+        "brecha_monto_sim_pct", "margen_ml_actual", "margen_hist_30d", "margen_hist_90d", "margen_hist_total",
+        "delta_margen_30d_pp", "ventas_ml_30d", "ventas_tienda_30d", "ads_inversion", "ads_ingresos", "ads_acos",
+        ]
+    insert_df = insert_df.reindex(columns=cols)
+    insert_df.to_sql("snapshot_producto", conn, if_exists="append", index=False)
+    conn.commit()
+    conn.close()
+    return run_id
 
-    Regla de arquitectura:
-    - SQLite = memoria rápida temporal.
-    - Sheets = memoria permanente oficial.
-    Por eso cada auditoría local genera también un evento audit_event idempotente para Sheets.
-    """
+
+
+def list_runs():
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
     try:
-        now = datetime.now().isoformat(timespec="seconds")
-        usuario_final = clean_text(usuario) or clean_text(mode) or "SIN_USUARIO"
-        before_json = json.dumps(before, ensure_ascii=False, default=str) if before is not None else ""
-        after_json = json.dumps(after, ensure_ascii=False, default=str) if after is not None else ""
-        base_key = {
-            "lote_id": int(lote_id) if lote_id is not None else None,
-            "item_id": int(item_id) if item_id is not None else None,
-            "event_type": clean_text(event_type),
-            "detail": clean_text(detail),
-            "qty": int(qty) if qty is not None else None,
-            "codigo_ml": norm_code(codigo_ml),
-            "sku": norm_code(sku),
-            "mode": clean_text(mode),
-            "usuario": usuario_final,
-            "created_at": now,
-        }
-        event_key = "audit:" + hashlib.sha1(json.dumps(base_key, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
-        with db() as c:
-            c.execute(
-                """
-                INSERT OR IGNORE INTO audit_events
-                (lote_id, item_id, event_type, detail, qty, codigo_ml, sku, mode, created_at,
-                 event_key, usuario, source_module, before_json, after_json, synced_to_sheets)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                """,
-                (
-                    int(lote_id) if lote_id is not None else None,
-                    int(item_id) if item_id is not None else None,
-                    clean_text(event_type), clean_text(detail),
-                    int(qty) if qty is not None else None,
-                    norm_code(codigo_ml), norm_code(sku), clean_text(mode), now,
-                    event_key, usuario_final, clean_text(source_module), before_json, after_json,
-                ),
-            )
-            c.commit()
+        df = pd.read_sql_query("SELECT * FROM runs ORDER BY id DESC", conn)
+    finally:
+        conn.close()
+    return df
 
-        if sync:
-            enqueue_backup_event("audit_event", {
-                "event_key": event_key,
-                "audit_type": clean_text(event_type),
-                "lote_id": int(lote_id) if lote_id is not None else None,
-                "item_id": int(item_id) if item_id is not None else None,
-                "detail": clean_text(detail),
-                "qty": int(qty) if qty is not None else None,
-                "codigo_ml": norm_code(codigo_ml),
-                "sku": norm_code(sku),
-                "mode": clean_text(mode),
-                "usuario": usuario_final,
-                "source_module": clean_text(source_module),
-                "before_json": before_json,
-                "after_json": after_json,
-                "created_at": now,
+
+
+def load_snapshot_history_for_skus(skus):
+    skus = [norm_sku(s) for s in (skus or []) if norm_sku(s)]
+    if not skus:
+        return pd.DataFrame()
+    ensure_history_db()
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        placeholders = ",".join(["?"] * len(skus))
+        query = f"""
+            SELECT sp.*, r.created_at
+            FROM snapshot_producto sp
+            JOIN runs r ON r.id = sp.run_id
+            WHERE sp.sku IN ({placeholders})
+            ORDER BY sp.sku, sp.run_id
+        """
+        return pd.read_sql_query(query, conn, params=skus)
+    finally:
+        conn.close()
+
+
+def load_snapshot_history_for_sku(sku):
+    sku = norm_sku(sku)
+    if not sku:
+        return pd.DataFrame()
+    return load_snapshot_history_for_skus([sku])
+
+
+def enrich_action_table_with_snapshot_history(action_table: pd.DataFrame) -> pd.DataFrame:
+    if action_table is None or action_table.empty:
+        return action_table
+    hist = load_snapshot_history_for_skus(action_table["sku"].dropna().unique().tolist())
+    if hist.empty:
+        out = action_table.copy()
+        for col in [
+            "brecha_costo_inicial_pct", "brecha_costo_previa_pct", "delta_brecha_costo_vs_inicial_pp", "delta_brecha_costo_vs_previa_pp",
+            "brecha_precio_inicial_pct", "brecha_precio_previa_pct", "delta_brecha_precio_vs_inicial_pp", "delta_brecha_precio_vs_previa_pp",
+            "brecha_ingreso_inicial_pct", "brecha_ingreso_previa_pct", "delta_brecha_ingreso_vs_inicial_pp", "delta_brecha_ingreso_vs_previa_pp",
+            "runs_count", "primera_corrida", "ultima_corrida_previa"
+        ]:
+            out[col] = np.nan
+        return out
+
+    rows = []
+    for sku, grp in hist.groupby("sku", sort=False):
+        grp = grp.sort_values("run_id")
+        first = grp.iloc[0]
+        prev = grp.iloc[-2] if len(grp) >= 2 else grp.iloc[-1]
+        rows.append({
+            "sku": sku,
+            "brecha_costo_inicial_pct": first.get("brecha_costo_pct"),
+            "brecha_costo_previa_pct": prev.get("brecha_costo_pct"),
+            "brecha_precio_inicial_pct": first.get("brecha_precio_pct"),
+            "brecha_precio_previa_pct": prev.get("brecha_precio_pct"),
+            "brecha_ingreso_inicial_pct": first.get("brecha_monto_sim_pct"),
+            "brecha_ingreso_previa_pct": prev.get("brecha_monto_sim_pct"),
+            "runs_count": len(grp),
+            "primera_corrida": first.get("created_at"),
+            "ultima_corrida_previa": prev.get("created_at"),
+        })
+    base = pd.DataFrame(rows)
+    out = action_table.merge(base, on="sku", how="left")
+    out["delta_brecha_costo_vs_inicial_pp"] = out["brecha_costo_pct"] - out["brecha_costo_inicial_pct"]
+    out["delta_brecha_costo_vs_previa_pp"] = out["brecha_costo_pct"] - out["brecha_costo_previa_pct"]
+    out["delta_brecha_precio_vs_inicial_pp"] = out["brecha_precio_pct"] - out["brecha_precio_inicial_pct"]
+    out["delta_brecha_precio_vs_previa_pp"] = out["brecha_precio_pct"] - out["brecha_precio_previa_pct"]
+    out["delta_brecha_ingreso_vs_inicial_pp"] = out["brecha_monto_sim_pct"] - out["brecha_ingreso_inicial_pct"]
+    out["delta_brecha_ingreso_vs_previa_pp"] = out["brecha_monto_sim_pct"] - out["brecha_ingreso_previa_pct"]
+    return out
+
+
+def build_validation_layers(master, ventas, compras, pubs, product_ads, promos, action_table=None):
+    details = {}
+    summary_rows = []
+
+    def register(name, severity, df, detail):
+        df = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+        details[name] = df
+        summary_rows.append({
+            "Capa": name,
+            "Severidad": severity,
+            "Hallazgos": len(df),
+            "Detalle": detail,
+        })
+
+    master = master.copy() if isinstance(master, pd.DataFrame) else pd.DataFrame()
+    ventas = ventas.copy() if isinstance(ventas, pd.DataFrame) else pd.DataFrame()
+    compras = compras.copy() if isinstance(compras, pd.DataFrame) else pd.DataFrame()
+    pubs = pubs.copy() if isinstance(pubs, pd.DataFrame) else pd.DataFrame()
+    product_ads = product_ads.copy() if isinstance(product_ads, pd.DataFrame) else pd.DataFrame()
+    promos = promos.copy() if isinstance(promos, pd.DataFrame) else pd.DataFrame()
+
+    master_skus = set(master.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    sales_skus = set(ventas.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    purchase_skus = set(compras.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    pub_skus = set(pubs.get("sku", pd.Series(dtype=str)).dropna().astype(str))
+    pub_mlcs = set(pubs.get("mlc", pd.Series(dtype=str)).dropna().astype(str))
+
+    dup_master = master[master.get("sku", pd.Series(dtype=str)).duplicated(keep=False)].sort_values("sku") if not master.empty else pd.DataFrame()
+    register("Maestra duplicada por SKU", "CRÍTICO" if not dup_master.empty else "OK", dup_master[[c for c in ["sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim"] if c in dup_master.columns]], "Un SKU no debería repetirse en la maestra consolidada.")
+
+    missing_core = master[(master.get("costo_maestra").isna()) | (master.get("precio_bruto").isna()) | (master.get("monto_sim").isna())] if not master.empty else pd.DataFrame()
+    register("Maestra incompleta", "ALERTA" if not missing_core.empty else "OK", missing_core[[c for c in ["sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim"] if c in missing_core.columns]], "La maestra debería quedar alimentada por reportes con costo, precio tienda y monto simulación.")
+
+    sales_out = ventas[~ventas.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values(["sku", "fecha"], ascending=[True, False]) if not ventas.empty else pd.DataFrame()
+    register("Ventas fuera de maestra", "CRÍTICO" if not sales_out.empty else "OK", sales_out[[c for c in ["sku", "fecha", "producto", "total_linea", "canal"] if c in sales_out.columns]].drop_duplicates(), "El reporte de ventas está trayendo SKUs que no quedaron absorbidos por la maestra.")
+
+    purchase_out = compras[~compras.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values(["sku", "fecha"], ascending=[True, False]) if not compras.empty else pd.DataFrame()
+    register("Compras fuera de maestra", "ALERTA" if not purchase_out.empty else "OK", purchase_out[[c for c in ["sku", "fecha", "proveedor", "precio_unitario"] if c in purchase_out.columns]].drop_duplicates(), "Hay costos del reporte de compras que no están cayendo a la maestra.")
+
+    pubs_out = pubs[~pubs.get("sku", pd.Series(dtype=str)).isin(master_skus)].sort_values("sku") if not pubs.empty else pd.DataFrame()
+    register("Publicaciones fuera de maestra", "CRÍTICO" if not pubs_out.empty else "OK", pubs_out[[c for c in ["sku", "mlc", "titulo", "precio_final", "status"] if c in pubs_out.columns]].drop_duplicates(), "Mercado Libre reporta publicaciones cuyo SKU no quedó consolidado en la maestra.")
+
+    master_without_pub = master[~master.get("sku", pd.Series(dtype=str)).isin(pub_skus)].sort_values("sku") if not master.empty else pd.DataFrame()
+    register("Maestra sin publicación ML", "ALERTA" if not master_without_pub.empty else "OK", master_without_pub[[c for c in ["sku", "descripcion", "precio_bruto", "monto_sim"] if c in master_without_pub.columns]], "Hay productos consolidados sin contraparte en el reporte de publicaciones.")
+
+    dup_mlc = pubs[pubs.get("mlc", pd.Series(dtype=str)).duplicated(keep=False)].sort_values("mlc") if not pubs.empty else pd.DataFrame()
+    register("MLC duplicado en reporte", "CRÍTICO" if not dup_mlc.empty else "OK", dup_mlc[[c for c in ["mlc", "sku", "titulo", "status"] if c in dup_mlc.columns]], "Un mismo MLC no debería repetirse en el reporte base.")
+
+    multi_active = pubs[pubs.get("status", pd.Series(dtype=str)).astype(str).str.upper().eq("ACTIVA")].copy() if not pubs.empty else pd.DataFrame()
+    multi_active = multi_active.groupby("sku").filter(lambda g: len(g) > 1) if not multi_active.empty else pd.DataFrame()
+    register("Múltiples publicaciones activas por SKU", "ALERTA" if not multi_active.empty else "OK", multi_active[[c for c in ["sku", "mlc", "titulo", "precio_final", "ventas_hist_pub"] if c in multi_active.columns]], "Puede existir estrategia multilistado, pero se debe revisar porque afecta la publicación principal y el pricing.")
+
+    promo_issues = promos[(promos.get("mlc", pd.Series(dtype=str)).astype(str).str.strip().eq("")) | (pd.isna(promos.get("fecha_venci")))] if not promos.empty else pd.DataFrame()
+    register("Promociones incompletas", "ALERTA" if not promo_issues.empty else "OK", promo_issues[[c for c in ["sku", "slot", "mlc", "precio_b2c", "fecha_venci", "comentario"] if c in promo_issues.columns]], "Las promos deben tener MLC y fecha de vencimiento para ser operables.")
+
+    ads_orphan = product_ads[~product_ads.get("mlc", pd.Series(dtype=str)).isin(pub_mlcs)].sort_values("mlc") if not product_ads.empty else pd.DataFrame()
+    register("Ads sin publicación asociada", "ALERTA" if not ads_orphan.empty else "OK", ads_orphan[[c for c in ["mlc", "campana", "titulo", "inversion_ads", "ingresos_ads"] if c in ads_orphan.columns]], "Product Ads trae publicaciones que hoy no están en el reporte maestro ML.")
+
+    future_purchases = compras[compras.get("fecha", pd.Series(dtype='datetime64[ns]')) > pd.Timestamp(date.today())] if not compras.empty else pd.DataFrame()
+    register("Compras con fecha futura", "ALERTA" if not future_purchases.empty else "OK", future_purchases[[c for c in ["sku", "fecha", "proveedor", "precio_unitario"] if c in future_purchases.columns]], "Hay registros de compras con fecha posterior a hoy.")
+
+    action_table = action_table.copy() if isinstance(action_table, pd.DataFrame) else pd.DataFrame()
+    if not action_table.empty:
+        ads_burning = action_table[(action_table.get("ads_inversion", 0).fillna(0) > 0) & (action_table.get("ads_ingresos", 0).fillna(0) <= 0)].copy() if "ads_inversion" in action_table.columns else pd.DataFrame()
+        register(
+            "Ads quemando gasto sin ventas",
+            "CRÍTICO" if not ads_burning.empty else "OK",
+            ads_burning[[c for c in ["sku", "descripcion", "ads_inversion", "ads_ingresos", "ads_clics", "accion_ads"] if c in ads_burning.columns]],
+            "Hay inversión publicitaria sin ingresos atribuidos; conviene pausar o recortar mientras se revisa ficha, precio o targeting.",
+        )
+
+        ads_negative_margin = action_table[action_table.get("estado_ads", pd.Series(dtype=str)).astype(str).eq("CRÍTICO")].copy() if "estado_ads" in action_table.columns else pd.DataFrame()
+        if not ads_negative_margin.empty and "margen_ml_con_ads" in ads_negative_margin.columns:
+            ads_negative_margin = ads_negative_margin[(ads_negative_margin["margen_ml_con_ads"].fillna(0) < 0) | (ads_negative_margin.get("gap_acos_pct", np.nan).fillna(-np.inf) > 0)]
+        register(
+            "Ads incoherente vs rentabilidad",
+            "CRÍTICO" if not ads_negative_margin.empty else "OK",
+            ads_negative_margin[[c for c in ["sku", "descripcion", "ads_acos", "acos_max_permitido_pct", "margen_ml_con_ads", "accion_ads"] if c in ads_negative_margin.columns]],
+            "El ACOS real ya superó el ACOS máximo permitido o el margen con Ads quedó negativo.",
+        )
+
+        ads_scale = action_table[action_table.get("estado_ads", pd.Series(dtype=str)).astype(str).eq("OPORTUNIDAD")].copy() if "estado_ads" in action_table.columns else pd.DataFrame()
+        register(
+            "Ads escalables",
+            "OK" if ads_scale.empty else "ALERTA",
+            ads_scale[[c for c in ["sku", "descripcion", "ads_acos", "margen_ml_con_ads", "ads_roas", "accion_ads"] if c in ads_scale.columns]],
+            "Estos SKUs tienen margen con Ads holgado y ACOS bajo; podrían absorber más presupuesto.",
+        )
+
+    summary = pd.DataFrame(summary_rows)
+    severity_rank = {"CRÍTICO": 3, "ALERTA": 2, "OK": 1}
+    if not summary.empty:
+        summary["_rank"] = summary["Severidad"].map(severity_rank).fillna(0)
+        summary = summary.sort_values(["_rank", "Hallazgos", "Capa"], ascending=[False, False, True]).drop(columns=["_rank"])
+    return {"summary": summary, "details": details}
+
+
+def calc_ml_net_revenue(price, fee_pct, fixed_charge=0.0, ads_pct=0.0):
+    price = safe_float(price, np.nan)
+    fee_pct = safe_float(fee_pct, 0.0)
+    fixed_charge = safe_float(fixed_charge, 0.0)
+    ads_pct = safe_float(ads_pct, 0.0)
+    if np.isnan(price) or price <= 0:
+        return np.nan
+    variable_rate = max(0.0, min(0.95, (fee_pct + ads_pct) / 100.0))
+    revenue_gross = price * (1 - variable_rate) - fixed_charge
+    if revenue_gross <= 0:
+        return np.nan
+    return revenue_gross / 1.19
+
+
+def calc_margin_from_ml_price(cost, price, fee_pct, fixed_charge=0.0, ads_pct=0.0):
+    cost = safe_float(cost, np.nan)
+    net_rev = calc_ml_net_revenue(price, fee_pct, fixed_charge, ads_pct)
+    if np.isnan(cost) or np.isnan(net_rev) or net_rev <= 0:
+        return np.nan
+    return ((net_rev - cost) / net_rev) * 100
+
+
+def calc_price_for_target_ml_margin(cost, fee_pct, fixed_charge=0.0, target_margin_pct=15.0, ads_pct=0.0):
+    cost = safe_float(cost, np.nan)
+    fee_pct = safe_float(fee_pct, 0.0)
+    fixed_charge = safe_float(fixed_charge, 0.0)
+    target_margin_pct = safe_float(target_margin_pct, np.nan)
+    ads_pct = safe_float(ads_pct, 0.0)
+    if np.isnan(cost) or np.isnan(target_margin_pct):
+        return np.nan
+    target = target_margin_pct / 100.0
+    variable_rate = max(0.0, min(0.95, (fee_pct + ads_pct) / 100.0))
+    denominator = 1 - variable_rate
+    if denominator <= 0 or target >= 1:
+        return np.nan
+    required_net_rev = cost / (1 - target)
+    return ((required_net_rev * 1.19) + fixed_charge) / denominator
+
+
+# =========================================================
+# Loaders
+# =========================================================
+@st.cache_data(show_spinner=False)
+def _coerce_excel_bytes(file_bytes, label: str = "archivo Excel") -> bytes:
+    if file_bytes is None:
+        raise ValueError(f"No se recibió {label}.")
+    if hasattr(file_bytes, "getvalue"):
+        file_bytes = file_bytes.getvalue()
+    if isinstance(file_bytes, memoryview):
+        file_bytes = file_bytes.tobytes()
+    if not isinstance(file_bytes, (bytes, bytearray)):
+        raise ValueError(f"{label}: tipo no soportado ({type(file_bytes).__name__}).")
+    file_bytes = bytes(file_bytes)
+    if not file_bytes:
+        raise ValueError(f"{label}: archivo vacío.")
+    return file_bytes
+
+
+def load_master_workbook(file_bytes: bytes):
+    file_bytes = _coerce_excel_bytes(file_bytes, "la maestra")
+    bio = io.BytesIO(file_bytes)
+
+    try:
+        xls = pd.ExcelFile(bio, engine="openpyxl")
+    except Exception as e:
+        head = file_bytes[:24]
+        raise ValueError(
+            "No pude abrir la maestra como Excel válido (.xlsx). "
+            f"Cabecera detectada: {head!r}. Error original: {e}"
+        ) from e
+
+    names = xls.sheet_names
+    maestra_name = _find_sheet(names, "MAESTRA de precios")
+    bridge_name = _find_sheet(names, "MLC -SKU")
+    rel_name = _find_sheet(names, "Relampago mi pagina")
+    control_name = _find_sheet(names, "CONTROL DE PROMOCIONES")
+
+    if not maestra_name:
+        raise ValueError("No encontré la hoja 'MAESTRA de precios'.")
+
+    master_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=maestra_name, engine="openpyxl")
+    bridge_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=bridge_name, engine="openpyxl") if bridge_name else pd.DataFrame()
+    rel_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=rel_name, header=None, engine="openpyxl") if rel_name else pd.DataFrame()
+    control_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=control_name, engine="openpyxl") if control_name else pd.DataFrame()
+
+    return {
+        "sheet_names": names,
+        "maestra_name": maestra_name,
+        "bridge_name": bridge_name,
+        "rel_name": rel_name,
+        "control_name": control_name,
+        "master_df": master_df,
+        "bridge_df": bridge_df,
+        "rel_df": rel_df,
+        "control_df": control_df,
+        "file_bytes": file_bytes,
+    }
+
+
+
+def parse_mlc_cell_list(value):
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return []
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return []
+    parts = re.split(r"[^A-Za-z0-9]+", s)
+    out = []
+    for p in parts:
+        v = norm_mlc(p)
+        if v:
+            out.append(v)
+    return list(dict.fromkeys(out))
+
+
+def _promo_slot_meta():
+    return {
+        1: {"pads": "CAMPAÑA PADS", "mlc": "MLC", "mlc_sync": "MLC SINCRONIZADO", "price": "PRECIO B2C PUBLICADO ", "comment": "COMENTARIO", "date": "FECHA VENCI"},
+        2: {"pads": "CAMPAÑA PADS.1", "mlc": "MLC.1", "mlc_sync": "MLC SINCRONIZADO.1", "price": "PRECIO B2C", "comment": "COMENTARIO.1", "date": "FECHA VENCI.1"},
+        3: {"pads": "CAMPAÑA PADS.2", "mlc": "MLC 3", "mlc_sync": "MLC SINCRONIZADO 3", "price": "PRECIO B2C.1", "comment": "COMENTARIO.2", "date": "FECHA VENCI.2"},
+        4: {"pads": "CAMPAÑA PADS.3", "mlc": "MLC 4", "mlc_sync": "MLC SINCRONIZADO 4", "price": "PRECIO B2C.2", "comment": "COMENTARIO.3", "date": "FECHA VENCI.3"},
+    }
+
+
+def normalize_master(master_df, bridge_df):
+    df = master_df.copy()
+
+    alias_sets = {
+        "SKU": ["SKU", "CODIGO", "CÓDIGO", "COD SKU"],
+        "DESCRIPCIÓN": ["DESCRIPCIÓN", "DESCRIPCION", "PRODUCTO", "ARTICULO", "ARTÍCULO", "DETALLE", "NOMBRE"],
+        "UBIC": ["UBIC", "UBICACION", "UBICACIÓN"],
+        "ÚLTIMO COSTO": ["ÚLTIMO COSTO", "ULTIMO COSTO", "COSTO", "ULT COSTO", "CAMBIO DE PRECIO"],
+        "PRECIO BRUTO": ["PRECIO BRUTO", "PRECIO VENTA", "PVP", "PRECIO"],
+        "PRECIO NETO": ["PRECIO NETO", "NETO"],
+        "MARGEN LOCAL": ["MARGEN LOCAL"],
+        "MARGEN MELI 1": ["MARGEN MELI 1"],
+        "NETO MELI 1": ["NETO MELI 1", " NETO MELI 1"],
+        "MONTO EN SIMULACIÓN": ["MONTO EN SIMULACIÓN", "MONTO EN SIMULACION", "MONTO SIMULACION", "MONTO SIMULADO"],
+        "CAMPAÑA PADS": ["CAMPAÑA PADS"],
+        "MLC": ["MLC"],
+        "MLC SINCRONIZADO": ["MLC SINCRONIZADO", "MLC SINCRON.", "MLC SINCRONIZADO 1", "MLC SINCRON. 1", "MLC SINCRONIZADO.0"],
+        "PRECIO B2C PUBLICADO ": ["PRECIO B2C PUBLICADO ", "PRECIO B2C PUBLICADO", "PRECIO B2C 1"],
+        "FECHA VENCI": ["FECHA VENCI", "FECHA VENCI", "VENCIMIENTO", "CAMPAÑA 1"],
+        "COMENTARIO": ["COMENTARIO", "ADS/COMENTARIO", "ADS / COMENTARIO"],
+        "MARGEN MELI 2": ["MARGEN MELI 2"],
+        "NETO MELI 2": ["NETO MELI 2"],
+        "VENTA BRUTO MELI 2": ["VENTA BRUTO MELI 2"],
+        "MLC.1": ["MLC.1", "MLC 2"],
+        "MLC SINCRONIZADO.1": ["MLC SINCRONIZADO.1", "MLC SINCRONIZADO 2", "MLC SINCRON. 2", "MLC SINCRON.1"],
+        "CAMPAÑA PADS.1": ["CAMPAÑA PADS.1", "CAMPAÑA PADS 2"],
+        "PRECIO B2C": ["PRECIO B2C", "PRECIO B2C 2", "PRECIO B2C PUBLICADO"],
+        "FECHA VENCI.1": ["FECHA VENCI.1", "FECHA VENCI 2", "CAMPAÑA 2"],
+        "COMENTARIO.1": ["COMENTARIO.1", "COMENTARIO 2"],
+        "MARGEN MELI 3": ["MARGEN MELI 3"],
+        "NETO MELI 3": ["NETO MELI 3"],
+        "VENTA BRUTO MELI 3": ["VENTA BRUTO MELI 3"],
+        "CAMPAÑA PADS.2": ["CAMPAÑA PADS.2", "CAMPAÑA PADS 3"],
+        "MLC 3": ["MLC 3", "MLC.2"],
+        "MLC SINCRONIZADO 3": ["MLC SINCRONIZADO 3", "MLC SINCRON. 3"],
+        "PRECIO B2C.1": ["PRECIO B2C.1", "PRECIO B2C 3"],
+        "FECHA VENCI.2": ["FECHA VENCI.2", "FECHA VENCI 3", "CAMPAÑA 3"],
+        "COMENTARIO.2": ["COMENTARIO.2", "COMENTARIO 3"],
+        "MARGEN MELI 4": ["MARGEN MELI 4"],
+        "NETO MELI 4": ["NETO MELI 4"],
+        "VENTA BRUTO MELI 4": ["VENTA BRUTO MELI 4"],
+        "CAMPAÑA PADS.3": ["CAMPAÑA PADS.3", "CAMPAÑA PADS 4"],
+        "MLC 4": ["MLC 4", "MLC.3"],
+        "MLC SINCRONIZADO 4": ["MLC SINCRONIZADO 4", "MLC SINCRON. 4"],
+        "PRECIO B2C.2": ["PRECIO B2C.2", "PRECIO B2C 4"],
+        "FECHA VENCI.3": ["FECHA VENCI.3", "FECHA VENCI 4", "CAMPAÑA 4"],
+        "COMENTARIO.3": ["COMENTARIO.3", "COMENTARIO 4"],
+    }
+
+    for target, aliases in alias_sets.items():
+        found = pick_existing_column(df, *aliases)
+        if found is None:
+            df[target] = np.nan
+        elif found != target:
+            df[target] = df[found]
+
+    df["sku"] = df["SKU"].map(norm_sku)
+    df["descripcion"] = df["DESCRIPCIÓN"].fillna("").astype(str)
+    df["costo_maestra"] = df["ÚLTIMO COSTO"].map(safe_float)
+    df["precio_bruto"] = df["PRECIO BRUTO"].map(safe_float)
+    df["precio_neto"] = df["PRECIO NETO"].map(safe_float)
+    df["monto_sim"] = df["MONTO EN SIMULACIÓN"].map(safe_float)
+    df["margen_local_maestra"] = df["MARGEN LOCAL"].map(lambda x: safe_float(x) * 100 if abs(safe_float(x, np.nan)) <= 2 else safe_float(x))
+    for i in range(1, 5):
+        mm_col = f"MARGEN MELI {i}"
+        df[f"margen_meli{i}_maestra"] = df[mm_col].map(lambda x: safe_float(x) * 100 if abs(safe_float(x, np.nan)) <= 2 else safe_float(x))
+
+    for meta in _promo_slot_meta().values():
+        if meta["date"] not in df.columns:
+            df[meta["date"]] = pd.NaT
+        df[meta["date"]] = pd.to_datetime(df[meta["date"]], errors="coerce").dt.normalize()
+
+    for slot, meta in _promo_slot_meta().items():
+        df[f"mlc_{slot}"] = df[meta["mlc"]].map(norm_mlc)
+        df[f"mlc_sync_{slot}"] = df[meta["mlc_sync"]].map(norm_mlc)
+
+    ads_cols = [meta["pads"] for meta in _promo_slot_meta().values()]
+    df["ads_flag"] = False
+    for c in ads_cols:
+        if c in df.columns:
+            df["ads_flag"] = df["ads_flag"] | (df[c].astype(str).str.strip().ne("") & df[c].notna())
+
+    mlc_bridge = {}
+    if bridge_df is not None and not bridge_df.empty:
+        tmp = bridge_df.copy()
+        sku_col = pick_existing_column(tmp, "SKU", "CODIGO", "CÓDIGO") or tmp.columns[0]
+        mlc_col = pick_existing_column(tmp, "Número de publicación", "Numero de publicacion", "MLC", "PUBLICACION") or tmp.columns[-1]
+        tmp["sku"] = tmp[sku_col].map(norm_sku)
+        tmp["mlc"] = tmp[mlc_col].map(norm_mlc)
+        tmp = tmp[(tmp["sku"] != "") & (tmp["mlc"] != "")]
+        mlc_bridge = tmp.groupby("sku")["mlc"].apply(lambda s: sorted(set(s))).to_dict()
+
+    all_mlcs = []
+    for _, row in df.iterrows():
+        vals = []
+        for slot in _promo_slot_meta():
+            vals.extend([row.get(f"mlc_{slot}", ""), row.get(f"mlc_sync_{slot}", "")])
+        vals.extend(mlc_bridge.get(row["sku"], []))
+        vals = [v for v in vals if v]
+        all_mlcs.append(sorted(set(vals)))
+    df["mlcs"] = all_mlcs
+
+    return df[df["sku"] != ""].copy(), pd.DataFrame(columns=["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
+
+
+
+
+
+
+def _slot_field_names(slot: int) -> dict:
+    meta = _promo_slot_meta().get(slot, {})
+    return {
+        "mlc_col": f"mlc_{slot}",
+        "mlc_sync_col": f"mlc_sync_{slot}",
+        "margen_col": f"MARGEN MELI {slot}",
+        "neto_col": " NETO MELI 1" if slot == 1 else f"NETO MELI {slot}",
+        "venta_col": "MONTO EN SIMULACIÓN" if slot == 1 else f"VENTA BRUTO MELI {slot}",
+        "price_col": meta.get("price", ""),
+        "comment_col": meta.get("comment", ""),
+    }
+
+
+def expand_master_meli(master: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        "sku", "descripcion", "slot", "mlc", "mlc_sync",
+        "margen_meli_slot", "neto_meli_slot", "venta_bruto_meli_slot",
+        "precio_b2c_slot", "comentario_slot", "mlc_lookup"
+    ]
+    if master is None or not isinstance(master, pd.DataFrame) or master.empty:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for _, row in master.iterrows():
+        for slot in range(1, 5):
+            cfg = _slot_field_names(slot)
+            mlc = norm_mlc(row.get(cfg["mlc_col"], ""))
+            mlc_sync = norm_mlc(row.get(cfg["mlc_sync_col"], ""))
+            if not mlc and not mlc_sync:
+                continue
+
+            rows.append({
+                "sku": row.get("sku", ""),
+                "descripcion": row.get("descripcion", ""),
+                "slot": slot,
+                "mlc": mlc,
+                "mlc_sync": mlc_sync,
+                "margen_meli_slot": safe_float(row.get(cfg["margen_col"], np.nan)),
+                "neto_meli_slot": safe_float(row.get(cfg["neto_col"], np.nan)),
+                "venta_bruto_meli_slot": safe_float(row.get(cfg["venta_col"], np.nan)),
+                "precio_b2c_slot": safe_float(row.get(cfg["price_col"], np.nan)),
+                "comentario_slot": row.get(cfg["comment_col"], ""),
+                "mlc_lookup": mlc or mlc_sync,
             })
-            # Flush pequeño y controlado: evita que la auditoría quede solo local hasta el próximo click.
-            flush_backup_queue(limit=20)
-            try:
-                with db() as c:
-                    c.execute("UPDATE audit_events SET synced_to_sheets=1 WHERE event_key=?", (event_key,))
-                    c.commit()
-            except Exception:
-                pass
-    except Exception:
-        # La auditoría nunca debe botar el flujo operativo.
-        pass
+
+    out = pd.DataFrame(rows, columns=cols)
+    return out
 
 
-def get_audit_events(lote_id=None, limit=300) -> pd.DataFrame:
-    with db() as c:
-        if lote_id:
-            return pd.read_sql_query(
-                """
-                SELECT created_at, event_type, detail, qty, codigo_ml, sku, mode, usuario, source_module, item_id
-                FROM audit_events
-                WHERE lote_id=?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                c,
-                params=(int(lote_id), int(limit)),
-            )
-        return pd.read_sql_query(
-            """
-            SELECT created_at, lote_id, event_type, detail, qty, codigo_ml, sku, mode, usuario, source_module, item_id
-            FROM audit_events
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            c,
-            params=(int(limit),),
-        )
+def build_brecha_comercial_df(master: pd.DataFrame, master_meli: pd.DataFrame, publications: pd.DataFrame | None, politicas_ml: pd.DataFrame | None) -> pd.DataFrame:
+    cols = [
+        "sku", "descripcion", "slot", "mlc", "mlc_sync", "status_publicacion",
+        "monto_sim", "ingreso_referencia_comercial", "brecha_monto_sim_pct",
+        "costo_ml_politica_2026", "margen_ml_reportado"
+    ]
+    if master is None or master.empty:
+        return pd.DataFrame(columns=cols)
 
+    base_master = master[["sku", "descripcion", "monto_sim", "costo_maestra"]].copy()
+    if master_meli is None or master_meli.empty:
+        out = base_master.copy()
+        out["slot"] = np.nan
+        out["mlc"] = ""
+        out["mlc_sync"] = ""
+        out["status_publicacion"] = ""
+        out["ingreso_referencia_comercial"] = np.nan
+        out["brecha_monto_sim_pct"] = np.nan
+        out["costo_ml_politica_2026"] = np.nan
+        out["margen_ml_reportado"] = np.nan
+        return out[cols]
 
-def get_recent_scans(lote_id: int, limit: int = 8) -> pd.DataFrame:
-    with db() as c:
-        return pd.read_sql_query(
-            """
-            SELECT s.created_at, i.descripcion, i.codigo_ml, i.sku, s.cantidad, s.modo
-            FROM scans s
-            LEFT JOIN items i ON i.id=s.item_id
-            WHERE s.lote_id=?
-            ORDER BY s.id DESC
-            LIMIT ?
-            """,
-            c,
-            params=(int(lote_id), int(limit)),
-        )
+    out = master_meli.merge(base_master, on=["sku", "descripcion"], how="left")
 
+    if publications is not None and not publications.empty:
+        pubs = publications.copy()
+        pubs["status_rank"] = np.where(pubs["status"].astype(str).str.upper().eq("ACTIVA"), 0, 1)
+        pubs["ventas_rank"] = pd.to_numeric(pubs["ventas_hist_pub"], errors="coerce").fillna(0)
+        pubs = pubs.sort_values(["mlc", "status_rank", "ventas_rank"], ascending=[True, True, False])
+        pubs = pubs.drop_duplicates(subset=["mlc"], keep="first")
+        pubs_match = pubs[["mlc", "status", "ingreso_estimado_ml", "precio_final", "total_cargo_pct", "costo_fijo"]].copy()
+        pubs_match = pubs_match.rename(columns={
+            "status": "status_publicacion",
+            "ingreso_estimado_ml": "ingreso_estimado_ml_pub",
+            "precio_final": "precio_ml_actual_pub",
+            "total_cargo_pct": "total_cargo_pct_ml_pub",
+            "costo_fijo": "costo_fijo_ml_pub",
+        })
+        out = out.merge(pubs_match, left_on="mlc_lookup", right_on="mlc", how="left", suffixes=("", "_pub"))
+    else:
+        out["status_publicacion"] = ""
+        out["ingreso_estimado_ml_pub"] = np.nan
+        out["precio_ml_actual_pub"] = np.nan
+        out["total_cargo_pct_ml_pub"] = np.nan
+        out["costo_fijo_ml_pub"] = np.nan
 
-def render_scan_incident_button(lote_id: int, items: pd.DataFrame, current_item=None):
-    """Incidencias creadas desde terreno.
-    El operador reporta el problema en el mismo flujo de escaneo; supervisor solo gestiona/resuelve.
-    """
-    current_item_id = None
-    current_label = ""
-    if current_item is not None:
-        try:
-            current_item_id = int(current_item.get("id"))
-            current_label = f"Producto actual: {clean_text(current_item.get('descripcion',''))[:80]} | ML {clean_text(current_item.get('codigo_ml',''))} | SKU {clean_text(current_item.get('sku',''))}"
-        except Exception:
-            current_item_id = None
-            current_label = ""
+    policy_fields = [
+        "precio_venta_politica", "costo_total_antiguo", "costo_nuevo_menvios", "costo_nuevo_flex",
+        "costo_nuevo_full_flex", "costo_nuevo_full_super", "diferencia_politica_clp",
+        "diferencia_politica_pct_precio", "impacto_politica", "metodo_envio_politica",
+        "titulo_politica", "costo_ml_politica_2026", "ingreso_simulado_ml_2026"
+    ]
+    for field in policy_fields:
+        out[field] = np.nan
 
-    with st.expander("Reportar incidencia", expanded=False):
-        st.caption("Usa esto en el momento exacto del problema. Queda registrado para que Supervisor lo resuelva antes del cierre.")
-        source_options = []
-        option_map = {}
-        if current_item_id:
-            source_options.append(current_label)
-            option_map[current_label] = current_item_id
-        source_options.append("Incidencia general del lote")
-        option_map["Incidencia general del lote"] = None
+    if politicas_ml is not None and not politicas_ml.empty:
+        pol = politicas_ml.copy()
+        pol_mlc = pol[pol["mlc"].astype(str).str.strip() != ""].copy()
+        if not pol_mlc.empty:
+            pol_mlc = pol_mlc.sort_values(["mlc", "costo_ml_politica_2026"], ascending=[True, True], na_position="last")
+            pol_mlc = pol_mlc.drop_duplicates(subset=["mlc"], keep="first")
+            pol_mlc = pol_mlc.rename(columns={c: f"{c}_mlc" for c in pol_mlc.columns if c != "mlc"})
+            out = out.merge(pol_mlc, left_on="mlc_lookup", right_on="mlc", how="left")
+        pol_sku = pol[pol["sku"].astype(str).str.strip() != ""].copy()
+        if not pol_sku.empty:
+            pol_sku = pol_sku.sort_values(["sku", "costo_ml_politica_2026"], ascending=[True, True], na_position="last")
+            pol_sku = pol_sku.drop_duplicates(subset=["sku"], keep="first")
+            pol_sku = pol_sku.rename(columns={c: f"{c}_sku" for c in pol_sku.columns if c != "sku"})
+            out = out.merge(pol_sku, on="sku", how="left")
+        for field in policy_fields:
+            mlc_col = f"{field}_mlc"
+            sku_col = f"{field}_sku"
+            if mlc_col in out.columns:
+                out[field] = out[mlc_col]
+            if sku_col in out.columns:
+                out[field] = out[field].where(out[field].notna(), out[sku_col])
 
-        if items is not None and not items.empty:
-            source_options.append("Seleccionar otro producto")
-
-        with st.form("scan_incident_form", clear_on_submit=True):
-            selected_source = st.radio("Asociar incidencia a", source_options, horizontal=False, key="scan_inc_source")
-            selected_item_id = option_map.get(selected_source)
-
-            if selected_source == "Seleccionar otro producto":
-                choices = []
-                choice_map = {}
-                work = items.copy()
-                work["pendiente"] = (work["unidades"].astype(int) - work["acopiadas"].astype(int)).clip(lower=0)
-                work = work.sort_values(["pendiente", "descripcion"], ascending=[False, True])
-                for _, r in work.iterrows():
-                    label = f"{clean_text(r.get('descripcion',''))[:75]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))} | Pend: {int(r.get('pendiente') or 0)}"
-                    choices.append(label)
-                    choice_map[label] = int(r["id"])
-                picked = st.selectbox("Producto", choices, key="scan_inc_item_select") if choices else None
-                selected_item_id = choice_map.get(picked) if picked else None
-
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS, key="scan_inc_tipo")
-            with c2:
-                qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=9999, value=0, step=1, key="scan_inc_qty")
-            usuario_inc = st.text_input("Usuario que reporta", key="scan_inc_usuario", placeholder="Ej: p1, p2, supervisor")
-            comentario_inc = st.text_area("Comentario", key="scan_inc_comentario", placeholder="Describe qué ocurrió: falta, daño, diferencia, etiqueta, etc.")
-            submit_inc = st.form_submit_button("Guardar incidencia", type="primary")
-
-        if submit_inc:
-            if not clean_text(usuario_inc):
-                st.error("Ingresa el usuario que reporta la incidencia.")
-            elif len(clean_text(comentario_inc)) < 3:
-                st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
-            else:
-                create_incidencia(lote_id, selected_item_id, tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
-                st.success("Incidencia registrada para revisión de Supervisor.")
-                st.rerun()
-
-
-# ============================================================
-# Fase 2: Supervisor, incidencias, reimpresión controlada y cierre
-# ============================================================
-
-INCIDENCIA_TIPOS = [
-    "Falta producto",
-    "Producto dañado",
-    "Código no coincide",
-    "Cantidad menor",
-    "Cantidad mayor",
-    "Etiqueta dañada",
-    "Problema de impresión",
-    "Otro",
-]
-
-
-def get_operator_name() -> str:
-    return clean_text(st.session_state.get("operator_name", "")) or "SIN_USUARIO"
-
-
-def get_incidencias(lote_id=None, status=None) -> pd.DataFrame:
-    with db() as c:
-        where = []
-        params = []
-        if lote_id:
-            where.append("inc.lote_id=?")
-            params.append(int(lote_id))
-        if status and clean_text(status) != "Todas":
-            where.append("inc.status=?")
-            params.append(clean_text(status))
-        sql_where = ("WHERE " + " AND ".join(where)) if where else ""
-        return pd.read_sql_query(
-            f"""
-            SELECT inc.id, inc.created_at, inc.lote_id, inc.item_id, inc.tipo, inc.cantidad,
-                   inc.comentario, inc.usuario, inc.status, inc.resolved_at, inc.resolved_by,
-                   inc.resolution_comment, i.codigo_ml, i.sku, i.descripcion
-            FROM incidencias inc
-            LEFT JOIN items i ON i.id=inc.item_id
-            {sql_where}
-            ORDER BY inc.id DESC
-            """,
-            c,
-            params=params,
-        )
-
-
-def create_incidencia(lote_id: int, item_id, tipo: str, cantidad: int, comentario: str, usuario: str):
-    now = datetime.now().isoformat(timespec="seconds")
-    item = {}
-    if item_id:
-        with db() as c:
-            row = c.execute("SELECT * FROM items WHERE id=? AND lote_id=?", (int(item_id), int(lote_id))).fetchone()
-            item = dict(row) if row else {}
-    with db() as c:
-        c.execute(
-            """
-            INSERT INTO incidencias
-            (lote_id, item_id, tipo, cantidad, comentario, usuario, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'ABIERTA', ?)
-            """,
-            (
-                int(lote_id),
-                int(item_id) if item_id else None,
-                clean_text(tipo),
-                max(0, int(cantidad or 0)),
-                clean_text(comentario),
-                clean_text(usuario) or "SIN_USUARIO",
-                now,
+    out["ingreso_referencia_comercial"] = np.where(
+        out["ingreso_simulado_ml_2026"].notna(),
+        out["ingreso_simulado_ml_2026"],
+        out["ingreso_estimado_ml_pub"]
+    )
+    out["brecha_monto_sim_pct"] = np.where(
+        out["monto_sim"].notna() & out["ingreso_referencia_comercial"].notna() & (out["monto_sim"] != 0),
+        ((out["ingreso_referencia_comercial"] - out["monto_sim"]) / out["monto_sim"]) * 100,
+        np.nan
+    )
+    out["margen_ml_reportado"] = np.where(
+        out["precio_ml_actual_pub"].notna() & out["costo_maestra"].notna(),
+        out.apply(
+            lambda r: calc_margin_from_ml_price(
+                r.get("costo_maestra", np.nan),
+                r.get("precio_ml_actual_pub", np.nan),
+                r.get("total_cargo_pct_ml_pub", np.nan),
+                r.get("costo_fijo_ml_pub", np.nan),
+                0.0
             ),
-        )
-        c.commit()
-
-    log_audit_event(
-        lote_id,
-        int(item_id) if item_id else None,
-        "INCIDENCIA_ABIERTA",
-        f"{clean_text(tipo)} · {clean_text(comentario)}",
-        max(0, int(cantidad or 0)),
-        item.get("codigo_ml", ""),
-        item.get("sku", ""),
-        clean_text(usuario) or "SIN_USUARIO",
+            axis=1
+        ),
+        np.nan
     )
 
+    for col in ["status_publicacion", "mlc", "mlc_sync"]:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].fillna("").astype(str)
 
-def resolve_incidencia(incidencia_id: int, usuario: str, comentario: str):
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as c:
-        inc = c.execute("SELECT * FROM incidencias WHERE id=?", (int(incidencia_id),)).fetchone()
-        if not inc:
-            return False, "Incidencia no encontrada."
-        if clean_text(inc["status"]) == "RESUELTA":
-            return False, "La incidencia ya estaba resuelta."
-        c.execute(
-            """
-            UPDATE incidencias
-            SET status='RESUELTA', resolved_at=?, resolved_by=?, resolution_comment=?
-            WHERE id=?
-            """,
-            (now, clean_text(usuario) or "SIN_USUARIO", clean_text(comentario), int(incidencia_id)),
-        )
-        c.commit()
-    log_audit_event(int(inc["lote_id"]), inc["item_id"], "INCIDENCIA_RESUELTA", clean_text(comentario), inc["cantidad"], mode=clean_text(usuario) or "SIN_USUARIO")
-    return True, "Incidencia resuelta."
+    out = out.sort_values(["brecha_monto_sim_pct", "ingreso_referencia_comercial"], ascending=[False, False], na_position="last")
+    return out[cols].copy()
 
 
-def get_reimpresiones(lote_id=None) -> pd.DataFrame:
-    with db() as c:
-        if lote_id:
-            return pd.read_sql_query(
-                """
-                SELECT r.created_at, r.scope, r.block_index, r.item_id, r.cantidad, r.motivo, r.usuario,
-                       i.codigo_ml, i.sku, i.descripcion
-                FROM reimpresiones r
-                LEFT JOIN items i ON i.id=r.item_id
-                WHERE r.lote_id=?
-                ORDER BY r.id DESC
-                """,
-                c,
-                params=(int(lote_id),),
+def ensure_promos_schema(promos_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"]
+    if promos_df is None or not isinstance(promos_df, pd.DataFrame):
+        return pd.DataFrame(columns=cols)
+    df = promos_df.copy()
+    for col in cols:
+        if col not in df.columns:
+            df[col] = np.nan if col not in ["sku", "descripcion", "mlc", "campana_ads", "comentario", "status"] else ""
+    return df[cols]
+
+
+def normalize_control_promos(control_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"]
+    return pd.DataFrame(columns=cols)
+
+
+def control_promos_to_sheet_df(control_df: pd.DataFrame) -> pd.DataFrame:
+    return control_df.copy() if isinstance(control_df, pd.DataFrame) else pd.DataFrame()
+
+
+def normalize_rel(rel_df):
+    if rel_df is None or rel_df.empty:
+        return pd.DataFrame(columns=["sku", "descripcion", "precio_b2c", "tipo", "estado"])
+    df = rel_df.copy()
+    while df.shape[1] < 6:
+        df[df.shape[1]] = np.nan
+    df = df.iloc[:, :6]
+    df.columns = ["SKU_raw", "descripcion", "precio_b2c", "extra", "tipo", "estado"]
+    df["sku"] = df["SKU_raw"].map(norm_sku)
+    df["precio_b2c"] = df["precio_b2c"].map(safe_float)
+    df = df[df["sku"] != ""].copy()
+    return df[["sku", "descripcion", "precio_b2c", "tipo", "estado"]]
+
+
+@st.cache_data(show_spinner=False)
+def load_sales(file_bytes: bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes))
+    raw = raw.copy()
+    for col in ["SKU", "Fecha", "Vendedor", "Documento", "Cantidad", "Precio Un.", "Total Línea", "Producto", "Rut", "Razón Social"]:
+        if col not in raw.columns:
+            raw[col] = np.nan
+    raw["sku"] = raw["SKU"].map(norm_sku)
+    raw["fecha"] = pd.to_datetime(raw["Fecha"], errors="coerce", dayfirst=True).dt.normalize()
+    raw["canal"] = raw["Vendedor"].apply(detect_channel)
+    raw["tipo_cliente"] = raw["Documento"].apply(detect_buyer_type)
+    raw["cantidad"] = raw["Cantidad"].map(safe_float)
+    raw["precio_unitario"] = raw["Precio Un."].map(safe_float)
+    raw["total_linea"] = raw["Total Línea"].map(safe_float)
+    raw["producto"] = raw["Producto"].fillna("").astype(str)
+    raw["rut"] = raw["Rut"].fillna("").astype(str)
+    raw["cliente"] = raw["Razón Social"].fillna("").astype(str)
+    raw = raw[raw["sku"] != ""].copy()
+    return raw
+
+
+@st.cache_data(show_spinner=False)
+def load_purchases(file_bytes: bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes))
+    raw = raw.copy()
+    for col in ["SKU", "Fecha", "Razón Social", "Precio Un.", "Cantidad", "Documento", "Folio"]:
+        if col not in raw.columns:
+            raw[col] = np.nan
+    raw["sku"] = raw["SKU"].map(norm_sku)
+    raw["fecha"] = pd.to_datetime(raw["Fecha"], errors="coerce", dayfirst=True).dt.normalize()
+    raw["proveedor"] = raw["Razón Social"].fillna("").astype(str)
+    raw["precio_unitario"] = raw["Precio Un."].map(safe_float)
+    raw["cantidad"] = raw["Cantidad"].map(safe_float)
+    raw["documento"] = raw["Documento"].fillna("").astype(str)
+    raw["folio"] = raw["Folio"].fillna("").astype(str)
+    raw = raw[raw["sku"] != ""].copy()
+    return raw
+
+
+@st.cache_data(show_spinner=False)
+def load_publications(file_bytes: bytes):
+    raw = pd.read_excel(io.BytesIO(file_bytes))
+    raw = raw.copy()
+    rename = {
+        "Id": "mlc",
+        "SKU": "sku",
+        "Título": "titulo",
+        "Comision": "comision_pct",
+        "Cargo cuotas": "cargo_cuotas_pct",
+        "Total cargo": "total_cargo_pct",
+        "Total cargo $": "total_cargo_monto",
+        "Costo fijo": "costo_fijo",
+        "Precio Final": "precio_final",
+        "Precio Base": "precio_base",
+        "Precio Oferta": "precio_oferta",
+        "Ventas": "ventas_hist_pub",
+        "Cantidad": "cantidad_pub",
+        "Full": "full_stock",
+        "Calidad": "calidad",
+        "Categoría": "categoria",
+        "Nombre Categoría": "categoria_nombre",
+        "Fecha creación": "fecha_creacion",
+        "Días publicados": "dias_publicado",
+        "Ventas/Días pub.": "ventas_por_dia_pub",
+        "Stock Real": "stock_real",
+        "Status": "status",
+        "Entrega": "entrega",
+        "Dimensiones": "dimensiones_raw",
+        "Link": "link",
+    }
+    for src, dst in rename.items():
+        if src in raw.columns:
+            raw[dst] = raw[src]
+        else:
+            raw[dst] = np.nan
+
+    raw["sku"] = raw["sku"].map(norm_sku)
+    raw["mlc"] = raw["mlc"].map(norm_mlc)
+    raw["fecha_creacion"] = pd.to_datetime(raw["fecha_creacion"], errors="coerce", dayfirst=True).dt.normalize()
+    for c in ["comision_pct", "cargo_cuotas_pct", "total_cargo_pct", "total_cargo_monto", "costo_fijo", "precio_final", "precio_base",
+              "precio_oferta", "ventas_hist_pub", "cantidad_pub", "full_stock", "calidad", "dias_publicado", "ventas_por_dia_pub", "stock_real"]:
+        raw[c] = raw[c].map(safe_float)
+    dims = raw["dimensiones_raw"].apply(parse_dimensions).apply(pd.Series)
+    raw = pd.concat([raw, dims], axis=1)
+    raw["ingreso_estimado_ml"] = raw["precio_final"].map(safe_float) - raw["total_cargo_monto"].map(safe_float).fillna(0) - raw["costo_fijo"].map(safe_float).fillna(0)
+    raw = raw[raw["sku"] != ""].copy()
+    return raw
+
+
+@st.cache_data(show_spinner=False)
+def load_product_ads(file_bytes: bytes):
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por anuncios", header=1)
+    df = df.copy()
+    cols = {
+        "Campaña": "campana",
+        "Título de anuncio": "titulo",
+        "Número de \npublicación": "mlc",
+        "Estado": "estado",
+        "Impresiones": "impresiones",
+        "Clics": "clics",
+        "Ingresos\n(Moneda local)": "ingresos_ads",
+        "Inversión\n(Moneda local)": "inversion_ads",
+        "ACOS\n(Inversión / Ingresos)": "acos",
+        "ROAS\n(Ingresos / Inversión)": "roas",
+        "Ventas por publicidad\n(Directas + Indirectas)": "ventas_ads",
+    }
+    out = pd.DataFrame()
+    for src, dst in cols.items():
+        out[dst] = df[src] if src in df.columns else np.nan
+    out["mlc"] = out["mlc"].map(norm_mlc)
+    for c in ["impresiones", "clics", "ingresos_ads", "inversion_ads", "acos", "roas", "ventas_ads"]:
+        out[c] = out[c].map(safe_float)
+    out = out[out["mlc"] != ""].copy()
+    return out
+
+
+
+
+@st.cache_data(show_spinner=False)
+def load_postventa(file_bytes: bytes):
+    file_bytes = _coerce_excel_bytes(file_bytes, "el reporte de ventas con problemas")
+    # Mercado Libre suele exportar este archivo con dos filas previas y header real en la fila 3
+    df = pd.read_excel(io.BytesIO(file_bytes), header=2)
+    df = df.copy()
+    rename_map = {
+        "Fecha de la venta": "fecha_venta_raw",
+        "# de la venta": "nro_venta",
+        "Título de la publicación": "titulo_publicacion",
+        "Variable": "variable",
+        "Tipo de problema": "tipo_problema",
+        "Detalle del problema": "detalle_problema",
+        "Número de reclamo": "nro_reclamo",
+        "Fecha del reclamo": "fecha_reclamo_raw",
+        "Reputación": "reputacion",
+        "Exclusión": "exclusion",
+    }
+    for src_col, dst_col in rename_map.items():
+        if src_col in df.columns:
+            df[dst_col] = df[src_col]
+        elif dst_col not in df.columns:
+            df[dst_col] = np.nan
+
+    # Quitar filas basura si quedaron encabezados repetidos
+    df = df[df["nro_venta"].astype(str).str.upper().ne("# DE LA VENTA")].copy()
+
+    meses = {
+        "ene": "Jan", "feb": "Feb", "mar": "Mar", "abr": "Apr", "may": "May", "jun": "Jun",
+        "jul": "Jul", "ago": "Aug", "sep": "Sep", "oct": "Oct", "nov": "Nov", "dic": "Dec"
+    }
+
+    def parse_ml_datetime(value):
+        if pd.isna(value):
+            return pd.NaT
+        s = str(value).strip()
+        if not s:
+            return pd.NaT
+        s = re.sub(r"^(Lunes|Martes|Miércoles|Miercoles|Jueves|Viernes|Sábado|Sabado|Domingo)\s+", "", s, flags=re.I)
+        s = s.replace("hs", "").replace("  ", " ").strip()
+        for es, en in meses.items():
+            s = re.sub(rf"\b{es}\b", en, s, flags=re.I)
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+        return dt
+
+    df["fecha_venta"] = df["fecha_venta_raw"].apply(parse_ml_datetime)
+    df["fecha_reclamo"] = df["fecha_reclamo_raw"].apply(parse_ml_datetime)
+    df["titulo_publicacion"] = df["titulo_publicacion"].fillna("").astype(str)
+    df["detalle_problema"] = df["detalle_problema"].fillna("").astype(str)
+    df["tipo_problema"] = df["tipo_problema"].fillna("").astype(str)
+    df["reputacion"] = df["reputacion"].fillna("").astype(str)
+    df["exclusion"] = df["exclusion"].fillna("").astype(str)
+    df["variable"] = df["variable"].fillna("").astype(str)
+    df["nro_venta"] = df["nro_venta"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+    df["nro_reclamo"] = df["nro_reclamo"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
+
+    # Tipo de caso base
+    df["tipo_caso"] = np.where(df["nro_reclamo"].str.strip().eq("") | df["nro_reclamo"].str.lower().eq("nan"), "Cancelación", "Reclamo")
+
+    rep_upper = df["reputacion"].str.upper()
+    exc_upper = df["exclusion"].str.upper()
+    df["afecta_reputacion"] = (
+        rep_upper.str.contains("AFECTA", na=False)
+        & ~rep_upper.str.contains("NO AFECTA", na=False)
+        & ~exc_upper.str.contains("NO AFECTA", na=False)
+    )
+
+    df["dias_activacion"] = (df["fecha_reclamo"] - df["fecha_venta"]).dt.total_seconds() / 86400.0
+    df["dias_activacion"] = df["dias_activacion"].where(df["dias_activacion"] >= 0, np.nan)
+
+    keep_cols = [
+        "fecha_venta", "nro_venta", "titulo_publicacion", "variable", "tipo_caso",
+        "tipo_problema", "detalle_problema", "nro_reclamo", "fecha_reclamo",
+        "reputacion", "exclusion", "afecta_reputacion", "dias_activacion"
+        ]
+    out = df[keep_cols].copy()
+    out = out[~out["nro_venta"].astype(str).str.strip().eq("")].copy()
+    return out
+
+
+def _normalize_title_for_match(value: str) -> str:
+    s = str(value or "").upper()
+    repl = {
+        "Á":"A","É":"E","Í":"I","Ó":"O","Ú":"U","Ñ":"N",
+        "-":" ","_":" ","/":" ","(":" ",")":" ","[":" ","]":" ",
+        ".":" ",",":" ",":":" ",";":" "
+    }
+    for a,b in repl.items():
+        s = s.replace(a,b)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _classify_evitabilidad(tipo_problema: str, detalle: str):
+    t = str(tipo_problema or "").upper()
+    d = str(detalle or "").upper()
+    txt = f"{t} {d}"
+
+    if any(k in txt for k in [
+        "ARREPINT", "NO LO QUIERO", "NO ERA LO QUE BUSCABA", "COMPRO POR ERROR", "NO RECONOZCO LA COMPRA"
+    ]):
+        return "BAJA", "Decisión del cliente", "Monitorear ficha y expectativas; no es prioridad operativa", "CLIENTE"
+
+    if any(k in txt for k in [
+        "FALTA", "FALTANTE", "LLEGARON MENOS", "MENOS UNIDADES", "INCOMPLETO",
+        "PRODUCTO EQUIVOCADO", "DIFERENTE AL PUBLICADO", "DIFERENTE AL COMPRADO",
+        "NO FUNCIONA", "DEFECTUOS", "ROTO", "QUEBRADO", "ABOLLADO", "DANAD", "DAÑAD",
+        "SIN TORNILLOS", "SIN PIEZAS", "PAQUETE VACIO", "VACIO", "PREPARAR LA VENTA", "GESTIONAR O PREPARAR"
+    ]):
+        return "ALTA", "Falla interna / producto / preparación", "Revisar picking, embalaje, control de calidad y ficha", "INTERNO"
+
+    if any(k in txt for k in [
+        "DESPACH", "ENTREGA", "DEMORA", "ATRASO", "NO LLEGO", "TRANSPORTE", "LOGIST"
+    ]):
+        return "MEDIA", "Logística / última milla", "Revisar modalidad logística, embalaje y promesa de entrega", "LOGISTICA"
+
+    if any(k in txt for k in ["OTROS MOTIVOS", "POR OTROS MOTIVOS"]):
+        return "MEDIA", "Causa no estructurada", "Revisar detalle y reclasificar en lote", "OTRO"
+
+    return "MEDIA", "Sin clasificar claramente", "Revisar detalle del caso", "OTRO"
+
+
+def build_postventa_module(postventa: pd.DataFrame, pubs: pd.DataFrame) -> dict:
+    empty = {
+        "enriched": pd.DataFrame(),
+        "resumen": {},
+        "evitabilidad": pd.DataFrame(),
+        "reincidencias": pd.DataFrame(),
+        "publicaciones": pd.DataFrame(),
+    }
+    if postventa is None or not isinstance(postventa, pd.DataFrame) or postventa.empty:
+        return empty
+
+    pv = postventa.copy()
+    pv["titulo_norm"] = pv["titulo_publicacion"].apply(_normalize_title_for_match)
+
+    pubs_work = pubs.copy() if isinstance(pubs, pd.DataFrame) else pd.DataFrame()
+    if pubs_work.empty:
+        pv["sku"] = ""
+        pv["mlc"] = ""
+        pv["status_pub"] = ""
+        pv["entrega_pub"] = ""
+        pv["full_pub"] = np.nan
+        pv["precio_final_pub"] = np.nan
+        pv["match_publicacion"] = False
+    else:
+        pubs_work["titulo_norm"] = pubs_work["titulo"].fillna("").astype(str).apply(_normalize_title_for_match)
+        pubs_work["ventas_hist_pub"] = pd.to_numeric(pubs_work.get("ventas_hist_pub"), errors="coerce").fillna(0)
+        pubs_work["status_rank"] = np.where(pubs_work.get("status", pd.Series(dtype=str)).astype(str).str.upper().eq("ACTIVA"), 0, 1)
+        pubs_work = pubs_work.sort_values(["titulo_norm", "status_rank", "ventas_hist_pub"], ascending=[True, True, False])
+        pubs_match = pubs_work.drop_duplicates(subset=["titulo_norm"], keep="first")[
+            ["titulo_norm", "sku", "mlc", "status", "entrega", "full_stock", "precio_final"]
+        ].copy()
+        pubs_match = pubs_match.rename(columns={
+            "status": "status_pub",
+            "entrega": "entrega_pub",
+            "full_stock": "full_pub",
+            "precio_final": "precio_final_pub",
+        })
+        pv = pv.merge(pubs_match, on="titulo_norm", how="left")
+        for col in ["sku", "mlc", "status_pub", "entrega_pub"]:
+            if col not in pv.columns:
+                pv[col] = ""
+            pv[col] = pv[col].fillna("").astype(str)
+        pv["match_publicacion"] = pv["mlc"].astype(str).str.strip().ne("")
+
+    clasif = pv.apply(lambda r: pd.Series(_classify_evitabilidad(r.get("tipo_problema"), r.get("detalle_problema")),
+                                          index=["evitabilidad", "causa_probable", "accion_sugerida", "familia_problema"]), axis=1)
+    pv = pd.concat([pv, clasif], axis=1)
+
+    # Reincidencia por venta
+    casos_por_venta = pv.groupby("nro_venta").size().rename("casos_por_venta").reset_index()
+    pv = pv.merge(casos_por_venta, on="nro_venta", how="left")
+    pv["es_reincidente"] = pv["casos_por_venta"].fillna(0) > 1
+
+    resumen = {
+        "casos_totales": int(len(pv)),
+        "pct_reputacion": float(pv["afecta_reputacion"].mean() * 100) if len(pv) else np.nan,
+        "dias_activacion": float(pv["dias_activacion"].dropna().mean()) if pv["dias_activacion"].notna().any() else np.nan,
+        "pct_reincidencia": float(pv["es_reincidente"].mean() * 100) if len(pv) else np.nan,
+        "pct_evitabilidad_alta": float(pv["evitabilidad"].eq("ALTA").mean() * 100) if len(pv) else np.nan,
+        "pct_match_publicaciones": float(pv["match_publicacion"].mean() * 100) if len(pv) else np.nan,
+    }
+
+    evit = (
+        pv.groupby(["evitabilidad", "familia_problema", "causa_probable", "accion_sugerida"], dropna=False)
+          .agg(
+              casos=("nro_venta", "size"),
+              pct_reputacion=("afecta_reputacion", lambda s: float(s.mean()*100) if len(s) else np.nan),
+              dias_activacion=("dias_activacion", "mean"),
+              pct_match=("match_publicacion", lambda s: float(s.mean()*100) if len(s) else np.nan),
+          )
+          .reset_index()
+          .sort_values(["casos", "pct_reputacion"], ascending=[False, False])
+    )
+
+    reinc = (
+        pv.groupby(["nro_venta", "titulo_publicacion"], dropna=False)
+          .agg(
+              casos=("nro_venta", "size"),
+              tipos=("tipo_problema", lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:3])),
+              detalles=("detalle_problema", lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:2])),
+              reputacion=("afecta_reputacion", lambda s: "Sí" if s.any() else "No"),
+              mlc=("mlc", lambda s: pd.Series(s).dropna().astype(str).iloc[0] if pd.Series(s).dropna().size else ""),
+              sku=("sku", lambda s: pd.Series(s).dropna().astype(str).iloc[0] if pd.Series(s).dropna().size else ""),
+          )
+          .reset_index()
+    )
+    reinc = reinc[reinc["casos"] > 1].sort_values(["casos", "titulo_publicacion"], ascending=[False, True])
+
+    pubs_rank = (
+        pv.groupby(["titulo_publicacion", "mlc", "sku", "status_pub", "entrega_pub"], dropna=False)
+          .agg(
+              casos=("nro_venta", "size"),
+              pct_reputacion=("afecta_reputacion", lambda s: float(s.mean()*100) if len(s) else np.nan),
+              pct_evitabilidad_alta=("evitabilidad", lambda s: float(pd.Series(s).eq("ALTA").mean()*100) if len(s) else np.nan),
+              dias_activacion=("dias_activacion", "mean"),
+          )
+          .reset_index()
+          .sort_values(["pct_evitabilidad_alta", "casos", "pct_reputacion"], ascending=[False, False, False])
+    )
+
+    return {
+        "enriched": pv,
+        "resumen": resumen,
+        "evitabilidad": evit,
+        "reincidencias": reinc,
+        "publicaciones": pubs_rank,
+    }
+
+
+
+
+@st.cache_data(show_spinner=False)
+def load_politicas_ml(file_bytes: bytes):
+    file_bytes = _coerce_excel_bytes(file_bytes, "el archivo de políticas ML 2026")
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
+    sheet = None
+    for wanted in ["ANALISIS_2026", "ANALISIS 2026", "ANALISIS", "ANÁLISIS_2026"]:
+        found = _find_sheet(xls.sheet_names, wanted)
+        if found:
+            sheet = found
+            break
+    if not sheet:
+        raise ValueError("No encontré la hoja 'ANALISIS_2026' en el archivo de políticas ML.")
+
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet, engine="openpyxl")
+    df = df.copy()
+
+    # Normalización flexible de columnas
+    alias_map = {
+        "mlc": ["MLC", "Id", "ID", "Número de publicación", "Numero de publicacion", "N° Publicación"],
+        "sku": ["SKU", "Sku", "Cod SKU", "Código", "Codigo"],
+        "titulo_politica": ["Título", "Titulo", "Título de la publicación", "Publicación", "Publicacion"],
+        "metodo_envio_politica": ["Método envío", "Metodo envio", "Método de envío", "Metodo de envio", "Método envío actual"],
+        "precio_venta_politica": ["Precio venta", "Precio de venta", "Precio", "Precio actual"],
+        "costo_total_antiguo": ["Costo total antiguo", "Costo antiguo", "Costo actual", "Costo total actual"],
+        "costo_nuevo_menvios": ["Costo nuevos M.Envíos", "Costo nuevo M.Envíos", "Costo nuevos M.Envios", "Costo nuevo M.Envios"],
+        "costo_nuevo_flex": ["Costo nuevo Flex", "Costo nuevos Flex"],
+        "costo_nuevo_full_flex": ["Costo nuevo Full + Flex", "Costo nuevos Full + Flex", "Costo nuevo Full+Flex"],
+        "costo_nuevo_full_super": ["Costo nuevo Full Súper", "Costo nuevo Full Super", "Costo nuevos Full Súper", "Costo nuevos Full Super"],
+        "diferencia_politica_clp": ["Diferencia $", "Diferencia CLP", "Cambio total $"],
+        "diferencia_politica_pct_precio": ["Diferencia % precio", "Diferencia %", "Cambio % precio"],
+        "impacto_politica": ["Impacto", "Impacto política", "Impacto politica"],
+        "modalidad_recomendada_2026": ["Modalidad recomendada", "Modalidad", "Tramo peso aplicado", "Método recomendado"],
+    }
+
+    canon = {_canon_label(c): c for c in df.columns}
+    for target, aliases in alias_map.items():
+        found = None
+        for a in aliases:
+            if _canon_label(a) in canon:
+                found = canon[_canon_label(a)]
+                break
+        if found is None:
+            df[target] = np.nan
+        elif found != target:
+            df[target] = df[found]
+
+    # Tipos base
+    df["mlc"] = df["mlc"].map(norm_mlc)
+    df["sku"] = df["sku"].map(norm_sku)
+    df["titulo_politica"] = df["titulo_politica"].fillna("").astype(str)
+    df["metodo_envio_politica"] = df["metodo_envio_politica"].fillna("").astype(str)
+    df["impacto_politica"] = df["impacto_politica"].fillna("").astype(str)
+    df["modalidad_recomendada_2026"] = df["modalidad_recomendada_2026"].fillna("").astype(str)
+
+    num_cols = [
+        "precio_venta_politica", "costo_total_antiguo", "costo_nuevo_menvios",
+        "costo_nuevo_flex", "costo_nuevo_full_flex", "costo_nuevo_full_super",
+        "diferencia_politica_clp", "diferencia_politica_pct_precio"
+    ]
+    for c in num_cols:
+        df[c] = df[c].map(safe_float)
+
+    # Costo ML política 2026: tomar el menor costo nuevo disponible como referencia operativa
+    cost_candidates = [
+        "costo_nuevo_menvios", "costo_nuevo_flex",
+        "costo_nuevo_full_flex", "costo_nuevo_full_super"
+    ]
+    df["costo_ml_politica_2026"] = df[cost_candidates].min(axis=1, skipna=True)
+
+    # Ingreso simulado ML 2026: precio venta - costo ML política 2026
+    df["ingreso_simulado_ml_2026"] = np.where(
+        df["precio_venta_politica"].notna() & df["costo_ml_politica_2026"].notna(),
+        df["precio_venta_politica"] - df["costo_ml_politica_2026"],
+        np.nan
+    )
+
+    # Si diferencia % viene en base 0-1, llevar a porcentaje
+    if "diferencia_politica_pct_precio" in df.columns:
+        s = df["diferencia_politica_pct_precio"]
+        mask = s.abs().le(2) & s.notna()
+        df.loc[mask, "diferencia_politica_pct_precio"] = s[mask] * 100
+
+    keep = [
+        "mlc", "sku", "titulo_politica", "metodo_envio_politica", "precio_venta_politica",
+        "costo_total_antiguo", "costo_nuevo_menvios", "costo_nuevo_flex",
+        "costo_nuevo_full_flex", "costo_nuevo_full_super", "diferencia_politica_clp",
+        "diferencia_politica_pct_precio", "impacto_politica", "modalidad_recomendada_2026",
+        "costo_ml_politica_2026", "ingreso_simulado_ml_2026"
+    ]
+    out = df[keep].copy()
+
+    if out.empty:
+        raise ValueError("La hoja ANALISIS_2026 no entregó filas válidas.")
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_keywords(file_bytes: bytes):
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Reporte por palabras clave", header=1)
+    df = df.copy()
+    cols = {
+        "Campaña": "campana",
+        "Palabra clave": "palabra_clave",
+        "Segmentación": "segmentacion",
+        "Impresiones": "impresiones",
+        "Clics": "clics",
+        "Ingresos\n(Moneda local)": "ingresos",
+        "Inversión\n(Moneda local)": "inversion",
+        "ACOS\n(Inversión / Ingresos)": "acos",
+        "ROAS\n(Ingresos / Inversión)": "roas",
+        "Ventas por publicidad": "ventas_ads",
+    }
+    out = pd.DataFrame()
+    for src, dst in cols.items():
+        out[dst] = df[src] if src in df.columns else np.nan
+    for c in ["impresiones", "clics", "ingresos", "inversion", "acos", "roas", "ventas_ads"]:
+        out[c] = out[c].map(safe_float)
+    return out
+
+
+# =========================================================
+# Metrics engine
+# =========================================================
+def attach_historical_purchase_cost_to_sales(ml_sales, purchases, master):
+    sales = ml_sales.copy()
+    if sales.empty:
+        sales["costo_unit_historico"] = np.nan
+        return sales
+
+    fallback_cost = master.set_index("sku")["costo_maestra"].to_dict()
+    if purchases is None or purchases.empty:
+        sales["costo_unit_historico"] = sales["sku"].map(fallback_cost)
+        return sales
+
+    sales = sales.sort_values(["sku", "fecha"]).copy()
+    purchases = purchases.sort_values(["sku", "fecha"]).copy()
+    merged_parts = []
+    for sku, sgrp in sales.groupby("sku", sort=False):
+        pgrp = purchases[purchases["sku"] == sku][["fecha", "precio_unitario"]].sort_values("fecha")
+        sgrp = sgrp.sort_values("fecha").copy()
+        if not pgrp.empty:
+            mg = pd.merge_asof(
+                sgrp,
+                pgrp,
+                on="fecha",
+                direction="backward",
+                suffixes=("", "_compra")
             )
-        return pd.read_sql_query("SELECT * FROM reimpresiones ORDER BY id DESC", c)
+            mg["costo_unit_historico"] = mg["precio_unitario_compra"].map(safe_float)
+            mg.drop(columns=[c for c in ["precio_unitario_compra"] if c in mg.columns], inplace=True)
+        else:
+            mg = sgrp.copy()
+            mg["costo_unit_historico"] = np.nan
+        mg["costo_unit_historico"] = mg["costo_unit_historico"].fillna(fallback_cost.get(sku, np.nan))
+        merged_parts.append(mg)
+    return pd.concat(merged_parts, ignore_index=True) if merged_parts else sales
 
 
-def get_label_blocks_df(lote_id: int) -> pd.DataFrame:
-    with db() as c:
-        return pd.read_sql_query(
-            """
-            SELECT *
-            FROM label_blocks
-            WHERE lote_id=?
-            ORDER BY block_index ASC
-            """,
-            c,
-            params=(int(lote_id),),
-        )
+def summarize_sales_windows(sales, master, purchases, days_list=(30, 90)):
+    out = {}
+    today = pd.Timestamp(date.today())
 
+    ml_sales = sales[sales["canal"] == "ML"].copy()
+    ml_sales = attach_historical_purchase_cost_to_sales(ml_sales, purchases, master)
+    ml_sales["utilidad_linea"] = ml_sales["total_linea"] - (ml_sales["cantidad"] * ml_sales["costo_unit_historico"])
+    ml_sales["margen_linea"] = np.where(ml_sales["total_linea"] > 0, (ml_sales["utilidad_linea"] / ml_sales["total_linea"]) * 100, np.nan)
 
-def register_controlled_block_reprint(lote_id: int, block: dict, motivo: str, usuario: str):
-    motivo = clean_text(motivo)
-    usuario = clean_text(usuario) or "SIN_USUARIO"
-    if len(motivo) < 5:
-        return False, "Debes ingresar un motivo claro de reimpresión."
+    def hist_margin(df):
+        ingresos = df["total_linea"].sum()
+        utilidad = df["utilidad_linea"].sum()
+        if ingresos <= 0:
+            return np.nan
+        return (utilidad / ingresos) * 100
 
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as c:
-        rec = c.execute(
-            "SELECT * FROM label_blocks WHERE lote_id=? AND block_index=? AND block_key=?",
-            (int(lote_id), int(block["block_index"]), clean_text(block["block_key"])),
-        ).fetchone()
-        if not rec:
-            return False, "Este bloque aún no está impreso. Debe descargarse primero como impresión normal."
-        c.execute(
-            """
-            UPDATE label_blocks
-            SET status='REIMPRESO', download_count=download_count+1, last_printed_at=?,
-                updated_at=?, last_reprint_reason=?, last_reprint_user=?
-            WHERE lote_id=? AND block_index=? AND block_key=?
-            """,
-            (now, now, motivo, usuario, int(lote_id), int(block["block_index"]), clean_text(block["block_key"])),
-        )
-        c.execute(
-            """
-            INSERT INTO reimpresiones
-            (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
-            VALUES (?, NULL, ?, ?, 'BLOQUE', ?, ?, ?, ?)
-            """,
-            (int(lote_id), int(block["block_index"]), clean_text(block["block_key"]), int(block["total_qty"]), motivo, usuario, now),
-        )
+    total_hist = (
+        ml_sales.groupby("sku").apply(hist_margin).rename("margen_hist_total").reset_index()
+        if not ml_sales.empty else pd.DataFrame(columns=["sku", "margen_hist_total"])
+    )
+
+    for d in days_list:
+        cutoff = today - pd.Timedelta(days=d)
+        sw = sales[sales["fecha"] >= cutoff].copy()
+        mlw = ml_sales[ml_sales["fecha"] >= cutoff].copy()
+
+        if not sw.empty:
+            bysku = sw.groupby(["sku", "canal"]).agg(
+                ingresos=("total_linea", "sum"),
+                unidades=("cantidad", "sum"),
+                ventas=("sku", "size")
+            ).reset_index()
+        else:
+            bysku = pd.DataFrame(columns=["sku", "canal", "ingresos", "unidades", "ventas"])
 
         rows = []
-        for item in block["items"]:
-            rows.append((
-                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), int(item.get("unidades", 0)), "BLOQUE", "NORMAL",
-                int(block["block_index"]), clean_text(block["block_key"]), 1, now,
-            ))
-            rows.append((
-                int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-                clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "BLOQUE", "SEPARADOR",
-                int(block["block_index"]), clean_text(block["block_key"]), 1, now,
-            ))
-        c.executemany(
-            """
-            INSERT INTO label_prints
-            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-             block_index, block_key, is_reprint, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        c.commit()
-
-    log_audit_event(lote_id, event_type="REIMPRESION_CONTROLADA", detail=f"Bloque {int(block['block_index'])} · {motivo}", qty=int(block["total_qty"]), mode=usuario)
-    return True, "Reimpresión registrada."
-
-
-def register_controlled_item_reprint(lote_id: int, item: dict, qty: int, motivo: str, usuario: str):
-    motivo = clean_text(motivo)
-    usuario = clean_text(usuario) or "SIN_USUARIO"
-    qty = max(1, int(qty or 1))
-    if len(motivo) < 5:
-        return False, "Debes ingresar un motivo claro de reimpresión."
-
-    now = datetime.now().isoformat(timespec="seconds")
-    with db() as c:
-        c.execute(
-            """
-            INSERT INTO reimpresiones
-            (lote_id, item_id, block_index, block_key, scope, cantidad, motivo, usuario, created_at)
-            VALUES (?, ?, NULL, NULL, 'PRODUCTO', ?, ?, ?, ?)
-            """,
-            (int(lote_id), int(item.get("id")), int(qty), motivo, usuario, now),
-        )
-        rows = [
-            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), int(qty), "INDIVIDUAL", "NORMAL", None, None, 1, now),
-            (int(lote_id), int(item.get("id")), norm_code(item.get("codigo_ml", "")), norm_code(item.get("sku", "")),
-             clean_text(item.get("descripcion", "")), LABEL_SEPARATOR_PER_PRODUCT, "INDIVIDUAL", "SEPARADOR", None, None, 1, now),
+        for sku, grp in bysku.groupby("sku"):
+            row = {"sku": sku}
+            for canal in ["ML", "TIENDA"]:
+                cgrp = grp[grp["canal"] == canal]
+                row[f"ingresos_{canal.lower()}_{d}d"] = cgrp["ingresos"].sum() if not cgrp.empty else 0.0
+                row[f"unidades_{canal.lower()}_{d}d"] = cgrp["unidades"].sum() if not cgrp.empty else 0.0
+                row[f"ventas_{canal.lower()}_{d}d"] = cgrp["ventas"].sum() if not cgrp.empty else 0.0
+            rows.append(row)
+        base_cols = [
+            "sku",
+            f"ingresos_ml_{d}d", f"unidades_ml_{d}d", f"ventas_ml_{d}d",
+            f"ingresos_tienda_{d}d", f"unidades_tienda_{d}d", f"ventas_tienda_{d}d",
         ]
-        c.executemany(
-            """
-            INSERT INTO label_prints
-            (lote_id, item_id, codigo_ml, sku, descripcion, cantidad, print_scope, print_kind,
-             block_index, block_key, is_reprint, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        c.commit()
-    log_audit_event(lote_id, int(item.get("id")), "REIMPRESION_CONTROLADA", f"Producto · {motivo}", qty, item.get("codigo_ml", ""), item.get("sku", ""), usuario)
-    return True, "Reimpresión individual registrada."
+        base = pd.DataFrame(rows)
+        if base.empty:
+            base = pd.DataFrame(columns=base_cols)
+        else:
+            for col in base_cols:
+                if col not in base.columns:
+                    base[col] = np.nan
+            base = base[base_cols]
+
+        # buyer split and purchase pattern
+        sw_pos = sw[(sw["cantidad"] > 0) & (sw["total_linea"] > 0)].copy()
+        sw_pos = sw_pos[sw_pos["tipo_cliente"].isin(["EMPRESA", "PERSONA"])].copy()
+        if not sw_pos.empty:
+            bt = sw_pos.groupby(["sku", "tipo_cliente"]).agg(
+                ingresos=("total_linea", "sum"),
+                unidades=("cantidad", "sum"),
+                ventas=("sku", "size"),
+                mediana_unidades=("cantidad", "median"),
+                p90_unidades=("cantidad", lambda s: s.quantile(0.90))
+            ).reset_index()
+        else:
+            bt = pd.DataFrame(columns=["sku", "tipo_cliente", "ingresos", "unidades", "ventas", "mediana_unidades", "p90_unidades"])
+
+        buyer_rows = []
+        for sku, grp in bt.groupby("sku"):
+            row = {"sku": sku}
+            total_ing = grp["ingresos"].sum()
+            for tipo in ["EMPRESA", "PERSONA"]:
+                tgrp = grp[grp["tipo_cliente"] == tipo]
+                ing = tgrp["ingresos"].sum() if not tgrp.empty else 0.0
+                row[f"participacion_{tipo.lower()}_{d}d"] = (ing / total_ing * 100) if total_ing > 0 else np.nan
+                row[f"mediana_unidades_{tipo.lower()}_{d}d"] = tgrp["mediana_unidades"].iloc[0] if not tgrp.empty else np.nan
+                row[f"p90_unidades_{tipo.lower()}_{d}d"] = tgrp["p90_unidades"].iloc[0] if not tgrp.empty else np.nan
+            buyer_rows.append(row)
+        buyer_cols = [
+            "sku",
+            f"participacion_empresa_{d}d", f"mediana_unidades_empresa_{d}d", f"p90_unidades_empresa_{d}d",
+            f"participacion_persona_{d}d", f"mediana_unidades_persona_{d}d", f"p90_unidades_persona_{d}d",
+        ]
+        buyer_df = pd.DataFrame(buyer_rows)
+        if buyer_df.empty:
+            buyer_df = pd.DataFrame(columns=buyer_cols)
+        else:
+            for col in buyer_cols:
+                if col not in buyer_df.columns:
+                    buyer_df[col] = np.nan
+            buyer_df = buyer_df[buyer_cols]
+
+        hist_d = mlw.groupby("sku").apply(hist_margin).rename(f"margen_hist_{d}d").reset_index() if not mlw.empty else pd.DataFrame(columns=["sku", f"margen_hist_{d}d"])
+
+        out[d] = base.merge(buyer_df, on="sku", how="outer").merge(hist_d, on="sku", how="outer")
+    return out, total_hist, ml_sales
 
 
-def supervisor_metrics(lote_id: int) -> dict:
-    items = get_items(lote_id)
-    if items.empty:
-        return {"total": 0, "done": 0, "pending": 0, "incidencias_abiertas": 0, "label_pending": 0}
-    view = items.copy()
-    view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-    labels = label_control_view(lote_id)
-    incid = get_incidencias(lote_id, status="ABIERTA")
+def summarize_purchases(purchases):
+    if purchases is None or purchases.empty:
+        return pd.DataFrame(columns=[
+            "sku", "ultima_fecha_compra", "ultimo_costo_compra", "ultimo_proveedor", "ultima_cantidad_compra", "brecha_doc", "compras_total"
+        ]), {}
+    by_sku = {}
+    rows = []
+    for sku, grp in purchases.groupby("sku", sort=False):
+        grp = grp.sort_values("fecha")
+        by_sku[sku] = grp.copy()
+        last = grp.iloc[-1]
+        rows.append({
+            "sku": sku,
+            "ultima_fecha_compra": last["fecha"],
+            "ultimo_costo_compra": safe_float(last["precio_unitario"]),
+            "ultimo_proveedor": last["proveedor"],
+            "ultima_cantidad_compra": safe_float(last["cantidad"]),
+            "compras_total": len(grp),
+        })
+    return pd.DataFrame(rows), by_sku
+
+
+def aggregate_ads_by_sku(product_ads, publications):
+    if product_ads is None or product_ads.empty or publications is None or publications.empty:
+        return pd.DataFrame(columns=["sku", "ads_inversion", "ads_ingresos", "ads_acos", "ads_roas", "ads_ventas", "ads_impresiones", "ads_clics"])
+    pubs_map = publications[["mlc", "sku"]].drop_duplicates()
+    ads = product_ads.merge(pubs_map, on="mlc", how="left")
+    ads = ads[ads["sku"].notna()].copy()
+    out = ads.groupby("sku").agg(
+        ads_inversion=("inversion_ads", "sum"),
+        ads_ingresos=("ingresos_ads", "sum"),
+        ads_ventas=("ventas_ads", "sum"),
+        ads_impresiones=("impresiones", "sum"),
+        ads_clics=("clics", "sum"),
+    ).reset_index()
+    out["ads_acos"] = np.where(out["ads_ingresos"] > 0, out["ads_inversion"] / out["ads_ingresos"] * 100, np.nan)
+    out["ads_roas"] = np.where(out["ads_inversion"] > 0, out["ads_ingresos"] / out["ads_inversion"], np.nan)
+    return out
+
+
+def keywords_summary(keywords):
+    if keywords is None or keywords.empty:
+        return {
+            "campanas": 0,
+            "inversion": 0.0,
+            "ingresos": 0.0,
+            "acos": np.nan,
+            "roas": np.nan,
+            "top_keywords": pd.DataFrame(columns=["palabra_clave", "ingresos", "inversion", "acos", "roas", "clics", "impresiones"])
+        }
+    df = keywords.copy()
+    inversion = df["inversion"].sum()
+    ingresos = df["ingresos"].sum()
     return {
-        "total": int(view["unidades"].sum()),
-        "done": int(view["acopiadas"].sum()),
-        "pending": int(view["pendiente"].sum()),
-        "incidencias_abiertas": int(len(incid)),
-        "label_pending": int(labels["label_pending"].sum()) if not labels.empty else 0,
+        "campanas": df["campana"].nunique(),
+        "inversion": inversion,
+        "ingresos": ingresos,
+        "acos": (inversion / ingresos * 100) if ingresos > 0 else np.nan,
+        "roas": (ingresos / inversion) if inversion > 0 else np.nan,
+        "top_keywords": df.sort_values(["ingresos", "inversion"], ascending=[False, False]).head(20)[
+            ["palabra_clave", "ingresos", "inversion", "acos", "roas", "clics", "impresiones"]
+        ]
     }
 
 
-def cierre_validaciones(lote_id: int, capacity: int = ROLL_CAPACITY_DEFAULT) -> tuple[bool, list[str], dict]:
-    items = get_items(lote_id)
-    issues = []
-    if items.empty:
-        issues.append("El lote no tiene productos.")
-        return False, issues, {}
-    view = items.copy()
-    view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-    pending_units = int(view["pendiente"].sum())
-    if pending_units > 0:
-        issues.append(f"Quedan {pending_units} unidades pendientes de acopio/escaneo.")
+def build_action_table(master, sales_windows, total_hist, purchase_summary, publications, ads_by_sku, politicas_ml=None):
+    base = master[[
+        "sku", "descripcion", "costo_maestra", "precio_bruto", "monto_sim",
+        "margen_local_maestra", "margen_meli1_maestra", "ads_flag", "mlcs"
+    ]].copy()
 
-    inc_abiertas = get_incidencias(lote_id, status="ABIERTA")
-    if not inc_abiertas.empty:
-        issues.append(f"Hay {len(inc_abiertas)} incidencia(s) abiertas.")
+    sw30 = sales_windows.get(30, pd.DataFrame(columns=["sku"]))
+    sw90 = sales_windows.get(90, pd.DataFrame(columns=["sku"]))
+    base = base.merge(sw30, on="sku", how="left").merge(sw90[["sku", "margen_hist_90d"]], on="sku", how="left").merge(total_hist, on="sku", how="left")
+    base = base.merge(purchase_summary, on="sku", how="left").merge(ads_by_sku, on="sku", how="left")
 
-    label_view = label_control_view(lote_id)
-    label_pending = int(label_view["label_pending"].sum()) if not label_view.empty else 0
-    if label_pending > 0:
-        issues.append(f"Quedan {label_pending} etiquetas normales pendientes de impresión.")
+    # current publication snapshot
+    pub_primary_rows = []
+    pub_map = {}
+    if publications is not None and not publications.empty:
+        for sku, grp in publications.groupby("sku", sort=False):
+            pr = choose_primary_publication(grp)
+            if pr is not None:
+                pub_map[sku] = grp.copy()
+                pub_primary_rows.append({
+                    "sku": sku,
+                    "mlc_principal": pr["mlc"],
+                    "precio_ml_actual": safe_float(pr["precio_final"]),
+                    "precio_ml_base": safe_float(pr["precio_base"]),
+                    "precio_ml_oferta": safe_float(pr["precio_oferta"]),
+                    "ingreso_estimado_ml": safe_float(pr["ingreso_estimado_ml"]),
+                    "dias_publicado": safe_float(pr["dias_publicado"]),
+                    "stock_real": safe_float(pr["stock_real"]),
+                    "ventas_por_dia_pub": safe_float(pr["ventas_por_dia_pub"]),
+                    "status_publicacion": pr["status"],
+                    "dimensiones": pr["dimensiones"],
+                    "peso_volumetrico_kg": safe_float(pr["peso_volumetrico_kg"]),
+                    "comision_pct_ml": safe_float(pr.get("comision_pct", np.nan)),
+                    "cargo_cuotas_pct_ml": safe_float(pr.get("cargo_cuotas_pct", np.nan)),
+                    "total_cargo_pct_ml": safe_float(pr.get("total_cargo_pct", np.nan)),
+                    "total_cargo_monto_ml": safe_float(pr.get("total_cargo_monto", np.nan)),
+                    "costo_fijo_ml": safe_float(pr.get("costo_fijo", np.nan)),
+                })
+    pub_primary = pd.DataFrame(pub_primary_rows)
+    base = base.merge(pub_primary, on="sku", how="left")
 
-    blocks_expected = build_label_blocks(label_view, int(capacity)) if not label_view.empty else []
-    blocks_db = get_label_blocks_df(lote_id)
-    printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
-    missing_blocks = [b for b in blocks_expected if str(b["block_key"]) not in printed_keys]
-    if missing_blocks:
-        issues.append(f"Faltan {len(missing_blocks)} bloque(s) ZPL por descargar/imprimir.")
+    if politicas_ml is not None and not politicas_ml.empty:
+        pol = politicas_ml.copy()
+        pol_mlc = pol[pol["mlc"].astype(str).str.strip() != ""].copy()
+        if not pol_mlc.empty:
+            pol_mlc = pol_mlc.sort_values(["mlc", "costo_ml_politica_2026"], ascending=[True, True], na_position="last")
+            pol_mlc = pol_mlc.drop_duplicates(subset=["mlc"], keep="first")
+            pol_mlc = pol_mlc.rename(columns={c: f"{c}_mlc" for c in pol_mlc.columns if c != "mlc"})
+            base = base.merge(pol_mlc, left_on="mlc_principal", right_on="mlc", how="left")
+        pol_sku = pol[pol["sku"].astype(str).str.strip() != ""].copy()
+        if not pol_sku.empty:
+            pol_sku = pol_sku.sort_values(["sku", "costo_ml_politica_2026"], ascending=[True, True], na_position="last")
+            pol_sku = pol_sku.drop_duplicates(subset=["sku"], keep="first")
+            pol_sku = pol_sku.rename(columns={c: f"{c}_sku" for c in pol_sku.columns if c != "sku"})
+            base = base.merge(pol_sku, on="sku", how="left")
+        policy_fields = [
+            "precio_venta_politica", "costo_total_antiguo", "costo_nuevo_menvios", "costo_nuevo_flex",
+            "costo_nuevo_full_flex", "costo_nuevo_full_super", "diferencia_politica_clp",
+            "diferencia_politica_pct_precio", "impacto_politica", "metodo_envio_politica",
+            "titulo_politica", "costo_ml_politica_2026", "modalidad_recomendada_2026",
+            "ingreso_simulado_ml_2026"
+        ]
+        for field in policy_fields:
+            mlc_col = f"{field}_mlc"
+            sku_col = f"{field}_sku"
+            base[field] = base[mlc_col] if mlc_col in base.columns else np.nan
+            if sku_col in base.columns:
+                base[field] = base[field].where(base[field].notna(), base[sku_col])
+    else:
+        for field in [
+            "precio_venta_politica", "costo_total_antiguo", "costo_nuevo_menvios", "costo_nuevo_flex",
+            "costo_nuevo_full_flex", "costo_nuevo_full_super", "diferencia_politica_clp",
+            "diferencia_politica_pct_precio", "impacto_politica", "metodo_envio_politica",
+            "titulo_politica", "costo_ml_politica_2026", "modalidad_recomendada_2026",
+            "ingreso_simulado_ml_2026"
+        ]:
+            base[field] = np.nan
 
-    return len(issues) == 0, issues, {
-        "pending_units": pending_units,
-        "open_incidents": int(len(inc_abiertas)),
-        "label_pending": label_pending,
-        "expected_blocks": int(len(blocks_expected)),
-        "printed_blocks": int(len(blocks_db)),
-    }
+    base["ads_share_ml_pct"] = np.where(
+        base["ingresos_ml_30d"].fillna(0) > 0,
+        (base["ads_inversion"].fillna(0) / base["ingresos_ml_30d"].fillna(0)) * 100,
+        0.0
+    )
+    base["monto_sim_neto"] = np.where(base["monto_sim"].notna(), base["monto_sim"] / 1.19, np.nan)
+    base["margen_ads_base_pct"] = base.apply(lambda r: calc_margin_from_monto_sim(r["costo_maestra"], r["monto_sim"]), axis=1)
+    base["margen_ml_actual"] = base["margen_ads_base_pct"]
+    base["margen_ml_reportado"] = base.apply(
+        lambda r: calc_margin_from_ml_price(
+            r["costo_maestra"], r["precio_ml_actual"], r.get("total_cargo_pct_ml", np.nan), r.get("costo_fijo_ml", np.nan), 0.0
+        ),
+        axis=1,
+    )
+    base["margen_ml_con_ads"] = np.where(
+        base["margen_ads_base_pct"].notna() & base["ads_acos"].notna(),
+        base["margen_ads_base_pct"] - base["ads_acos"],
+        base["margen_ads_base_pct"],
+    )
+    base["margen_tienda_actual"] = base.apply(lambda r: calc_margin_from_bruto(r["costo_maestra"], r["precio_bruto"]), axis=1)
+    base["brecha_costo_pct"] = np.where(
+        base["costo_maestra"].notna() & base["ultimo_costo_compra"].notna() & (base["costo_maestra"] != 0),
+        ((base["ultimo_costo_compra"] - base["costo_maestra"]) / base["costo_maestra"]) * 100,
+        np.nan
+    )
+    base["brecha_costo_clp"] = np.where(
+        base["costo_maestra"].notna() & base["ultimo_costo_compra"].notna(),
+        base["ultimo_costo_compra"] - base["costo_maestra"],
+        np.nan
+    )
+    base["brecha_precio_pct"] = np.where(
+        base["precio_bruto"].notna() & base["precio_ml_actual"].notna() & (base["precio_bruto"] != 0),
+        ((base["precio_ml_actual"] - base["precio_bruto"]) / base["precio_bruto"]) * 100,
+        np.nan
+    )
+    base["ingreso_referencia_comercial"] = np.where(
+        base["ingreso_simulado_ml_2026"].notna(),
+        base["ingreso_simulado_ml_2026"],
+        base["ingreso_estimado_ml"],
+    )
+    base["brecha_monto_sim_pct"] = np.where(
+        base["monto_sim"].notna() & base["ingreso_referencia_comercial"].notna() & (base["monto_sim"] != 0),
+        ((base["ingreso_referencia_comercial"] - base["monto_sim"]) / base["monto_sim"]) * 100,
+        np.nan
+    )
+    base["delta_margen_30d_pp"] = base["margen_ml_actual"] - base["margen_hist_30d"]
+    base["estado_brecha_costo"] = base["brecha_costo_pct"].apply(classify_cost_gap_pct)
+    base["estado_margen"] = base["delta_margen_30d_pp"].apply(classify_margin_delta_pp)
+    base["objetivo_margen_ads_pct"] = ADS_TARGET_MARGIN_PCT
+    base["acos_max_permitido_pct"] = np.where(
+        base["margen_ads_base_pct"].notna(),
+        base["margen_ads_base_pct"] - base["objetivo_margen_ads_pct"],
+        np.nan,
+    )
+    base["gap_acos_pct"] = np.where(
+        base["ads_acos"].notna() & base["acos_max_permitido_pct"].notna(),
+        base["ads_acos"] - base["acos_max_permitido_pct"],
+        np.nan,
+    )
+    base["brecha_ads_objetivo_pp"] = np.where(
+        base["margen_ml_con_ads"].notna(),
+        base["margen_ml_con_ads"] - base["objetivo_margen_ads_pct"],
+        np.nan,
+    )
+    base["estado_ads"] = base.apply(classify_ads_state, axis=1)
+    base["motivo_ads"] = base.apply(classify_ads_reason, axis=1)
+    base["accion_ads"] = base.apply(suggest_ads_action, axis=1)
+    base["ads_score"] = 0.0
+    base["ads_score"] += base["margen_ml_con_ads"].fillna(0) * 0.5
+    base["ads_score"] += base["ads_roas"].fillna(0) * 3.0
+    base["ads_score"] -= base["ads_acos"].fillna(0) * 0.7
+    base["ads_score"] += np.where(base["estado_ads"].eq("OPORTUNIDAD"), 10, 0)
+
+    def action(row):
+        cost_state = row["estado_brecha_costo"]
+        margin_state = row["estado_margen"]
+        if cost_state == "CRÍTICO" and margin_state in ("CRÍTICO", "ALERTA"):
+            return "REPRECIO URGENTE"
+        if cost_state == "CRÍTICO":
+            return "REVISAR COSTO Y PRECIO"
+        if str(row.get("estado_ads", "")).upper() == "CRÍTICO":
+            return "REVISAR ADS URGENTE"
+        if str(row.get("estado_ads", "")).upper() == "ALERTA":
+            return "OPTIMIZAR ADS / PRECIO"
+        if row.get("ads_flag", False) and margin_state in ("CRÍTICO", "ALERTA"):
+            return "REVISAR PRECIO / ADS"
+        if margin_state == "CRÍTICO":
+            return "REVISAR RENTABILIDAD"
+        if cost_state == "BAJÓ COSTO":
+            return "OPORTUNIDAD"
+        return "MANTENER / MONITOREAR"
+
+    def semaforo(row):
+        cost_state = row["estado_brecha_costo"]
+        margin_state = row["estado_margen"]
+        ads_state = str(row.get("estado_ads", "")).upper()
+        if cost_state == "CRÍTICO" or margin_state == "CRÍTICO" or ads_state == "CRÍTICO":
+            return "CRÍTICO"
+        if cost_state == "ALERTA" or margin_state == "ALERTA" or ads_state == "ALERTA":
+            return "ALERTA"
+        if cost_state == "BAJÓ COSTO" or margin_state == "MEJORA" or ads_state == "OPORTUNIDAD":
+            return "OPORTUNIDAD"
+        return "ESTABLE"
+
+    base["estado_general"] = base.apply(semaforo, axis=1)
+    base["accion_sugerida"] = base.apply(action, axis=1)
+
+    state_score = {"CRÍTICO": 3, "ALERTA": 2, "OPORTUNIDAD": 1, "ESTABLE": 0}
+    base["score"] = base["estado_general"].map(state_score).fillna(0) * 100
+    base["score"] += base["ingresos_ml_30d"].fillna(0) / 10000
+    base["score"] += base["ads_inversion"].fillna(0) / 10000
+    base = base.sort_values(["score", "ingresos_ml_30d"], ascending=[False, False])
+
+    return base, pub_map
 
 
-def close_lote(lote_id: int, usuario: str, nota: str):
-    ok, issues, _ = cierre_validaciones(lote_id)
-    if not ok:
-        return False, "No se puede cerrar: " + " ".join(issues)
-    now = datetime.now().isoformat(timespec="seconds")
-    usuario = clean_text(usuario) or "SIN_USUARIO"
-    with db() as c:
-        c.execute(
-            "UPDATE lotes SET status='CERRADO', closed_at=?, closed_by=?, close_note=? WHERE id=?",
-            (now, usuario, clean_text(nota), int(lote_id)),
-        )
-        c.commit()
-    log_audit_event(lote_id, event_type="LOTE_CERRADO", detail=clean_text(nota), mode=usuario)
-    return True, "Lote cerrado correctamente."
+def rel_to_sheet_df(rel_df: pd.DataFrame) -> pd.DataFrame:
+    if rel_df is None or rel_df.empty:
+        return pd.DataFrame(columns=list(range(6)))
+    out = pd.DataFrame({
+        0: rel_df["sku"],
+        1: rel_df["descripcion"],
+        2: rel_df["precio_b2c"],
+        3: np.nan,
+        4: rel_df["tipo"],
+        5: rel_df["estado"],
+    })
+    return out
 
 
-def reopen_lote(lote_id: int, usuario: str, motivo: str):
-    usuario = clean_text(usuario) or "SIN_USUARIO"
-    with db() as c:
-        c.execute("UPDATE lotes SET status='ACTIVO', closed_at=NULL, closed_by=NULL, close_note=NULL WHERE id=?", (int(lote_id),))
-        c.commit()
-    log_audit_event(lote_id, event_type="LOTE_REABIERTO", detail=clean_text(motivo), mode=usuario)
-    return True, "Lote reabierto."
-
-# ============================================================
-# Exportación
-# ============================================================
-
-def export_lote(lote_id):
-    items = get_items(lote_id)
-    if not items.empty:
-        items["pendiente"] = (items["unidades"].astype(int) - items["acopiadas"].astype(int)).clip(lower=0)
-        items["estado"] = items["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
-    scans = pd.DataFrame()
-    with db() as c:
-        scans = pd.read_sql_query("SELECT created_at, item_id, scan_primario, scan_secundario, cantidad, modo FROM scans WHERE lote_id=? ORDER BY id DESC", c, params=(lote_id,))
-    audit = get_audit_events(lote_id, limit=5000)
-    incidencias = get_incidencias(lote_id)
-    reimpresiones = get_reimpresiones(lote_id)
+@st.cache_data(show_spinner=False)
+def build_download_bytes(master_df: pd.DataFrame, rel_df: pd.DataFrame, control_df: pd.DataFrame, original_bytes: bytes, maestra_name: str, rel_name: str, control_name: str | None = None):
+    xls = pd.ExcelFile(io.BytesIO(_coerce_excel_bytes(original_bytes, "la maestra original")), engine="openpyxl")
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        items.to_excel(writer, sheet_name="control_full", index=False)
-        scans.to_excel(writer, sheet_name="escaneos", index=False)
-        audit.to_excel(writer, sheet_name="auditoria", index=False)
-        incidencias.to_excel(writer, sheet_name="incidencias", index=False)
-        reimpresiones.to_excel(writer, sheet_name="reimpresiones", index=False)
+        for sheet in xls.sheet_names:
+            if sheet == maestra_name:
+                drop_cols = [
+                    "sku", "descripcion", "costo_maestra", "precio_bruto", "precio_neto", "monto_sim", "margen_local_maestra",
+                    "margen_meli1_maestra", "margen_meli2_maestra", "margen_meli3_maestra", "margen_meli4_maestra",
+                    "mlc_1", "mlc_2", "mlc_3", "mlc_4", "mlc_sync_1", "mlc_sync_2", "mlc_sync_3", "mlc_sync_4", "ads_flag", "mlcs"
+                ]
+                master_df.drop(columns=[c for c in drop_cols if c in master_df.columns], errors="ignore").to_excel(writer, sheet_name=sheet, index=False)
+            elif rel_name and sheet == rel_name:
+                rel_to_sheet_df(rel_df).to_excel(writer, sheet_name=sheet, index=False, header=False)
+            elif control_name and sheet == control_name:
+                control_promos_to_sheet_df(control_df).to_excel(writer, sheet_name=sheet, index=False)
+            else:
+                pd.read_excel(io.BytesIO(_coerce_excel_bytes(original_bytes, "la maestra original")), sheet_name=sheet, header=None if "relampago" in sheet.lower() else 0, engine="openpyxl").to_excel(
+                    writer,
+                    sheet_name=sheet,
+                    index=False,
+                    header=not ("relampago" in sheet.lower())
+                )
     return out.getvalue()
 
 
-# ============================================================
-# UI
-# ============================================================
+# =========================================================
+# Model
+# =========================================================
+def build_model(master_up, ventas_up, compras_up=None, pubs_up=None, ads_up=None, keywords_up=None, postventa_up=None, politicas_ml_up=None):
+    wb = load_master_workbook(master_up.getvalue())
+    master, _ = normalize_master(wb["master_df"], wb["bridge_df"])
+    master_meli = expand_master_meli(master)
+    rel = normalize_rel(wb["rel_df"])
+    promos = pd.DataFrame(columns=["promo_index","sku","descripcion","slot","mlc","campana_ads","precio_b2c","fecha_venci","comentario","status","status_order"])
 
-init_db()
-load_maestro_from_repo()
+    ventas = load_sales(ventas_up.getvalue()) if ventas_up else pd.DataFrame()
+    compras = load_purchases(compras_up.getvalue()) if compras_up else pd.DataFrame()
+    pubs = load_publications(pubs_up.getvalue()) if pubs_up else pd.DataFrame()
+    product_ads = load_product_ads(ads_up.getvalue()) if ads_up else pd.DataFrame()
+    keywords = load_keywords(keywords_up.getvalue()) if keywords_up else pd.DataFrame()
+    postventa = load_postventa(postventa_up.getvalue()) if postventa_up else pd.DataFrame()
+    politicas_ml = load_politicas_ml(politicas_ml_up.getvalue()) if politicas_ml_up else pd.DataFrame()
 
-if "_auto_restore_checked" not in st.session_state:
-    st.session_state["_auto_restore_checked"] = True
-    restored, restore_msg = restore_from_backup_if_empty()
-    st.session_state["_auto_restore_msg"] = restore_msg
-    st.session_state["_auto_restore_ok"] = restored
+    sales_windows, total_hist, ml_sales = summarize_sales_windows(ventas, master, compras, days_list=(7, 15, 30, 90))
+    purchase_summary, purchase_map = summarize_purchases(compras)
+    ads_by_sku = aggregate_ads_by_sku(product_ads, pubs)
+    kw_summary = keywords_summary(keywords)
+    action_table, pub_map = build_action_table(master, sales_windows, total_hist, purchase_summary, pubs, ads_by_sku, politicas_ml)
+    brecha_comercial_df = build_brecha_comercial_df(master, master_meli, pubs, politicas_ml)
+    validations = build_validation_layers(master, ventas, compras, pubs, product_ads, promos, action_table)
+    postventa_mod = build_postventa_module(postventa, pubs)
 
-st.markdown("""
-<style>
-/* Estilo general: control y carga mantienen tamaño normal para no desproporcionar la UI */
-.stButton > button {font-weight:800!important;}
-div[data-testid="stMetricValue"] {font-size:1.8rem!important;}
-.product-title {font-size:1.3rem;font-weight:850;line-height:1.25;margin:8px 0;}
-.control-card {border:1px solid #E5E7EB;border-radius:16px;padding:15px 17px;margin:12px 0;background:#FFF;}
-.control-title {font-size:1.05rem;font-weight:850;line-height:1.35;margin-bottom:8px;}
-.control-meta {font-size:.92rem;color:#374151;margin-bottom:8px;}
-.badge {display:inline-block;padding:6px 10px;border-radius:999px;background:#F3F4F6;margin:3px 4px 3px 0;font-size:.92rem;font-weight:750;}
-.badge-alert {background:#FFF7ED;}
-.label-card {border:1px solid #D1D5DB;border-radius:16px;padding:16px;margin:12px 0;background:#FFFFFF;}
-.label-card-printed {border-color:#86EFAC;background:#F0FDF4;}
-.label-card-warn {border-color:#FDBA74;background:#FFF7ED;}
-</style>
-""", unsafe_allow_html=True)
+    product_options = action_table["sku"].dropna().tolist()
+    sku_desc = action_table.set_index("sku")["descripcion"].to_dict()
+
+    return {
+        "wb": wb,
+        "master": master,
+        "master_meli": master_meli,
+        "brecha_comercial_df": brecha_comercial_df,
+        "promos": promos,
+        "control_df": pd.DataFrame(),
+        "rel": rel,
+        "ventas": ventas,
+        "compras": compras,
+        "pubs": pubs,
+        "product_ads": product_ads,
+        "keywords": keywords,
+        "postventa": postventa,
+        "politicas_ml": politicas_ml,
+        "postventa_mod": postventa_mod,
+        "kw_summary": kw_summary,
+        "sales_windows": sales_windows,
+        "ml_sales": ml_sales,
+        "purchase_summary": purchase_summary,
+        "purchase_map": purchase_map,
+        "ads_by_sku": ads_by_sku,
+        "action_table": action_table,
+        "pub_map": pub_map,
+        "product_options": product_options,
+        "sku_desc": sku_desc,
+        "validations": validations,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def build_model_cached(master_bytes, ventas_bytes, compras_bytes=None, pubs_bytes=None, ads_bytes=None, keywords_bytes=None, postventa_bytes=None, politicas_ml_bytes=None):
+    master_bytes = _coerce_excel_bytes(master_bytes, "la maestra")
+    ventas_bytes = _coerce_excel_bytes(ventas_bytes, "el reporte de ventas")
+    master_up = StoredUploadedFile(Path(FILE_SPECS["master"]["filename"]), master_bytes)
+    ventas_up = StoredUploadedFile(Path(FILE_SPECS["ventas"]["filename"]), ventas_bytes)
+    compras_up = StoredUploadedFile(Path(FILE_SPECS["compras"]["filename"]), compras_bytes) if compras_bytes else None
+    pubs_up = StoredUploadedFile(Path(FILE_SPECS["pubs"]["filename"]), pubs_bytes) if pubs_bytes else None
+    ads_up = StoredUploadedFile(Path(FILE_SPECS["ads"]["filename"]), ads_bytes) if ads_bytes else None
+    keywords_up = StoredUploadedFile(Path(FILE_SPECS["keywords"]["filename"]), keywords_bytes) if keywords_bytes else None
+    postventa_up = StoredUploadedFile(Path(FILE_SPECS["postventa"]["filename"]), postventa_bytes) if postventa_bytes else None
+    politicas_ml_up = StoredUploadedFile(Path(FILE_SPECS["politicas_ml"]["filename"]), politicas_ml_bytes) if politicas_ml_bytes else None
+    return build_model(master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up, postventa_up, politicas_ml_up)
+
+
+def build_shared_model(resolved_files: dict):
+    return build_model_cached(
+        resolved_files["master"].getvalue() if resolved_files.get("master") else None,
+        resolved_files["ventas"].getvalue() if resolved_files.get("ventas") else None,
+        resolved_files["compras"].getvalue() if resolved_files.get("compras") else None,
+        resolved_files["pubs"].getvalue() if resolved_files.get("pubs") else None,
+        resolved_files["ads"].getvalue() if resolved_files.get("ads") else None,
+        resolved_files["keywords"].getvalue() if resolved_files.get("keywords") else None,
+        resolved_files["postventa"].getvalue() if resolved_files.get("postventa") else None,
+        resolved_files["politicas_ml"].getvalue() if resolved_files.get("politicas_ml") else None,
+    )
+
+
+def persist_current_master_workbook(model: dict, note: str = "maestra actualizada desde app"):
+    ensure_storage_dirs()
+    wb = model["wb"]
+    output_bytes = build_download_bytes(model["master"], model["rel"], model.get("control_df", pd.DataFrame()), wb["file_bytes"], wb["maestra_name"], wb["rel_name"], wb.get("control_name"))
+    active_path = active_file_path("master")
+    archived_path = archive_existing_active_file("master")
+    active_path.write_bytes(output_bytes)
+    stored = StoredUploadedFile(path=active_path, data=output_bytes, original_name=active_path.name)
+    log_source_file_event(
+        file_key="master",
+        active_filename=active_path.name,
+        archived_filename=archived_path.name if archived_path else "",
+        original_filename=note,
+        file_sig=file_signature(stored),
+        file_size=len(output_bytes),
+    )
+    build_model_cached.clear()
+    load_master_workbook.clear()
+    bump_shared_version(note)
+    return stored
+
+
+# =========================================================
+# UI bootstrap
+# =========================================================
+ensure_storage_dirs()
+ensure_source_files_table()
+
+st.title("Centro de Control Comercial Aurora")
+
+resolved_files = {}
+resolved_sources = {}
 
 with st.sidebar:
-    st.header("Menú")
-    # Usuario se solicita solo donde realmente corresponde: incidencia, reimpresión o cierre.
-    page = st.radio("Vista", ["Escaneo", "Cargar lote FULL", "Supervisor", "Etiquetas"], label_visibility="collapsed")
-    st.divider()
-    lotes = list_lotes()
-    if lotes.empty:
-        active_lote = None
-        st.info("Sin lotes creados.")
-    else:
-        options = {f"{r.nombre} · {int(r.acopiadas)}/{int(r.unidades)}": int(r.id) for r in lotes.itertuples(index=False)}
-        active_lote = options[st.selectbox("Lote activo", list(options.keys()))]
+    st.subheader("Archivos activos")
+    uploaders = {}
+    for file_key, spec in FILE_SPECS.items():
+        uploaders[file_key] = st.file_uploader(spec["label"], type=["xlsx"], key=f"upload_{file_key}")
 
-    st.divider()
-    bs = backup_status()
-    pending_backup = int(bs.get("pending") or 0)
-    sent_backup = int(bs.get("sent") or 0)
-    if pending_backup:
-        st.warning(f"Respaldo externo: {pending_backup} eventos pendientes")
-        if bs.get("last_error"):
-            st.caption(f"Último error: {clean_text(bs.get('last_error'))[:180]}")
-        if st.button("Reintentar respaldo"):
-            flush_backup_queue(limit=100)
+    pending_updates = [FILE_SPECS[k]["label"] for k, v in uploaders.items() if v is not None]
+    if pending_updates:
+        st.info("Pendientes por validar y reemplazar: " + ", ".join(pending_updates))
+
+    col_reload, col_apply = st.columns(2)
+    with col_reload:
+        if st.button("Recargar activos", use_container_width=True):
             st.rerun()
-    else:
-        st.success(f"Respaldo externo activo · enviados: {sent_backup}")
-    if bs.get("last_sent"):
-        st.caption(f"Último respaldo: {fmt_dt(bs.get('last_sent'))}")
-    if st.session_state.get("_auto_restore_msg"):
-        if st.session_state.get("_auto_restore_ok"):
-            st.success(st.session_state.get("_auto_restore_msg"))
-        else:
-            st.caption(f"Restauración: {st.session_state.get('_auto_restore_msg')}")
-    if st.button("Restaurar desde Sheets"):
-        if local_lotes_count() > 0:
-            st.warning("Ya hay lotes en la base local.")
-        else:
-            ok_restore, msg_restore = restore_from_backup_if_empty()
-            st.session_state["_auto_restore_ok"] = ok_restore
-            st.session_state["_auto_restore_msg"] = msg_restore
-            if ok_restore:
-                st.success(msg_restore)
+    with col_apply:
+        if st.button("Validar y reemplazar", use_container_width=True):
+            ok, errors, updated_labels = apply_uploaded_updates(uploaders)
+            if ok:
+                st.success("Archivos actualizados: " + ", ".join(updated_labels) if updated_labels else "No había archivos nuevos para actualizar.")
                 st.rerun()
             else:
-                st.error(msg_restore)
-    if st.button("Probar respaldo Sheets"):
-        ok_test, detail_test = test_backup_webhook()
-        if ok_test:
-            st.success("Prueba enviada a Google Sheets.")
-        else:
-            st.error(f"Falló prueba Sheets: {detail_test[:250]}")
+                for err in errors:
+                    st.error(err)
 
-if page == "Cargar lote FULL":
-    st.subheader("Cargar lote FULL")
-    full_file = st.file_uploader("Excel FULL", type=["xlsx"])
-    if full_file:
-        names = sheet_names(full_file)
-        default_idx = len(names) - 1 if names else 0
-        selected_sheet = st.selectbox("Hoja a cargar", names, index=default_idx)
-        try:
-            df, warns = read_full_excel_sheet(full_file, selected_sheet)
-            for w in warns:
-                st.warning(w)
-            if df.empty:
-                st.error("No se encontraron productos válidos en la hoja seleccionada.")
+    for file_key in FILE_SPECS:
+        resolved_files[file_key], resolved_sources[file_key] = resolve_input_file(file_key, uploaders[file_key])
+
+    status_df = storage_status_df()
+    st.caption("Los archivos nuevos no reemplazan al activo hasta que pases la validación. Se mantiene un único respaldo del archivo anterior.")
+    st.dataframe(status_df, use_container_width=True, hide_index=True, height=250)
+
+    st.markdown("---")
+    default_period = st.selectbox("Periodo de análisis", [7, 15, 30, 90], index=2)
+    st.caption("Ventas, patrones y margen histórico se priorizan con este periodo.")
+
+    st.markdown("---")
+    st.caption("Modo compartido sin recarga automática agresiva. Para ver cambios hechos desde otra ventana, usa recargar activos.")
+
+master_up = resolved_files["master"]
+ventas_up = resolved_files["ventas"]
+compras_up = resolved_files["compras"]
+pubs_up = resolved_files["pubs"]
+ads_up = resolved_files["ads"]
+keywords_up = resolved_files["keywords"]
+postventa_up = resolved_files["postventa"]
+
+current_shared_status = get_shared_status()
+current_shared_version = int(current_shared_status.get("version", 0) or 0)
+previous_shared_version = st.session_state.get("seen_shared_version")
+st.session_state["seen_shared_version"] = current_shared_version
+
+required_missing = [
+    FILE_SPECS[file_key]["label"]
+    for file_key, spec in FILE_SPECS.items()
+    if spec["required"] and resolved_files[file_key] is None
+]
+
+if required_missing:
+    st.info("Para comenzar deja activos o sube al menos: maestra, ventas y publicaciones ML.")
+    st.stop()
+
+shared_status = get_shared_status()
+combined_sig = "|".join([
+    file_signature(x) if x is not None else ""
+    for x in [master_up, ventas_up, compras_up, pubs_up, ads_up, keywords_up]
+])
+current_state_sig = f"v{shared_status['version']}|{combined_sig}"
+model = build_shared_model(resolved_files)
+action_table = model["action_table"].copy()
+
+
+# Auto snapshot deduplicado por estado consolidado
+if master_up and ventas_up and pubs_up and not action_table.empty:
+    sigs = {
+        "master_sig": file_signature(master_up) if master_up else "",
+        "ventas_sig": file_signature(ventas_up) if ventas_up else "",
+        "compras_sig": file_signature(compras_up) if compras_up else "",
+        "pubs_sig": file_signature(pubs_up) if pubs_up else "",
+        "ads_sig": file_signature(ads_up) if ads_up else "",
+        "keywords_sig": file_signature(keywords_up) if keywords_up else "",
+    }
+    # Snapshot automático desactivado para priorizar velocidad y estabilidad
+
+model["action_table"] = action_table
+model["validations"] = build_validation_layers(model["master"], model["ventas"], model["compras"], model["pubs"], model["product_ads"], model["promos"], action_table)
+
+tabs = st.tabs([
+    "Centro de Control Comercial",
+    "Ficha de Producto",
+    "Ads",
+    "Postventa",
+])
+
+# =========================================================
+# Tab 1 - Control center
+# =========================================================
+with tabs[0]:
+    critical_cost = int((action_table["estado_brecha_costo"] == "CRÍTICO").sum())
+    alert_cost = int((action_table["estado_brecha_costo"] == "ALERTA").sum())
+    critical_margin = int((action_table["estado_margen"] == "CRÍTICO").sum())
+    ads_risk = int((action_table.get("estado_ads", pd.Series(dtype=str)).isin(["CRÍTICO", "ALERTA"])).sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Brechas costo críticas", critical_cost)
+    c2.metric("Brechas costo alerta", alert_cost)
+    c3.metric("Margen histórico deteriorado", critical_margin)
+    c4.metric("Ads en riesgo", ads_risk)
+
+    st.subheader("Bandeja de acción")
+    f1, f2, f3, f4 = st.columns([1.2, 1, 1, 1.2])
+    estado_filter = f1.multiselect("Estado general", ["CRÍTICO", "ALERTA", "OPORTUNIDAD", "ESTABLE"], default=["CRÍTICO", "ALERTA", "OPORTUNIDAD", "ESTABLE"])
+    canal_filter = f2.selectbox("Canal", ["Todos", "ML", "TIENDA"], index=0)
+    ads_filter = f3.selectbox("Ads", ["Todos", "Solo con ads", "Solo sin ads"], index=0)
+    text_filter = f4.text_input("Buscar SKU / descripción / MLC")
+
+    work = action_table.copy()
+    if estado_filter:
+        work = work[work["estado_general"].isin(estado_filter)]
+    if canal_filter == "ML":
+        work = work[work["ingresos_ml_30d"].fillna(0) > 0]
+    elif canal_filter == "TIENDA":
+        work = work[work["ingresos_tienda_30d"].fillna(0) > 0]
+    if ads_filter == "Solo con ads":
+        work = work[work["ads_flag"]]
+    elif ads_filter == "Solo sin ads":
+        work = work[~work["ads_flag"]]
+    if text_filter:
+        q = text_filter.strip().lower()
+        work = work[
+            work["sku"].astype(str).str.contains(q, na=False) |
+            work["descripcion"].astype(str).str.lower().str.contains(q, na=False) |
+            work["mlc_principal"].astype(str).str.lower().str.contains(q, na=False)
+        ]
+
+    display_required_cols = [
+        "sku", "descripcion", "estado_general", "brecha_costo_clp", "brecha_costo_pct", "delta_margen_30d_pp",
+        "ads_flag", "margen_ml_actual", "margen_hist_30d", "ingresos_ml_30d", "accion_sugerida"
+        ]
+    for col in display_required_cols:
+        if col not in work.columns:
+            if col == "ads_flag":
+                work[col] = False
             else:
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Hoja", selected_sheet)
-                c2.metric("Líneas", len(df))
-                c3.metric("Unidades", int(df["unidades"].sum()))
-                c4.metric("SKUs únicos", int(df["sku"].nunique()))
-                with st.expander("Revisión rápida de columnas leídas", expanded=True):
-                    st.dataframe(df[["codigo_ml", "codigo_universal", "sku", "descripcion", "unidades", "identificacion", "vence"]].head(20), use_container_width=True, hide_index=True)
-                nombre = st.text_input("Nombre del lote", value=f"{selected_sheet} {datetime.now().strftime('%d-%m-%Y %H:%M')}")
-                if st.button("Crear lote", type="primary"):
-                    create_lote(nombre, full_file.name, selected_sheet, df)
-                    reset_scan_state()
-                    st.success("Lote creado correctamente.")
-                    st.rerun()
-        except Exception as e:
-            st.error(f"No pude leer la hoja seleccionada: {e}")
+                work[col] = np.nan
+    display = work[display_required_cols].copy()
+    display.columns = ["SKU", "Descripción", "Estado", "Brecha costo ($)", "Δ costo %", "Δ margen pp", "Ads", "Margen ML actual", "Margen hist. 30d", "Ventas ML 30d", "Acción sugerida"]
+    display["Brecha costo ($)"] = display["Brecha costo ($)"].map(fmt_money)
+    display["Δ costo %"] = display["Δ costo %"].map(fmt_pct)
+    display["Δ margen pp"] = display["Δ margen pp"].map(lambda x: "—" if pd.isna(x) else f"{x:.1f} pp")
+    display["Margen ML actual"] = display["Margen ML actual"].map(fmt_pct)
+    display["Margen hist. 30d"] = display["Margen hist. 30d"].map(fmt_pct)
+    display["Ventas ML 30d"] = display["Ventas ML 30d"].map(fmt_money)
+    display["Ads"] = display["Ads"].map(lambda x: "Sí" if bool(x) else "No")
+    st.dataframe(display, use_container_width=True, hide_index=True, height=420)
 
-elif page == "Escaneo":
-    st.markdown("""
-    <style>
-    /* Escaneo PDA: visión grande para operación en piso */
-    div[data-testid="stTextInput"] label,
-    div[data-testid="stNumberInput"] label {
-        font-size:1.85rem!important;
-        font-weight:900!important;
-        margin-bottom:.35rem!important;
-    }
-    div[data-testid="stTextInput"] input,
-    div[data-testid="stNumberInput"] input {
-        font-size:2.35rem!important;
-        min-height:4.8rem!important;
-        font-weight:800!important;
-    }
-    .stButton > button {
-        font-size:1.75rem!important;
-        min-height:4.5rem!important;
-        width:100%;
-        font-weight:900!important;
-        border-radius:14px!important;
-    }
-    div[data-testid="stMetricLabel"] {font-size:1.35rem!important;font-weight:800!important;}
-    div[data-testid="stMetricValue"] {font-size:2.35rem!important;font-weight:900!important;}
-    .product-title {font-size:1.8rem!important;font-weight:900!important;line-height:1.25;margin:12px 0;}
-    div[data-testid="stAlert"] {font-size:1.35rem!important;font-weight:800!important;}
-    </style>
-    """, unsafe_allow_html=True)
-    if not active_lote:
-        st.warning("Primero crea un lote FULL.")
+    sku_labels = [f"{sku} — {model['sku_desc'].get(sku, '')}" for sku in work["sku"].tolist()]
+    if sku_labels:
+        selected_label = st.selectbox("Abrir producto", sku_labels, key="selected_sku_from_control")
+        st.session_state.selected_sku = selected_label.split(" — ")[0]
     else:
-        items = get_items(active_lote)
-        total = int(items["unidades"].sum()) if not items.empty else 0
-        done = int(items["acopiadas"].sum()) if not items.empty else 0
-        st.progress(done / total if total else 0)
-        a, b, c = st.columns(3)
-        a.metric("Solicitado", total)
-        b.metric("Acopiado", done)
-        c.metric("Pendiente", max(total - done, 0))
-        st.divider()
+        st.info("No hay productos con esos filtros.")
 
-        for k, v in {"primary_validated": False, "primary_code": "", "candidate_id": None, "candidate_mode": "", "_clear_scan_inputs_next_run": False}.items():
-            if k not in st.session_state:
-                st.session_state[k] = v
-
-        clear_scan_inputs_if_needed()
-
-        st.text_input("Código ML o EAN supermercado", key="scan_primary")
-        cv, cl = st.columns([2, 1])
-        with cv:
-            validar_primario = st.button("Validar código", type="primary")
-        with cl:
-            limpiar = st.button("Limpiar")
-        if limpiar:
-            reset_scan_state(); st.rerun()
-
-        if validar_primario:
-            st.session_state["candidate_id"] = None
-            st.session_state["candidate_mode"] = ""
-            st.session_state["primary_validated"] = False
-            st.session_state["primary_code"] = norm_code(st.session_state.get("scan_primary", ""))
-            st.session_state["scan_secondary"] = ""
-            code = st.session_state["primary_code"]
-            if not code:
-                st.error("Escanea o ingresa un código.")
-            else:
-                sm = match_secondary(items, code, only_super=True)
-                if not sm.empty:
-                    cand = best_match(sm)
-                    st.session_state["candidate_id"] = int(cand["id"])
-                    st.session_state["candidate_mode"] = "SUPERMERCADO"
-                    st.session_state["primary_validated"] = True
-                else:
-                    m1 = match_ml(items, code)
-                    if m1.empty:
-                        st.error("Código no encontrado en productos pendientes.")
-                    elif m1["identificacion"].map(is_supermercado).all():
-                        st.error("Este producto es SUPERMERCADO. Debe confirmarse escaneando SKU/EAN/Código Universal, no Código ML.")
-                    else:
-                        st.session_state["primary_validated"] = True
-
-        candidate = None
-        modo = st.session_state.get("candidate_mode", "")
-        candidate_from_preview_this_run = False
-
-        if st.session_state.get("candidate_id"):
-            candidate = get_item_row(items, st.session_state["candidate_id"])
-        elif st.session_state.get("primary_validated") and st.session_state.get("primary_code"):
-            m1 = match_ml(items, st.session_state["primary_code"])
-            m1 = m1[~m1["identificacion"].map(is_supermercado)]
-            preview = best_match(m1)
-            if preview is not None:
-                pendiente_preview = int(preview["unidades"]) - int(preview["acopiadas"])
-                st.markdown(f"<div class='product-title'>{esc(preview['descripcion'])}</div>", unsafe_allow_html=True)
-                q1, q2, q3 = st.columns(3)
-                q1.metric("Solicitadas", int(preview["unidades"]))
-                q2.metric("Acopiadas", int(preview["acopiadas"]))
-                q3.metric("Pendientes", max(pendiente_preview, 0))
-                st.text_input("SKU / EAN / Código Universal", key="scan_secondary")
-                b1, b2 = st.columns(2)
-                with b1:
-                    validar_sec = st.button("Validar SKU/EAN", type="primary")
-                with b2:
-                    sin_ean = st.button("Sin EAN")
-
-                if sin_ean:
-                    m_no_super = m1[~m1["identificacion"].map(is_supermercado)]
-                    if m_no_super.empty:
-                        st.error("No encontré ese Código ML pendiente para usar Sin EAN.")
-                    else:
-                        cand = best_match(m_no_super)
-                        st.session_state["candidate_id"] = int(cand["id"])
-                        st.session_state["candidate_mode"] = "SIN_EAN"
-                        candidate = cand
-                        modo = "SIN_EAN"
-                        candidate_from_preview_this_run = True
-
-                if validar_sec and candidate is None:
-                    sec = st.session_state.get("scan_secondary", "")
-                    if not norm_code(sec):
-                        st.error("Escanea o ingresa el SKU/EAN.")
-                    else:
-                        m2 = match_secondary(m1, sec, only_super=False)
-                        if m2.empty:
-                            st.error("El SKU/EAN/Código Universal no corresponde a este producto.")
-                        else:
-                            cand = best_match(m2)
-                            st.session_state["candidate_id"] = int(cand["id"])
-                            st.session_state["candidate_mode"] = "ML+SECUNDARIO"
-                            candidate = cand
-                            modo = "ML+SECUNDARIO"
-                            candidate_from_preview_this_run = True
-
-        if candidate is not None:
-            pendiente = int(candidate["unidades"]) - int(candidate["acopiadas"])
-            st.success("Producto validado")
-
-            # Si el producto se acaba de validar en esta misma corrida, ya mostramos arriba
-            # nombre y cantidades. No los duplicamos para evitar parpadeos y confusión en PDA.
-            if not candidate_from_preview_this_run:
-                st.markdown(f"<div class='product-title'>{esc(candidate['descripcion'])}</div>", unsafe_allow_html=True)
-                x1, x2, x3, x4 = st.columns(4)
-                x1.metric("SKU", candidate["sku"])
-                x2.metric("Solicitadas", int(candidate["unidades"]))
-                x3.metric("Acopiadas", int(candidate["acopiadas"]))
-                x4.metric("Pendientes", max(pendiente, 0))
-
-            with st.form("form_agregar_cantidad", clear_on_submit=False):
-                qty_txt = st.text_input(
-                    "Cantidad a agregar",
-                    value="",
-                    key="scan_qty_input",
-                    placeholder="Ingresa cantidad",
-                )
-                agregar = st.form_submit_button("Agregar cantidad", type="primary")
-
-            if agregar:
-                qty = to_int(qty_txt)
-                if qty <= 0:
-                    st.error("Ingresa una cantidad válida mayor a cero.")
-                elif qty > pendiente:
-                    st.error(f"No puedes agregar {qty}. Solo quedan {pendiente} pendientes.")
-                else:
-                    submit_sig = f"{active_lote}:{int(candidate['id'])}:{qty}:{norm_code(st.session_state.get('scan_primary', ''))}:{norm_code(st.session_state.get('scan_secondary', ''))}:{modo}"
-                    if st.session_state.get("_last_scan_submit_sig") == submit_sig:
-                        st.warning("Este escaneo ya fue procesado. Limpia o escanea el siguiente producto.")
-                    else:
-                        st.session_state["_last_scan_submit_sig"] = submit_sig
-                        ok, msg = add_acopio(active_lote, int(candidate["id"]), int(qty), st.session_state.get("scan_primary", ""), st.session_state.get("scan_secondary", ""), modo)
-                        if ok:
-                            reset_scan_state()
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-        render_scan_incident_button(active_lote, items, candidate)
-
-        st.divider()
-        if st.button("Deshacer último escaneo"):
-            ok, msg = undo_last_scan(active_lote)
-            st.success(msg) if ok else st.warning(msg)
-            if ok: st.rerun()
-
-        recientes = get_recent_scans(active_lote, limit=8)
-        if not recientes.empty:
-            st.subheader("Últimos escaneos")
-            recientes = recientes.rename(columns={
-                "created_at": "Fecha",
-                "descripcion": "Producto",
-                "codigo_ml": "Código ML",
-                "sku": "SKU",
-                "cantidad": "Cantidad",
-                "modo": "Modo",
-            })
-            st.dataframe(recientes, use_container_width=True, hide_index=True, height=260)
-
-elif page == "Supervisor":
-    st.subheader("Panel supervisor")
-    if not active_lote:
-        st.warning("No hay lote activo.")
+    st.subheader("Capas de validación")
+    validations = model.get("validations", {"summary": pd.DataFrame(), "details": {}})
+    summary_df = validations.get("summary", pd.DataFrame())
+    if summary_df.empty:
+        st.info("No encontré hallazgos de validación para la carga actual.")
     else:
-        lote = get_lote(active_lote)
-        items = get_items(active_lote)
-        capacity_sup = st.number_input("Capacidad de rollo para validar bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="supervisor_capacity")
-        ok_cierre, issues, cierre_data = cierre_validaciones(active_lote, int(capacity_sup))
-        metrics = supervisor_metrics(active_lote)
-        total = metrics["total"]
-        done = metrics["done"]
-        avance = (done / total * 100) if total else 0
+        st.dataframe(summary_df, use_container_width=True, hide_index=True, height=240)
+        with st.expander("Ver detalle por capa"):
+            for name, detail_df in validations.get("details", {}).items():
+                if detail_df is not None and not detail_df.empty:
+                    st.markdown(f"**{name}**")
+                    st.dataframe(detail_df, use_container_width=True, hide_index=True, height=min(260, 60 + 35 * len(detail_df.head(10))))
 
-        s1, s2, s3, s4, s5 = st.columns(5)
-        s1.metric("Estado lote", clean_text(lote.get("status", "ACTIVO")))
-        s2.metric("Avance", f"{avance:.1f}%")
-        s3.metric("Pendientes", metrics["pending"])
-        s4.metric("Incidencias abiertas", metrics["incidencias_abiertas"])
-        s5.metric("Etiquetas pendientes", metrics["label_pending"])
+    st.subheader("Brecha maestra vs última compra")
+    b1, b2, b3 = st.columns([1.1, 1.1, 1.4])
+    cost_state_filter = b1.multiselect("Estado costo", ["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK", "SIN DATOS"], default=["CRÍTICO", "ALERTA", "BAJÓ COSTO", "OK"], key="cost_gap_state_filter")
+    cost_sort = b2.selectbox("Orden costo", ["Mayor brecha costo", "Mayor última compra", "Mayor costo maestra"], key="cost_gap_sort")
+    cost_limit = int(b3.number_input("Filas costo", min_value=20, max_value=10000, value=200, step=20, key="cost_gap_limit"))
 
-        st.progress(done / total if total else 0)
-        st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Creado: {fmt_dt(lote.get('created_at',''))}")
+    brechas = action_table.copy()
+    if cost_state_filter:
+        brechas = brechas[brechas["estado_brecha_costo"].isin(cost_state_filter)]
+    sort_col = {
+        "Mayor brecha costo": "brecha_costo_pct",
+        "Mayor última compra": "ultimo_costo_compra",
+        "Mayor costo maestra": "costo_maestra",
+    }[cost_sort]
+    brechas = brechas.sort_values(sort_col, ascending=False, na_position="last")
+    brechas_show = brechas[[
+        "sku", "descripcion", "costo_maestra", "ultimo_costo_compra", "brecha_costo_clp", "brecha_costo_pct", "estado_brecha_costo", "accion_sugerida"
+    ]].copy()
+    brechas_show.columns = ["SKU", "Descripción", "Costo maestra", "Última compra", "Brecha costo ($)", "Brecha costo %", "Estado", "Acción"]
+    for c in ["Costo maestra", "Última compra", "Brecha costo ($)"]:
+        brechas_show[c] = brechas_show[c].map(fmt_money)
+    brechas_show["Brecha costo %"] = brechas_show["Brecha costo %"].map(fmt_pct)
+    st.dataframe(brechas_show.head(cost_limit), use_container_width=True, hide_index=True, height=320)
 
-        if ok_cierre:
-            st.success("El lote está apto para cierre formal.")
+    st.subheader("Bandeja de acción Ads")
+    st.caption("Prioriza campañas que están quemando margen, las que requieren optimización y las que tienen espacio para escalar.")
+    a1, a2, a3, a4 = st.columns([1.1, 1.0, 1.0, 1.2])
+    ads_state_filter = a1.multiselect("Estado Ads", ["CRÍTICO", "ALERTA", "OPORTUNIDAD", "OK", "SIN ADS"], default=["CRÍTICO", "ALERTA", "OPORTUNIDAD", "OK"], key="ads_state_filter")
+    ads_sort = a2.selectbox("Orden Ads", ["Mayor gap ACOS", "Peor margen con Ads", "Mayor inversión Ads", "Mejor oportunidad Ads"], key="ads_sort")
+    ads_only_active = a3.selectbox("Cobertura Ads", ["Solo con ads activos", "Todos"], key="ads_coverage_filter")
+    ads_limit = int(a4.number_input("Filas Ads", min_value=20, max_value=10000, value=200, step=20, key="ads_limit"))
+
+    ads_work = action_table.copy()
+    if ads_state_filter:
+        ads_work = ads_work[ads_work["estado_ads"].isin(ads_state_filter)]
+    if ads_only_active == "Solo con ads activos":
+        ads_work = ads_work[(ads_work["ads_inversion"].fillna(0) > 0) | (ads_work["ads_ingresos"].fillna(0) > 0) | (ads_work["ads_clics"].fillna(0) > 0)]
+
+    ads_sort_map = {
+        "Mayor gap ACOS": ["gap_acos_pct", "ads_inversion"],
+        "Peor margen con Ads": ["margen_ml_con_ads", "ads_inversion"],
+        "Mayor inversión Ads": ["ads_inversion", "ads_ingresos"],
+        "Mejor oportunidad Ads": ["ads_score", "margen_ml_con_ads"],
+    }
+    sort_cols = ads_sort_map[ads_sort]
+    ascending = [False, False]
+    if ads_sort == "Peor margen con Ads":
+        ascending = [True, False]
+    ads_work = ads_work.sort_values(sort_cols, ascending=ascending, na_position="last")
+
+    ads_required_cols = [
+        "sku", "descripcion", "estado_ads", "ads_inversion", "ads_ingresos", "ads_acos",
+        "acos_max_permitido_pct", "gap_acos_pct", "margen_ml_reportado", "margen_ml_con_ads",
+        "brecha_ads_objetivo_pp", "accion_ads"
+        ]
+    for col in ads_required_cols:
+        if col not in ads_work.columns:
+            ads_work[col] = np.nan
+    ads_show = ads_work[ads_required_cols].copy()
+    ads_show.columns = [
+        "SKU", "Descripción", "Estado Ads", "Inversión Ads", "Ingresos Ads", "ACOS real",
+        "ACOS máx.", "Gap ACOS", "Margen sin Ads", "Margen con Ads",
+        "Brecha vs objetivo", "Acción Ads"
+        ]
+    for c in ["Inversión Ads", "Ingresos Ads"]:
+        ads_show[c] = ads_show[c].map(fmt_money)
+    for c in ["ACOS real", "ACOS máx.", "Gap ACOS", "Margen sin Ads", "Margen con Ads", "Brecha vs objetivo"]:
+        ads_show[c] = ads_show[c].map(fmt_pct)
+    st.dataframe(ads_show.head(ads_limit), use_container_width=True, hide_index=True, height=320)
+
+    st.subheader("Brecha comercial real: monto en simulación maestra vs ingreso simulado ML políticas 2026")
+    st.caption("La brecha comercial se separa por publicación. La maestra ya soporta columnas corridas o repetidas por slot Meli; el cruce prioriza MLC, luego MLC sincronizado y finalmente SKU como respaldo.")
+    c1, c2, c3 = st.columns([1.1, 1.1, 1.4])
+    commercial_sort = c1.selectbox("Orden comercial", ["Mayor brecha comercial", "Mayor ingreso simulado ML 2026", "Mayor monto simulación"], key="commercial_sort")
+    only_with_pub = c2.selectbox("Cobertura ML", ["Solo con publicación", "Todos"], key="commercial_pub_filter")
+    commercial_limit = int(c3.number_input("Filas comercial", min_value=20, max_value=10000, value=200, step=20, key="commercial_limit"))
+
+    commercial = model.get("brecha_comercial_df", pd.DataFrame()).copy()
+    if commercial.empty:
+        commercial = action_table.copy()
+    if only_with_pub == "Solo con publicación" and "ingreso_referencia_comercial" in commercial.columns:
+        commercial = commercial[commercial["ingreso_referencia_comercial"].notna()]
+    commercial = commercial.sort_values({
+        "Mayor brecha comercial": "brecha_monto_sim_pct",
+        "Mayor ingreso simulado ML 2026": "ingreso_referencia_comercial",
+        "Mayor monto simulación": "monto_sim",
+    }[commercial_sort], ascending=False, na_position="last")
+    commercial_required_cols = [
+        "sku", "mlc", "slot", "descripcion", "status_publicacion",
+        "monto_sim", "ingreso_referencia_comercial", "brecha_monto_sim_pct",
+        "costo_ml_politica_2026", "margen_ml_reportado"
+        ]
+    for col in commercial_required_cols:
+        if col not in commercial.columns:
+            commercial[col] = np.nan
+    commercial_show = commercial[commercial_required_cols].copy()
+    commercial_show.columns = [
+        "SKU", "MLC", "Slot", "Descripción", "Status",
+        "Monto simulación maestra", "Ingreso simulado ML 2026", "Brecha comercial %",
+        "Costo ML política 2026", "Margen ML reportado"
+        ]
+    for c in ["Monto simulación maestra", "Ingreso simulado ML 2026", "Costo ML política 2026"]:
+        if c in commercial_show.columns:
+            commercial_show[c] = commercial_show[c].map(fmt_money)
+    for c in ["Brecha comercial %", "Margen ML reportado"]:
+        if c in commercial_show.columns:
+            commercial_show[c] = commercial_show[c].map(fmt_pct)
+    st.dataframe(commercial_show.head(commercial_limit), use_container_width=True, hide_index=True, height=360)
+
+# =========================================================
+# Tab 2 - Product sheet
+# =========================================================
+with tabs[1]:
+    if "selected_sku" not in st.session_state:
+        st.session_state.selected_sku = model["product_options"][0] if model["product_options"] else None
+
+    options = [f"{sku} — {model['sku_desc'].get(sku, '')}" for sku in model["product_options"]]
+    selected_label = st.selectbox("Producto", options, index=max(0, options.index(f"{st.session_state.selected_sku} — {model['sku_desc'].get(st.session_state.selected_sku, '')}")) if st.session_state.selected_sku and f"{st.session_state.selected_sku} — {model['sku_desc'].get(st.session_state.selected_sku, '')}" in options else 0)
+    sku = selected_label.split(" — ")[0] if selected_label else None
+    st.session_state.selected_sku = sku
+
+    row = action_table[action_table["sku"] == sku]
+    if row.empty:
+        st.warning("No encontré el SKU seleccionado.")
+    else:
+        row = row.iloc[0]
+        header_l, header_r = st.columns([3, 1.2])
+        with header_l:
+            st.subheader(f"{row['sku']} — {row['descripcion']}")
+            st.write(f"MLC asociados: {format_mlc_list(row.get('mlcs'))}")
+        with header_r:
+            st.metric("Estado general", row["estado_general"])
+            st.metric("Acción sugerida", row["accion_sugerida"])
+
+        st.markdown("### Resumen rápido")
+        r1, r2, r3, r4, r5, r6 = st.columns(6)
+        r1.metric("Ventas ML 30d", fmt_money(row.get("ingresos_ml_30d")), fmt_int(row.get("unidades_ml_30d")) + " un")
+        r2.metric("Ventas tienda 30d", fmt_money(row.get("ingresos_tienda_30d")), fmt_int(row.get("unidades_tienda_30d")) + " un")
+        r3.metric("Margen ML actual", fmt_pct(row.get("margen_ml_actual")))
+        r4.metric("Margen hist. ML 30d", fmt_pct(row.get("margen_hist_30d")))
+        r5.metric("Δ margen", "—" if pd.isna(row.get("delta_margen_30d_pp")) else f"{row.get('delta_margen_30d_pp'):.1f} pp")
+        r6.metric("Brecha costo ($)", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
+
+        st.markdown("### Precios y rentabilidad")
+        a, b = st.columns(2)
+        with a:
+            st.markdown("#### Mercado Libre")
+            st.write(f"Precio ML actual: {fmt_money(row.get('precio_ml_actual'))}")
+            st.write(f"Precio base ML: {fmt_money(row.get('precio_ml_base'))}")
+            st.write(f"Precio oferta ML: {fmt_money(row.get('precio_ml_oferta'))}")
+            st.write(f"Monto en simulación: {fmt_money(row.get('monto_sim'))}")
+            st.write(f"Ingreso simulado ML 2026: {fmt_money(row.get('ingreso_referencia_comercial'))}")
+            st.write(f"Margen ML actual: {fmt_pct(row.get('margen_ml_actual'))}")
+            st.write(f"Costo ML política 2026: {fmt_money(row.get('costo_ml_politica_2026'))}")
+            st.write(f"Margen histórico ML 30d: {fmt_pct(row.get('margen_hist_30d'))}")
+            st.write(f"Margen histórico ML 90d: {fmt_pct(row.get('margen_hist_90d'))}")
+            st.write(f"Margen histórico ML total: {fmt_pct(row.get('margen_hist_total'))}")
+            st.write(f"Brecha precio ML: {fmt_pct(row.get('brecha_precio_pct'))}")
+            st.write(f"Brecha comercial (monto simulación maestra vs ingreso simulado ML 2026): {fmt_pct(row.get('brecha_monto_sim_pct'))}")
+        with b:
+            st.markdown("#### Tienda")
+            st.write(f"Precio bruto tienda: {fmt_money(row.get('precio_bruto'))}")
+            st.write(f"Margen tienda actual: {fmt_pct(row.get('margen_tienda_actual'))}")
+            st.write(f"Precio neto tienda: {fmt_money(row.get('precio_bruto') / 1.19 if pd.notna(row.get('precio_bruto')) else np.nan)}")
+            st.write(f"Ventas tienda 30d: {fmt_money(row.get('ingresos_tienda_30d'))}")
+            st.write(f"Ventas tienda 90d: {fmt_money(model['sales_windows'].get(90, pd.DataFrame()).set_index('sku').get('ingresos_tienda_90d', pd.Series()).get(sku, np.nan) if not model['sales_windows'].get(90, pd.DataFrame()).empty else np.nan)}")
+
+        st.markdown("### Ads")
+        ads_detail = build_ads_report_detail_for_sku(sku, model.get("product_ads", pd.DataFrame()), model.get("pubs", pd.DataFrame()))
+        if ads_detail.empty:
+            st.info("No encontré Product Ads asociados a las publicaciones de este SKU.")
         else:
-            st.warning("El lote aún no está apto para cierre.")
-            for issue in issues:
-                st.write(f"• {issue}")
+            inversion_total = ads_detail["inversion_ads"].fillna(0).sum()
+            ingresos_total = ads_detail["ingresos_ads"].fillna(0).sum()
+            ventas_total = ads_detail["ventas_ads"].fillna(0).sum()
+            acos_total = (inversion_total / ingresos_total * 100) if ingresos_total > 0 else np.nan
+            roas_total = (ingresos_total / inversion_total) if inversion_total > 0 else np.nan
 
-        tab_resumen, tab_pendientes, tab_incid, tab_control, tab_auditoria, tab_bloques, tab_reimp, tab_cierre = st.tabs(["Resumen", "Pendientes", "Incidencias", "Control", "Auditoría", "Bloques", "Reimpresión", "Cierre"])
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Ads en reporte", "Sí")
+            m2.metric("Inversión", fmt_money(inversion_total))
+            m3.metric("Ingresos ads", fmt_money(ingresos_total))
+            m4.metric("ACOS", fmt_pct(acos_total))
+            m5.metric("ROAS", f"{roas_total:.2f}" if pd.notna(roas_total) else "—")
+            st.caption(f"Ventas por publicidad: {fmt_int(ventas_total)}")
 
-        with tab_resumen:
-            view = items.copy()
-            if not view.empty:
-                view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-                resumen = pd.DataFrame([{
-                    "Unidades solicitadas": int(view["unidades"].sum()),
-                    "Unidades acopiadas": int(view["acopiadas"].sum()),
-                    "Unidades pendientes": int(view["pendiente"].sum()),
-                    "Líneas totales": int(len(view)),
-                    "Líneas pendientes": int((view["pendiente"] > 0).sum()),
-                    "Bloques impresos": cierre_data.get("printed_blocks", 0),
-                    "Bloques esperados": cierre_data.get("expected_blocks", 0),
-                    "Incidencias abiertas": cierre_data.get("open_incidents", 0),
-                }])
-                st.dataframe(resumen, use_container_width=True, hide_index=True)
+            ads_show = ads_detail[["campana", "mlc", "estado", "inversion_ads", "ingresos_ads", "acos", "roas", "ventas_ads"]].copy()
+            ads_show.columns = ["Campaña", "MLC", "Estado", "Inversión", "Ingresos", "ACOS", "ROAS", "Ventas Ads"]
+            ads_show["MLC"] = ads_show["MLC"].astype(str).str.replace(r"\.0$", "", regex=True)
+            ads_show["Inversión"] = ads_show["Inversión"].map(fmt_money)
+            ads_show["Ingresos"] = ads_show["Ingresos"].map(fmt_money)
+            ads_show["ACOS"] = ads_show["ACOS"].map(fmt_pct)
+            ads_show["ROAS"] = ads_show["ROAS"].map(lambda x: f"{safe_float(x, np.nan):.2f}" if pd.notna(x) else "—")
+            ads_show["Ventas Ads"] = ads_show["Ventas Ads"].map(fmt_int)
+            st.dataframe(ads_show, use_container_width=True, hide_index=True, height=220)
 
-        with tab_pendientes:
-            view = items.copy()
-            if not view.empty:
-                view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-                pend = view[view["pendiente"] > 0].copy()
-                if pend.empty:
-                    st.success("No hay productos pendientes.")
-                else:
-                    out = pend.rename(columns={"codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto", "unidades": "Solicitadas", "acopiadas": "Acopiadas", "pendiente": "Pendiente", "identificacion": "Identificación", "vence": "Vence"})
-                    cols = ["Código ML", "SKU", "Producto", "Solicitadas", "Acopiadas", "Pendiente", "Identificación", "Vence"]
-                    st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
-
-        with tab_incid:
-            inc = get_incidencias(active_lote)
-            if inc.empty:
-                st.success("Sin incidencias registradas.")
-            else:
-                out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
-                cols = ["Fecha", "Estado", "Tipo", "Cantidad", "Código ML", "SKU", "Producto", "Comentario", "Usuario"]
-                st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=520)
-
-        with tab_control:
-            st.subheader("Control de lote")
-            if items.empty:
-                st.warning("El lote no tiene productos.")
-            else:
-                view = items.copy()
-                view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-                view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
-                scans = get_last_scans(active_lote)
-                if not scans.empty:
-                    view = view.merge(scans, left_on="id", right_on="item_id", how="left")
-                else:
-                    view["procesado_at"] = ""
-
-                c1, c2, c3, c4 = st.columns(4)
-                total_control = int(view["unidades"].sum())
-                done_control = int(view["acopiadas"].sum())
-                c1.metric("Unidades", total_control)
-                c2.metric("Acopiadas", done_control)
-                c3.metric("Pendientes", max(total_control - done_control, 0))
-                c4.metric("Avance", f"{(done_control / total_control * 100) if total_control else 0:.1f}%")
-
-                filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"], key="sup_control_filter")
-                show = view
-                if filtro == "Pendientes":
-                    show = view[view["pendiente"] > 0]
-                elif filtro == "Completos":
-                    show = view[view["pendiente"] == 0]
-                elif filtro == "Supermercado":
-                    show = view[view["identificacion"].map(is_supermercado)]
-
-                option_rows = []
-                option_map = {"": None}
-                for _, sr in show.iterrows():
-                    desc = clean_text(sr.get("descripcion", ""))
-                    sku = clean_text(sr.get("sku", ""))
-                    ml = clean_text(sr.get("codigo_ml", ""))
-                    ean = clean_text(sr.get("codigo_universal", ""))
-                    ident = clean_text(sr.get("identificacion", ""))
-                    label = f"{desc} | SKU {sku} | ML {ml} | EAN {ean} | {ident}"[:180]
-                    option_rows.append(label)
-                    option_map[label] = int(sr["id"])
-
-                selected_search = st.selectbox(
-                    "Buscar producto",
-                    [""] + option_rows,
-                    index=0,
-                    placeholder="Escribe nombre, SKU, Código ML, EAN o supermercado",
-                    key="sup_control_search_select",
-                )
-                selected_id = option_map.get(selected_search)
-                if selected_id:
-                    show = show[show["id"].astype(int) == int(selected_id)]
-
-                st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
-                modo_vista = st.radio("Vista control", ["Tarjetas operativas", "Tabla"], horizontal=True, key="sup_control_view_mode")
-                if modo_vista == "Tarjetas operativas":
-                    for _, r in show.iterrows():
-                        ident = clean_text(r.get("identificacion", ""))
-                        vence = clean_text(r.get("vence", ""))
-                        proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
-                        badges_parts = [
-                            f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
-                            f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
-                            f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
-                        ]
-                        if ident:
-                            badges_parts.append(f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>")
-                        if vence:
-                            badges_parts.append(f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>")
-                        badges_parts.append(f"<span class='badge'>Procesado: {esc(proc)}</span>")
-                        st.markdown(
-                            f"""
-                            <div class='control-card'>
-                                <div class='control-title'>{esc(r['descripcion'])}</div>
-                                <div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>
-                                <div>{''.join(badges_parts)}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    out = show.copy()
-                    out["Procesado"] = out["procesado_at"].map(fmt_dt)
-                    out = out.rename(columns={
-                        "sku": "SKU", "codigo_ml": "Código ML", "codigo_universal": "EAN / Código universal",
-                        "descripcion": "Producto", "unidades": "Unidades", "acopiadas": "Acopiadas", "pendiente": "Pendiente",
-                        "identificacion": "Identificación", "vence": "Vence", "estado": "Estado"
-                    })
-                    cols = ["SKU", "Código ML", "EAN / Código universal", "Producto", "Unidades", "Acopiadas", "Pendiente", "Identificación", "Vence", "Procesado", "Estado"]
-                    st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
-
-                st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="sup_export_control_excel")
-                st.divider()
-                if st.button("Eliminar lote activo", key="sup_delete_lote"):
-                    delete_lote(active_lote)
-                    st.success("Lote eliminado.")
-                    st.rerun()
-
-        with tab_auditoria:
-            st.subheader("Auditoría operacional")
-            eventos = get_audit_events(active_lote, limit=500)
-            if eventos.empty:
-                st.info("Aún no hay eventos de auditoría para este lote.")
-            else:
-                f_eventos = ["Todos"] + sorted([x for x in eventos["event_type"].dropna().unique().tolist()])
-                filtro_evento = st.selectbox("Filtrar evento", f_eventos, key="sup_audit_filter")
-                show_audit = eventos.copy()
-                if filtro_evento != "Todos":
-                    show_audit = show_audit[show_audit["event_type"] == filtro_evento]
-                show_audit = show_audit.rename(columns={
-                    "created_at": "Fecha",
-                    "event_type": "Evento",
-                    "detail": "Detalle",
-                    "qty": "Cantidad",
-                    "codigo_ml": "Código ML",
-                    "sku": "SKU",
-                    "mode": "Modo",
-                    "item_id": "Item ID",
-                })
-                st.dataframe(show_audit, use_container_width=True, hide_index=True, height=650)
-                st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
-
-        with tab_bloques:
-            labels = label_control_view(active_lote)
-            expected = build_label_blocks(labels, int(capacity_sup)) if not labels.empty else []
-            blocks_db = get_label_blocks_df(active_lote)
-            printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
-            rows = []
-            for b in expected:
-                rows.append({"Bloque": int(b["block_index"]), "Estado": "IMPRESO" if str(b["block_key"]) in printed_keys else "PENDIENTE", "Productos": int(b["products_count"]), "Etiquetas normales": int(b["normal_qty"]), "Inicio/Fin": int(b["separator_qty"]), "Total": int(b["total_qty"]), "Key": b["block_key"]})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=520)
-
-        with tab_reimp:
-            st.info("Toda reimpresión requiere motivo. Esto evita duplicaciones no controladas.")
-            mode_rep = st.radio("Tipo de reimpresión", ["Bloque completo", "Producto individual"], horizontal=True, key="sup_rep_mode")
-            usuario_rep = st.text_input("Usuario que reimprime", key="sup_rep_usuario", placeholder="Ej: p1, p2, supervisor")
-            motivo_rep = st.text_area("Motivo obligatorio", key="sup_rep_motivo", placeholder="Ej: rollo se cortó a mitad de bloque, etiqueta dañada, impresora pausada, etc.")
-            if mode_rep == "Bloque completo":
-                view_rep = label_control_view(active_lote)
-                expected_rep = build_label_blocks(view_rep, int(capacity_sup)) if not view_rep.empty else []
-                blocks_db_rep = get_label_blocks_df(active_lote)
-                printed_keys_rep = set(blocks_db_rep["block_key"].astype(str).tolist()) if not blocks_db_rep.empty else set()
-                printed_blocks = [b for b in expected_rep if str(b["block_key"]) in printed_keys_rep]
-                if not printed_blocks:
-                    st.warning("Aún no hay bloques impresos para reimprimir.")
-                else:
-                    labels_rep = [f"Bloque {int(b['block_index'])} · {int(b['products_count'])} productos · {int(b['total_qty'])} etiquetas" for b in printed_blocks]
-                    map_blocks = {labels_rep[i]: printed_blocks[i] for i in range(len(labels_rep))}
-                    selected_block_label = st.selectbox("Bloque a reimprimir", labels_rep, key="sup_rep_block")
-                    block = map_blocks[selected_block_label]
-                    zpl_data = zpl_for_block(block).encode("utf-8")
-                    fname = f"reimpresion_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
-                    if clean_text(motivo_rep) and clean_text(usuario_rep):
-                        st.download_button("Descargar ZPL y registrar reimpresión", data=zpl_data, file_name=fname, mime="text/plain", key=f"sup_reprint_block_{active_lote}_{block['block_index']}_{block['block_key']}_{hashlib.sha1((clean_text(motivo_rep)+clean_text(usuario_rep)).encode()).hexdigest()[:8]}", on_click=register_controlled_block_reprint, args=(active_lote, block, motivo_rep, usuario_rep))
-                    else:
-                        st.warning("Ingresa usuario y motivo para habilitar descarga.")
-            else:
-                view_rep = label_control_view(active_lote)
-                options_rep = []
-                option_map_rep = {}
-                for _, r in view_rep.iterrows():
-                    label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
-                    options_rep.append(label)
-                    option_map_rep[label] = int(r["id"])
-                if not options_rep:
-                    st.warning("No hay productos.")
-                else:
-                    selected_item_label = st.selectbox("Producto a reimprimir", options_rep, key="sup_rep_item")
-                    item_id = option_map_rep[selected_item_label]
-                    row = view_rep[view_rep["id"].astype(int) == int(item_id)].iloc[0].to_dict()
-                    qty_rep = st.number_input("Cantidad de etiquetas normales", min_value=1, max_value=9999, value=1, step=1, key="sup_rep_qty")
-                    zpl_ind = zpl_for_item_with_separators(row, int(qty_rep)).encode("utf-8")
-                    fname_ind = f"reimpresion_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
-                    if clean_text(motivo_rep) and clean_text(usuario_rep):
-                        st.download_button("Descargar ZPL individual y registrar reimpresión", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"sup_reprint_item_{active_lote}_{item_id}_{qty_rep}_{hashlib.sha1((clean_text(motivo_rep)+clean_text(usuario_rep)).encode()).hexdigest()[:8]}", on_click=register_controlled_item_reprint, args=(active_lote, row, int(qty_rep), motivo_rep, usuario_rep))
-                    else:
-                        st.warning("Ingresa usuario y motivo para habilitar descarga.")
-            hist_rep = get_reimpresiones(active_lote)
-            if not hist_rep.empty:
-                st.divider()
-                st.subheader("Historial de reimpresiones")
-                out_rep = hist_rep.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
-                st.dataframe(out_rep, use_container_width=True, hide_index=True, height=320)
-
-        with tab_cierre:
-            lote_close = get_lote(active_lote)
-            ok_close2, issues2, data_close2 = cierre_validaciones(active_lote, int(capacity_sup))
+        st.markdown("### Compras")
+        ps = model["purchase_summary"]
+        purchase_row = ps[ps["sku"] == sku]
+        if purchase_row.empty:
+            st.info("No encontré compras para este SKU.")
+        else:
+            pr = purchase_row.iloc[0]
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Estado actual", clean_text(lote_close.get("status", "ACTIVO")))
-            c2.metric("Unidades pendientes", data_close2.get("pending_units", 0))
-            c3.metric("Incidencias abiertas", data_close2.get("open_incidents", 0))
-            c4.metric("Bloques", f"{data_close2.get('printed_blocks',0)}/{data_close2.get('expected_blocks',0)}")
-            if clean_text(lote_close.get("status")) == "CERRADO":
-                st.success(f"Lote cerrado por {clean_text(lote_close.get('closed_by',''))} el {fmt_dt(lote_close.get('closed_at',''))}.")
-                st.caption(clean_text(lote_close.get("close_note", "")))
-                with st.expander("Reabrir lote"):
-                    reopen_user = st.text_input("Usuario", key="sup_reopen_user", placeholder="Ej: supervisor")
-                    reopen_reason = st.text_area("Motivo de reapertura", key="sup_reopen_reason")
-                    if st.button("Reabrir lote", type="primary", key="sup_reopen_btn"):
-                        if not clean_text(reopen_user):
-                            st.error("Ingresa el usuario.")
-                        else:
-                            ok_reopen, msg_reopen = reopen_lote(active_lote, reopen_user, reopen_reason)
-                            st.success(msg_reopen) if ok_reopen else st.error(msg_reopen)
-                            if ok_reopen:
-                                st.rerun()
+            c1.metric("Última compra", fmt_date(pr["ultima_fecha_compra"]))
+            c2.metric("Último costo compra", fmt_money(pr["ultimo_costo_compra"]))
+            c3.metric("Proveedor", pr["ultimo_proveedor"])
+            c4.metric("Brecha maestra vs última compra", fmt_money(row.get("brecha_costo_clp")), fmt_pct(row.get("brecha_costo_pct")))
+            hist = model["purchase_map"].get(sku, pd.DataFrame()).copy()
+            if not hist.empty:
+                hist_show = hist[["fecha", "proveedor", "cantidad", "precio_unitario", "documento", "folio"]].sort_values("fecha", ascending=False)
+                hist_show.columns = ["Fecha", "Proveedor", "Cantidad", "Precio Unitario", "Documento", "Folio"]
+                hist_show["Fecha"] = hist_show["Fecha"].map(fmt_date)
+                hist_show["Precio Unitario"] = hist_show["Precio Unitario"].map(fmt_money)
+                st.dataframe(hist_show, use_container_width=True, hide_index=True, height=280)
+
+        st.markdown("### Comportamiento de venta")
+        b1, b2 = st.columns(2)
+        with b1:
+            sw = model["sales_windows"].get(default_period, pd.DataFrame())
+            srow = sw[sw["sku"] == sku]
+            if srow.empty:
+                st.info("No encontré ventas para este SKU en el periodo.")
             else:
-                if ok_close2:
-                    st.success("Validación correcta. El lote puede cerrarse.")
+                srow = srow.iloc[0]
+                total_ing = safe_float(srow.get(f"ingresos_ml_{default_period}d"), 0) + safe_float(srow.get(f"ingresos_tienda_{default_period}d"), 0)
+                part_ml = safe_float(srow.get(f"ingresos_ml_{default_period}d"), 0) / total_ing * 100 if total_ing > 0 else np.nan
+                part_t = safe_float(srow.get(f"ingresos_tienda_{default_period}d"), 0) / total_ing * 100 if total_ing > 0 else np.nan
+                st.write(f"Participación ML {default_period}d: {fmt_pct(part_ml)}")
+                st.write(f"Participación tienda {default_period}d: {fmt_pct(part_t)}")
+                st.write(f"Empresas {default_period}d: {fmt_pct(srow.get(f'participacion_empresa_{default_period}d'))}")
+                st.write(f"Personas {default_period}d: {fmt_pct(srow.get(f'participacion_persona_{default_period}d'))}")
+        with b2:
+            if not srow.empty:
+                st.write(f"Compra típica empresas: {fmt_int(srow.get(f'mediana_unidades_empresa_{default_period}d'))} unidades")
+                st.write(f"P90 empresas: {fmt_int(srow.get(f'p90_unidades_empresa_{default_period}d'))} unidades")
+                st.write(f"Compra típica personas: {fmt_int(srow.get(f'mediana_unidades_persona_{default_period}d'))} unidades")
+                st.write(f"P90 personas: {fmt_int(srow.get(f'p90_unidades_persona_{default_period}d'))} unidades")
+
+        st.markdown("### Datos de Publicación ML")
+        pr = choose_primary_publication(model["pub_map"].get(sku, pd.DataFrame()))
+        if pr is None:
+            st.info("No encontré publicación principal para este SKU.")
+        else:
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Dimensiones", pr["dimensiones"])
+            peso_real = "—"
+            if pd.notna(pr.get("peso_grs", np.nan)):
+                peso_g = safe_float(pr.get("peso_grs"), np.nan)
+                peso_real = f"{peso_g/1000:.2f} kg" if peso_g >= 1000 else f"{peso_g:.0f} g"
+            d2.metric("Peso", peso_real)
+            d3.metric("Peso volumétrico", f"{safe_float(pr['peso_volumetrico_kg'], np.nan):.2f} kg" if pd.notna(pr["peso_volumetrico_kg"]) else "—")
+            d4.metric("Días publicado", fmt_int(pr["dias_publicado"]))
+            st.caption(f"Status: {pr['status']} | Entrega: {pr['entrega']}")
+
+        st.markdown("### Historial de ventas")
+        sales_sku = model["ventas"][model["ventas"]["sku"] == sku].copy()
+        if sales_sku.empty:
+            st.info("No encontré ventas para este SKU.")
+        else:
+            sales_sku["fecha"] = pd.to_datetime(sales_sku["fecha"], errors="coerce")
+            sales_sku = sales_sku.sort_values("fecha", ascending=False)
+
+            sales_ml = sales_sku[sales_sku["canal"] == "ML"].copy()
+            sales_tienda = sales_sku[sales_sku["canal"] == "TIENDA"].copy()
+
+            hm1, hm2, hm3, hm4 = st.columns(4)
+            hm1.metric("Ventas ML totales", fmt_money(sales_ml["total_linea"].sum()))
+            hm2.metric("Unidades ML", fmt_int(sales_ml["cantidad"].sum()))
+            hm3.metric("Ventas tienda totales", fmt_money(sales_tienda["total_linea"].sum()))
+            hm4.metric("Unidades tienda", fmt_int(sales_tienda["cantidad"].sum()))
+
+            vv1, vv2 = st.columns(2)
+            with vv1:
+                st.markdown("#### Ventas Mercado Libre")
+                if sales_ml.empty:
+                    st.info("No encontré ventas ML para este SKU.")
                 else:
-                    st.error("El lote no se puede cerrar todavía.")
-                    for issue in issues2:
-                        st.write(f"• {issue}")
-                close_user = st.text_input("Cerrado por", key="sup_close_user", placeholder="Ej: supervisor")
-                close_note = st.text_area("Nota de cierre", placeholder="Ej: lote revisado completo, sin diferencias abiertas.", key="sup_close_note")
-                if st.button("Cerrar lote", type="primary", disabled=not ok_close2, key="sup_close_btn"):
-                    if not clean_text(close_user):
-                        st.error("Ingresa quién cierra el lote.")
-                    else:
-                        ok_final, msg_final = close_lote(active_lote, close_user, close_note)
-                        st.success(msg_final) if ok_final else st.error(msg_final)
-                        if ok_final:
-                            st.rerun()
+                    ml_show = sales_ml[["fecha", "tipo_cliente", "cantidad", "precio_unitario", "total_linea", "cliente", "rut"]].copy()
+                    ml_show.columns = ["Fecha", "Tipo cliente", "Cantidad", "Precio unitario", "Total línea", "Cliente", "RUT"]
+                    ml_show["Fecha"] = ml_show["Fecha"].map(fmt_date)
+                    ml_show["Precio unitario"] = ml_show["Precio unitario"].map(fmt_money)
+                    ml_show["Total línea"] = ml_show["Total línea"].map(fmt_money)
+                    st.dataframe(ml_show, use_container_width=True, hide_index=True, height=320)
 
-
-elif page == "Incidencias":
-    st.subheader("Incidencias operativas")
-    if not active_lote:
-        st.warning("No hay lote activo.")
-    else:
-        items = get_items(active_lote)
-        tab_new, tab_open, tab_all = st.tabs(["Nueva incidencia", "Abiertas", "Historial"])
-        with tab_new:
-            st.info("Registra problemas reales del lote: faltantes, daños, códigos que no coinciden o problemas de impresión.")
-            options = ["General del lote"]
-            option_map = {"General del lote": None}
-            for _, r in items.iterrows():
-                label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
-                options.append(label)
-                option_map[label] = int(r["id"])
-            selected_inc = st.selectbox("Producto afectado", options, index=0)
-            tipo_inc = st.selectbox("Tipo de incidencia", INCIDENCIA_TIPOS)
-            qty_inc = st.number_input("Cantidad afectada", min_value=0, max_value=99999, value=1, step=1)
-            comentario_inc = st.text_area("Comentario", placeholder="Describe qué ocurrió y qué evidencia existe.")
-            usuario_inc = st.text_input("Usuario responsable del registro", value=get_operator_name(), key="inc_usuario")
-            if st.button("Registrar incidencia", type="primary"):
-                if len(clean_text(comentario_inc)) < 3:
-                    st.error("Agrega un comentario mínimo para que la incidencia sea útil.")
+            with vv2:
+                st.markdown("#### Ventas Tienda")
+                if sales_tienda.empty:
+                    st.info("No encontré ventas tienda para este SKU.")
                 else:
-                    create_incidencia(active_lote, option_map.get(selected_inc), tipo_inc, int(qty_inc), comentario_inc, usuario_inc)
-                    st.success("Incidencia registrada.")
-                    st.rerun()
-        with tab_open:
-            inc = get_incidencias(active_lote, status="ABIERTA")
-            if inc.empty:
-                st.success("No hay incidencias abiertas.")
-            else:
-                for _, r in inc.iterrows():
-                    st.markdown(f"""
-                    <div class='control-card'>
-                        <div class='control-title'>{esc(r.get('tipo',''))} · {esc(r.get('descripcion','') or 'General del lote')}</div>
-                        <div class='control-meta'><b>Estado:</b> {esc(r.get('status',''))} · <b>Cantidad:</b> {int(r.get('cantidad') or 0)} · <b>Usuario:</b> {esc(r.get('usuario',''))} · <b>Fecha:</b> {esc(fmt_dt(r.get('created_at','')))}</div>
-                        <div>{esc(r.get('comentario',''))}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    with st.expander(f"Resolver incidencia #{int(r['id'])}"):
-                        res_user = st.text_input("Resuelto por", value=get_operator_name(), key=f"res_user_{int(r['id'])}")
-                        res_comment = st.text_area("Comentario de resolución", key=f"res_comment_{int(r['id'])}")
-                        if st.button("Marcar como resuelta", key=f"resolve_{int(r['id'])}", type="primary"):
-                            ok_res, msg_res = resolve_incidencia(int(r["id"]), res_user, res_comment)
-                            st.success(msg_res) if ok_res else st.error(msg_res)
-                            if ok_res:
-                                st.rerun()
-        with tab_all:
-            inc = get_incidencias(active_lote)
-            if inc.empty:
-                st.info("Sin incidencias.")
-            else:
-                out = inc.rename(columns={"created_at": "Fecha", "tipo": "Tipo", "cantidad": "Cantidad", "comentario": "Comentario", "usuario": "Usuario", "status": "Estado", "resolved_at": "Fecha resolución", "resolved_by": "Resuelto por", "resolution_comment": "Comentario resolución", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
-                st.dataframe(out, use_container_width=True, hide_index=True, height=620)
+                    tienda_show = sales_tienda[["fecha", "tipo_cliente", "cantidad", "precio_unitario", "total_linea", "cliente", "rut"]].copy()
+                    tienda_show.columns = ["Fecha", "Tipo cliente", "Cantidad", "Precio unitario", "Total línea", "Cliente", "RUT"]
+                    tienda_show["Fecha"] = tienda_show["Fecha"].map(fmt_date)
+                    tienda_show["Precio unitario"] = tienda_show["Precio unitario"].map(fmt_money)
+                    tienda_show["Total línea"] = tienda_show["Total línea"].map(fmt_money)
+                    st.dataframe(tienda_show, use_container_width=True, hide_index=True, height=320)
+
+# =========================================================
+# Tab 3 - Mass repricing
+# =========================================================
+if False:
+    st.subheader("Repricing técnico basado en reportes")
+    st.caption("La fuente de verdad para precio, cargos y comisión es el reporte de publicaciones ML. La maestra queda como consolidado de trabajo.")
+    x1, x2, x3, x4 = st.columns(4)
+    proveedor_alza_pct = x1.number_input("Simular alza proveedor %", min_value=-30.0, max_value=200.0, value=0.0, step=1.0)
+    comision_extra_pct = x2.number_input("Cambio fee ML (pp)", min_value=-20.0, max_value=20.0, value=0.0, step=0.5)
+    margen_obj_ml = x3.number_input("Margen objetivo ML %", min_value=0.0, max_value=80.0, value=15.0, step=0.5)
+    incluir_ads = x4.selectbox("Considerar ads en cálculo", ["Sí", "No"], index=0)
+
+    sim = action_table.copy()
+    sim = sim[sim["precio_ml_actual"].notna()].copy()
+    for _col in ["total_cargo_pct_ml", "ads_share_ml_pct", "costo_fijo_ml", "costo_maestra", "precio_ml_actual"]:
+        if _col not in sim.columns:
+            sim[_col] = np.nan
+    sim["costo_simulado"] = sim["costo_maestra"] * (1 + proveedor_alza_pct / 100.0)
+    sim["fee_total_sim_pct"] = sim["total_cargo_pct_ml"].fillna(0) + comision_extra_pct
+    sim["ads_pct_sim"] = sim["ads_share_ml_pct"].fillna(0) if incluir_ads == "Sí" else 0.0
+    sim["precio_sugerido_ml"] = sim.apply(lambda r: calc_price_for_target_ml_margin(r["costo_simulado"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), margen_obj_ml, r.get("ads_pct_sim", 0.0)), axis=1)
+    sim["margen_proyectado_actual"] = sim.apply(lambda r: calc_margin_from_ml_price(r["costo_simulado"], r["precio_ml_actual"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), r.get("ads_pct_sim", 0.0)), axis=1)
+    sim["margen_proyectado_sugerido"] = sim.apply(lambda r: calc_margin_from_ml_price(r["costo_simulado"], r["precio_sugerido_ml"], r["fee_total_sim_pct"], r.get("costo_fijo_ml", 0.0), r.get("ads_pct_sim", 0.0)), axis=1)
+    sim["delta_precio_sugerido_pct"] = np.where(
+        sim["precio_ml_actual"].notna() & (sim["precio_ml_actual"] != 0) & sim["precio_sugerido_ml"].notna(),
+        ((sim["precio_sugerido_ml"] - sim["precio_ml_actual"]) / sim["precio_ml_actual"]) * 100,
+        np.nan
+    )
+    sim["gap_margen_obj_pp"] = sim["margen_proyectado_actual"] - margen_obj_ml
+    sim["decision_repricing"] = np.select(
+        [
+            sim["margen_proyectado_actual"].isna(),
+            sim["gap_margen_obj_pp"] <= -5,
+            sim["gap_margen_obj_pp"].between(-5, -1, inclusive="left"),
+            sim["gap_margen_obj_pp"] >= 3,
+        ],
+        [
+            "Sin base suficiente",
+            "Subir precio urgente",
+            "Subir precio / revisar costo",
+            "Hay holgura",
+        ],
+        default="Mantener / monitorear",
+    )
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("SKUs con base ML", fmt_int(len(sim)))
+    k2.metric("Subir urgente", fmt_int((sim["decision_repricing"] == "Subir precio urgente").sum()))
+    k3.metric("Gap margen promedio", "—" if sim["gap_margen_obj_pp"].dropna().empty else f"{sim['gap_margen_obj_pp'].mean():.1f} pp")
+    k4.metric("Δ precio sugerido promedio", "—" if sim["delta_precio_sugerido_pct"].dropna().empty else f"{sim['delta_precio_sugerido_pct'].mean():.1f}%")
+
+    sim_show = sim[[
+        "sku", "descripcion", "costo_maestra", "costo_simulado", "precio_ml_actual", "precio_sugerido_ml",
+        "fee_total_sim_pct", "ads_pct_sim", "costo_fijo_ml", "margen_proyectado_actual", "margen_proyectado_sugerido",
+        "delta_precio_sugerido_pct", "decision_repricing", "accion_sugerida"
+    ]].copy()
+    sim_show.columns = ["SKU", "Descripción", "Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Fee ML sim %", "Ads sim %", "Costo fijo ML", "Margen proyectado actual", "Margen proyectado sugerido", "Δ precio sugerido %", "Decisión repricing", "Acción base"]
+    for c in ["Costo actual", "Costo simulado", "Precio ML actual", "Precio sugerido ML", "Costo fijo ML"]:
+        sim_show[c] = sim_show[c].map(fmt_money)
+    for c in ["Fee ML sim %", "Ads sim %", "Margen proyectado actual", "Margen proyectado sugerido", "Δ precio sugerido %"]:
+        sim_show[c] = sim_show[c].map(fmt_pct)
+    st.dataframe(sim_show.sort_values(["Decisión repricing", "Δ precio sugerido %"], ascending=[True, False]), use_container_width=True, hide_index=True, height=540)
 
 
-elif page == "Reimpresión":
-    st.subheader("Reimpresión controlada")
-    if not active_lote:
-        st.warning("No hay lote activo.")
+# =========================================================
+# Tab 3 - Ads
+# =========================================================
+with tabs[2]:
+    st.subheader("Módulo Ads")
+    st.caption("Rentabilidad Ads calculada con la base actual del sistema. Aquí puedes revisar alertas, oportunidades y el detalle por SKU con sus campañas.")
+
+    ads_table = action_table.copy()
+    if ads_table.empty:
+        st.info("No hay base suficiente para construir el módulo Ads.")
     else:
-        st.info("Toda reimpresión requiere motivo. Esto evita duplicaciones no controladas.")
-        mode_rep = st.radio("Tipo de reimpresión", ["Bloque completo", "Producto individual"], horizontal=True)
-        usuario_rep = st.text_input("Usuario que reimprime", value=get_operator_name(), key="rep_usuario")
-        motivo_rep = st.text_area("Motivo obligatorio", placeholder="Ej: rollo se cortó a mitad de bloque, etiqueta dañada, impresora pausada, etc.")
-        if mode_rep == "Bloque completo":
-            view = label_control_view(active_lote)
-            capacity_rep = st.number_input("Capacidad de rollo usada para reconstruir bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="rep_capacity")
-            expected = build_label_blocks(view, int(capacity_rep)) if not view.empty else []
-            blocks_db = get_label_blocks_df(active_lote)
-            printed_keys = set(blocks_db["block_key"].astype(str).tolist()) if not blocks_db.empty else set()
-            printed_blocks = [b for b in expected if str(b["block_key"]) in printed_keys]
-            if not printed_blocks:
-                st.warning("Aún no hay bloques impresos para reimprimir.")
-            else:
-                labels = [f"Bloque {int(b['block_index'])} · {int(b['products_count'])} productos · {int(b['total_qty'])} etiquetas" for b in printed_blocks]
-                map_blocks = {labels[i]: printed_blocks[i] for i in range(len(labels))}
-                selected_block_label = st.selectbox("Bloque a reimprimir", labels)
-                block = map_blocks[selected_block_label]
-                zpl_data = zpl_for_block(block).encode("utf-8")
-                fname = f"reimpresion_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
-                if clean_text(motivo_rep):
-                    st.download_button("Descargar ZPL y registrar reimpresión", data=zpl_data, file_name=fname, mime="text/plain", key=f"reprint_block_{active_lote}_{block['block_index']}_{block['block_key']}_{hashlib.sha1(clean_text(motivo_rep).encode()).hexdigest()[:8]}", on_click=register_controlled_block_reprint, args=(active_lote, block, motivo_rep, usuario_rep))
-                else:
-                    st.warning("Ingresa motivo para habilitar descarga.")
-                with st.expander("Productos del bloque"):
-                    bdf = pd.DataFrame(block["items"])
-                    st.dataframe(bdf[[c for c in ["codigo_ml", "sku", "descripcion", "unidades"] if c in bdf.columns]], use_container_width=True, hide_index=True)
-        else:
-            view = label_control_view(active_lote)
-            options = []
-            option_map = {}
-            for _, r in view.iterrows():
-                label = f"{clean_text(r.get('descripcion',''))[:80]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))}"
-                options.append(label)
-                option_map[label] = int(r["id"])
-            if not options:
-                st.warning("No hay productos.")
-            else:
-                selected_item_label = st.selectbox("Producto a reimprimir", options)
-                item_id = option_map[selected_item_label]
-                row = view[view["id"].astype(int) == int(item_id)].iloc[0].to_dict()
-                qty_rep = st.number_input("Cantidad de etiquetas normales", min_value=1, max_value=9999, value=1, step=1)
-                zpl_ind = zpl_for_item_with_separators(row, int(qty_rep)).encode("utf-8")
-                fname_ind = f"reimpresion_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
-                if clean_text(motivo_rep):
-                    st.download_button("Descargar ZPL individual y registrar reimpresión", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"reprint_item_{active_lote}_{item_id}_{qty_rep}_{hashlib.sha1(clean_text(motivo_rep).encode()).hexdigest()[:8]}", on_click=register_controlled_item_reprint, args=(active_lote, row, int(qty_rep), motivo_rep, usuario_rep))
-                else:
-                    st.warning("Ingresa motivo para habilitar descarga.")
-        hist = get_reimpresiones(active_lote)
-        if not hist.empty:
-            st.divider()
-            st.subheader("Historial de reimpresiones")
-            out = hist.rename(columns={"created_at": "Fecha", "scope": "Alcance", "block_index": "Bloque", "cantidad": "Cantidad", "motivo": "Motivo", "usuario": "Usuario", "codigo_ml": "Código ML", "sku": "SKU", "descripcion": "Producto"})
-            st.dataframe(out, use_container_width=True, hide_index=True, height=360)
+        active_ads = ads_table[(ads_table["ads_inversion"].fillna(0) > 0) | (ads_table["ads_ingresos"].fillna(0) > 0) | (ads_table["ads_clics"].fillna(0) > 0)].copy()
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        total_inv = active_ads["ads_inversion"].fillna(0).sum()
+        total_ing = active_ads["ads_ingresos"].fillna(0).sum()
+        global_acos = (total_inv / total_ing * 100) if total_ing > 0 else np.nan
+        global_roas = (total_ing / total_inv) if total_inv > 0 else np.nan
+        k1.metric("Inversión Ads", fmt_money(total_inv))
+        k2.metric("Ingresos Ads", fmt_money(total_ing))
+        k3.metric("ACOS global", fmt_pct(global_acos))
+        k4.metric("ROAS global", "—" if pd.isna(global_roas) else f"{global_roas:.2f}")
+        k5.metric("SKUs críticos", fmt_int(int((ads_table.get("estado_ads", pd.Series(dtype=str)) == "CRÍTICO").sum())))
+        k6.metric("SKUs oportunidad", fmt_int(int((ads_table.get("estado_ads", pd.Series(dtype=str)) == "OPORTUNIDAD").sum())))
 
+        x1, x2, x3, x4 = st.columns([1.2, 1.2, 1.0, 1.2])
+        state_options = ["CRÍTICO", "ALERTA", "OPORTUNIDAD", "OK", "SIN ADS", "NO USAR ADS"]
+        ads_state_filter = x1.multiselect("Estado Ads", state_options, default=state_options, key="ads_module_state")
+        ads_action_filter = x2.multiselect("Acción Ads", sorted([x for x in ads_table.get("accion_ads", pd.Series(dtype=str)).dropna().astype(str).unique().tolist() if x]), default=[], key="ads_module_action")
+        ads_only_live = x3.selectbox("Cobertura", ["Todos", "Solo con datos Ads", "Solo sin Ads"], key="ads_module_coverage")
+        ads_search = x4.text_input("Buscar SKU / descripción / MLC", key="ads_module_search")
 
-elif page == "Cierre de lote":
-    st.subheader("Cierre formal de lote")
-    if not active_lote:
-        st.warning("No hay lote activo.")
-    else:
-        lote = get_lote(active_lote)
-        capacity_close = st.number_input("Capacidad de rollo para validar bloques", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100, key="close_capacity")
-        ok_close, issues, data_close = cierre_validaciones(active_lote, int(capacity_close))
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Estado actual", clean_text(lote.get("status", "ACTIVO")))
-        c2.metric("Unidades pendientes", data_close.get("pending_units", 0))
-        c3.metric("Incidencias abiertas", data_close.get("open_incidents", 0))
-        c4.metric("Bloques", f"{data_close.get('printed_blocks',0)}/{data_close.get('expected_blocks',0)}")
-        if clean_text(lote.get("status")) == "CERRADO":
-            st.success(f"Lote cerrado por {clean_text(lote.get('closed_by',''))} el {fmt_dt(lote.get('closed_at',''))}.")
-            st.caption(clean_text(lote.get("close_note", "")))
-            with st.expander("Reabrir lote"):
-                reopen_user = st.text_input("Usuario", value=get_operator_name(), key="reopen_user")
-                reopen_reason = st.text_area("Motivo de reapertura", key="reopen_reason")
-                if st.button("Reabrir lote", type="primary"):
-                    ok_reopen, msg_reopen = reopen_lote(active_lote, reopen_user, reopen_reason)
-                    st.success(msg_reopen) if ok_reopen else st.error(msg_reopen)
-                    if ok_reopen:
-                        st.rerun()
-        else:
-            if ok_close:
-                st.success("Validación correcta. El lote puede cerrarse.")
-            else:
-                st.error("El lote no se puede cerrar todavía.")
-                for issue in issues:
-                    st.write(f"• {issue}")
-            close_user = st.text_input("Cerrado por", value=get_operator_name(), key="close_user")
-            close_note = st.text_area("Nota de cierre", placeholder="Ej: lote revisado completo, sin diferencias abiertas.", key="close_note")
-            if st.button("Cerrar lote", type="primary", disabled=not ok_close):
-                ok_final, msg_final = close_lote(active_lote, close_user, close_note)
-                st.success(msg_final) if ok_final else st.error(msg_final)
-                if ok_final:
-                    st.rerun()
+        y1, y2, y3, y4 = st.columns(4)
+        min_inv = float(y1.number_input("Inversión mínima", min_value=0.0, value=0.0, step=1000.0, key="ads_module_min_inv"))
+        min_clicks = float(y2.number_input("Clicks mínimos", min_value=0.0, value=0.0, step=1.0, key="ads_module_min_clicks"))
+        acos_view = y3.selectbox("Vista ACOS", ["Todos", "Sobre 5.09%", "Sobre ACOS máximo", "Dentro de límite"], key="ads_module_acos_view")
+        sort_mode = y4.selectbox("Orden", ["Mayor criticidad", "Mayor inversión", "Peor margen con Ads", "Mayor gap ACOS", "Mejor oportunidad"], key="ads_module_sort")
 
+        ads_work = ads_table.copy()
+        required_ads_cols = {
+            "sku": "", "descripcion": "", "mlc_principal": "", "estado_ads": "SIN ADS", "accion_ads": "Sin acción",
+            "ads_inversion": np.nan, "ads_ingresos": np.nan, "ads_acos": np.nan, "ads_roas": np.nan,
+            "ads_clics": np.nan, "ads_impresiones": np.nan, "acos_max_permitido_pct": np.nan,
+            "gap_acos_pct": np.nan, "margen_ml_reportado": np.nan, "margen_ml_con_ads": np.nan,
+            "brecha_ads_objetivo_pp": np.nan, "margen_ads_base_pct": np.nan, "motivo_ads": "Sin datos suficientes",
+            "ads_score": np.nan, "precio_ml_actual": np.nan, "monto_sim": np.nan, "monto_sim_neto": np.nan,
+        }
+        for _col, _default in required_ads_cols.items():
+            if _col not in ads_work.columns:
+                ads_work[_col] = _default
 
-elif page == "Etiquetas":
-    st.subheader("Etiquetas Zebra 50x30")
-    st.caption("Módulo independiente: solo genera/descarga ZPL y registra etiquetas. No modifica el escaneo ni las unidades acopiadas.")
-
-    if not active_lote:
-        st.warning("Primero crea o selecciona un lote FULL.")
-    else:
-        lote = get_lote(active_lote)
-        view = label_control_view(active_lote)
-        if view.empty:
-            st.warning("El lote activo no tiene productos.")
-        else:
-            capacity = st.number_input("Capacidad de rollo dedicado", min_value=100, max_value=10000, value=ROLL_CAPACITY_DEFAULT, step=100)
-            blocks = build_label_blocks(view, int(capacity))
-            total_products = int(len(view))
-            total_normal = int(view["unidades"].sum())
-            total_separators = int(total_products * LABEL_SEPARATOR_PER_PRODUCT)
-            total_labels = int(total_normal + total_separators)
-            printed_normal = int(view["printed_normal"].sum())
-            pending_normal = max(total_normal - printed_normal, 0)
-
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Productos", total_products)
-            c2.metric("Etiquetas producto", total_normal)
-            c3.metric("Inicio/Fin", total_separators)
-            c4.metric("Total ZPL", total_labels)
-            c5.metric("Bloques", len(blocks))
-            st.caption(f"Lote: {lote.get('nombre','')} · Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')}")
-
-            if any(b.get("over_capacity") for b in blocks):
-                st.warning("Hay al menos un producto que por sí solo supera la capacidad del rollo. Ese producto quedará en un bloque propio.")
-
-            tab_blocks, tab_individual, tab_control = st.tabs(["Bloques por rollo", "Individual", "Control etiquetas"])
-
-            with tab_blocks:
-                st.info("Regla activa: 1 bloque = 1 rollo nuevo dedicado. Cada producto imprime: INICIO + etiquetas normales + FIN. Al descargar un ZPL, queda registrado automáticamente como impreso.")
-                for block in blocks:
-                    rec = get_label_block_record(active_lote, block["block_index"], block["block_key"])
-                    printed = bool(rec)
-                    status = rec.get("status", "PENDIENTE") if rec else "PENDIENTE"
-                    card_class = "label-card-printed" if printed else "label-card"
-                    first_item = block["items"][0]
-                    last_item = block["items"][-1]
-                    st.markdown(f"""
-                        <div class='label-card {card_class}'>
-                            <b>Bloque {int(block['block_index'])}</b><br>
-                            Estado: <b>{esc(status)}</b><br>
-                            Productos: <b>{int(block['products_count'])}</b> · Etiquetas normales: <b>{int(block['normal_qty'])}</b> · Inicio/Fin: <b>{int(block['separator_qty'])}</b> · Total rollo: <b>{int(block['total_qty'])}</b><br>
-                            Desde: <b>{esc(first_item.get('codigo_ml',''))}</b> / SKU {esc(first_item.get('sku',''))}<br>
-                            Hasta: <b>{esc(last_item.get('codigo_ml',''))}</b> / SKU {esc(last_item.get('sku',''))}
-                        </div>
-                        """, unsafe_allow_html=True)
-                    zpl_data = zpl_for_block(block).encode("utf-8")
-                    fname = f"etiquetas_lote_{active_lote}_bloque_{int(block['block_index'])}.zpl"
-                    if printed:
-                        st.warning(f"Bloque {int(block['block_index'])} ya fue marcado como impreso. Para volver a imprimirlo usa la vista Reimpresión y registra motivo obligatorio.")
-                    else:
-                        label = f"Descargar ZPL bloque {int(block['block_index'])} y marcar como impreso"
-                        st.download_button(label, data=zpl_data, file_name=fname, mime="text/plain", key=f"download_block_{active_lote}_{block['block_index']}_{block['block_key']}", on_click=register_block_download, args=(active_lote, block))
-                    with st.expander(f"Ver productos del bloque {int(block['block_index'])}"):
-                        bdf = pd.DataFrame(block["items"])
-                        show_cols = ["codigo_ml", "sku", "descripcion", "unidades", "printed_normal", "label_pending", "label_status"]
-                        existing_cols = [c for c in show_cols if c in bdf.columns]
-                        st.dataframe(bdf[existing_cols], use_container_width=True, hide_index=True)
-
-            with tab_individual:
-                st.info("Para excepciones: imprimir 1 o varias etiquetas de un producto específico. También queda registrado automáticamente al descargar.")
-                options = []
-                option_map = {}
-                for _, r in view.iterrows():
-                    label = f"{clean_text(r.get('descripcion',''))[:70]} | ML {clean_text(r.get('codigo_ml',''))} | SKU {clean_text(r.get('sku',''))} | Estado {clean_text(r.get('label_status',''))}"
-                    options.append(label)
-                    option_map[label] = int(r["id"])
-                selected = st.selectbox("Buscar producto", options, index=0 if options else None, placeholder="Escribe nombre, Código ML o SKU")
-                selected_id = option_map.get(selected) if selected else None
-                if selected_id:
-                    row = view[view["id"].astype(int) == int(selected_id)].iloc[0].to_dict()
-                    req = int(row.get("unidades", 0))
-                    printed = int(row.get("printed_normal", 0))
-                    pending = max(req - printed, 0)
-                    status = clean_text(row.get("label_status", ""))
-                    m1, m2, m3, m4 = st.columns(4)
-                    m1.metric("Unidades", req)
-                    m2.metric("Impresas", printed)
-                    m3.metric("Pendientes", pending)
-                    m4.metric("Estado", status)
-                    st.markdown(f"**{clean_text(row.get('descripcion',''))}**")
-                    st.caption(f"Código ML: {clean_text(row.get('codigo_ml',''))} · SKU: {clean_text(row.get('sku',''))}")
-                    qty_ind = st.number_input("Cantidad de etiquetas normales a descargar", min_value=1, max_value=9999, value=1, step=1)
-                    if printed >= req:
-                        st.warning("Este producto ya tiene todas sus etiquetas normales impresas. La descarga se registrará como REIMPRESIÓN.")
-                    elif int(qty_ind) > pending:
-                        st.warning(f"La cantidad supera lo pendiente ({pending}). Puede dejar el producto SOBREIMPRESO.")
-                    zpl_ind = zpl_for_item_with_separators(row, int(qty_ind)).encode("utf-8")
-                    fname_ind = f"etiqueta_{norm_code(row.get('codigo_ml','')) or 'producto'}_{norm_code(row.get('sku',''))}.zpl"
-                    st.download_button("Descargar ZPL individual y marcar como impreso", data=zpl_ind, file_name=fname_ind, mime="text/plain", key=f"download_individual_{active_lote}_{selected_id}_{qty_ind}", on_click=register_individual_download, args=(active_lote, row, int(qty_ind)))
-
-            with tab_control:
-                st.caption(f"Etiquetas normales impresas: {printed_normal}/{total_normal} · Pendientes normales: {pending_normal}")
-                filtro_label = st.selectbox("Filtro estado etiquetas", ["Todos", "SIN IMPRIMIR", "PARCIAL", "COMPLETO", "SOBREIMPRESO"])
-                show = view.copy()
-                if filtro_label != "Todos":
-                    show = show[show["label_status"] == filtro_label]
-                out = show.rename(columns={
-                    "codigo_ml": "Código ML",
-                    "sku": "SKU",
-                    "descripcion": "Producto",
-                    "unidades": "Unidades requeridas",
-                    "printed_normal": "Etiquetas impresas",
-                    "label_pending": "Pendientes",
-                    "label_status": "Estado etiquetas",
-                    "printed_separators": "Inicio/Fin impresos",
-                    "last_label_printed_at": "Última impresión",
-                })
-                cols = ["Código ML", "SKU", "Producto", "Unidades requeridas", "Etiquetas impresas", "Pendientes", "Estado etiquetas", "Inicio/Fin impresos", "Última impresión"]
-                st.dataframe(out[[c for c in cols if c in out.columns]], use_container_width=True, hide_index=True, height=620)
-
-elif page == "Auditoría":
-    st.subheader("Auditoría operacional")
-    if not active_lote:
-        st.warning("No hay lote activo.")
-    else:
-        eventos = get_audit_events(active_lote, limit=500)
-        if eventos.empty:
-            st.info("Aún no hay eventos de auditoría para este lote.")
-        else:
-            f_eventos = ["Todos"] + sorted([x for x in eventos["event_type"].dropna().unique().tolist()])
-            filtro_evento = st.selectbox("Filtrar evento", f_eventos)
-            show = eventos.copy()
-            if filtro_evento != "Todos":
-                show = show[show["event_type"] == filtro_evento]
-            show = show.rename(columns={
-                "created_at": "Fecha",
-                "event_type": "Evento",
-                "detail": "Detalle",
-                "qty": "Cantidad",
-                "codigo_ml": "Código ML",
-                "sku": "SKU",
-                "mode": "Modo",
-                "item_id": "Item ID",
-            })
-            st.dataframe(show, use_container_width=True, hide_index=True, height=650)
-            st.caption("La auditoría queda guardada en SQLite y también se incluye en el Excel de control exportado.")
-
-elif page == "Control":
-    st.subheader("Control de lote")
-    if not active_lote:
-        st.warning("No hay lote activo.")
-    else:
-        lote = get_lote(active_lote)
-        items = get_items(active_lote)
-        if items.empty:
-            st.warning("El lote no tiene productos.")
-        else:
-            view = items.copy()
-            view["pendiente"] = (view["unidades"].astype(int) - view["acopiadas"].astype(int)).clip(lower=0)
-            view["estado"] = view["pendiente"].apply(lambda x: "COMPLETO" if int(x) == 0 else "PENDIENTE")
-            scans = get_last_scans(active_lote)
-            if not scans.empty:
-                view = view.merge(scans, left_on="id", right_on="item_id", how="left")
-            else:
-                view["procesado_at"] = ""
-            c1, c2, c3, c4 = st.columns(4)
-            total = int(view["unidades"].sum()); done = int(view["acopiadas"].sum())
-            c1.metric("Unidades", total)
-            c2.metric("Acopiadas", done)
-            c3.metric("Pendientes", max(total-done, 0))
-            c4.metric("Avance", f"{(done/total*100) if total else 0:.1f}%")
-            st.caption(f"Archivo: {lote.get('archivo','')} · Hoja: {lote.get('hoja','')} · Cargado: {fmt_dt(lote.get('created_at',''))}")
-
-            filtro = st.selectbox("Filtro", ["Todos", "Pendientes", "Completos", "Supermercado"])
-
-            show = view
-            if filtro == "Pendientes":
-                show = view[view["pendiente"] > 0]
-            elif filtro == "Completos":
-                show = view[view["pendiente"] == 0]
-            elif filtro == "Supermercado":
-                show = view[view["identificacion"].map(is_supermercado)]
-
-            # Buscador dinámico nativo: el selectbox permite escribir y muestra coincidencias al instante.
-            option_rows = []
-            option_map = {"": None}
-            for _, sr in show.iterrows():
-                desc = clean_text(sr.get("descripcion", ""))
-                sku = clean_text(sr.get("sku", ""))
-                ml = clean_text(sr.get("codigo_ml", ""))
-                ean = clean_text(sr.get("codigo_universal", ""))
-                ident = clean_text(sr.get("identificacion", ""))
-                label = f"{desc} | SKU {sku} | ML {ml} | EAN {ean} | {ident}"
-                # Limita el largo visual, pero mantiene códigos suficientes para buscar.
-                label = label[:180]
-                option_rows.append(label)
-                option_map[label] = int(sr["id"])
-
-            selected_search = st.selectbox(
-                "Buscar tarjeta",
-                [""] + option_rows,
-                index=0,
-                placeholder="Escribe nombre, SKU, Código ML, EAN o supermercado",
-                key="control_search_select",
+        if ads_work["margen_ads_base_pct"].isna().all() and {"costo_maestra", "monto_sim"}.issubset(set(ads_work.columns)):
+            ads_work["monto_sim_neto"] = np.where(ads_work["monto_sim"].notna(), ads_work["monto_sim"] / 1.19, np.nan)
+            ads_work["margen_ads_base_pct"] = ads_work.apply(lambda r: calc_margin_from_monto_sim(r.get("costo_maestra"), r.get("monto_sim")), axis=1)
+        if ads_work["margen_ml_con_ads"].isna().all() and "margen_ads_base_pct" in ads_work.columns:
+            ads_work["margen_ml_con_ads"] = np.where(
+                ads_work["margen_ads_base_pct"].notna() & ads_work["ads_acos"].notna(),
+                ads_work["margen_ads_base_pct"] - ads_work["ads_acos"],
+                ads_work["margen_ads_base_pct"],
             )
+        if ads_work["acos_max_permitido_pct"].isna().all() and "margen_ads_base_pct" in ads_work.columns:
+            ads_work["acos_max_permitido_pct"] = np.where(
+                ads_work["margen_ads_base_pct"].notna(),
+                ads_work["margen_ads_base_pct"] - ADS_TARGET_MARGIN_PCT,
+                np.nan,
+            )
+        if ads_work["gap_acos_pct"].isna().all() and {"ads_acos", "acos_max_permitido_pct"}.issubset(set(ads_work.columns)):
+            ads_work["gap_acos_pct"] = np.where(
+                ads_work["ads_acos"].notna() & ads_work["acos_max_permitido_pct"].notna(),
+                ads_work["ads_acos"] - ads_work["acos_max_permitido_pct"],
+                np.nan,
+            )
+        if ads_work["motivo_ads"].astype(str).eq("Sin datos suficientes").all():
+            ads_work["motivo_ads"] = ads_work.apply(classify_ads_reason, axis=1)
+        if ads_work["estado_ads"].astype(str).eq("SIN ADS").all() or ads_work["estado_ads"].isna().all():
+            ads_work["estado_ads"] = ads_work.apply(classify_ads_state, axis=1)
+        if ads_work["accion_ads"].astype(str).isin(["Sin acción", "SIN ACCIÓN ADS"]).all() or ads_work["accion_ads"].isna().all():
+            ads_work["accion_ads"] = ads_work.apply(suggest_ads_action, axis=1)
 
-            selected_id = option_map.get(selected_search)
-            if selected_id:
-                show = show[show["id"].astype(int) == int(selected_id)]
+        if ads_state_filter:
+            ads_work = ads_work[ads_work["estado_ads"].isin(ads_state_filter)]
+        if ads_action_filter:
+            ads_work = ads_work[ads_work["accion_ads"].isin(ads_action_filter)]
+        if ads_only_live == "Solo con datos Ads":
+            ads_work = ads_work[(ads_work["ads_inversion"].fillna(0) > 0) | (ads_work["ads_ingresos"].fillna(0) > 0) | (ads_work["ads_clics"].fillna(0) > 0)]
+        elif ads_only_live == "Solo sin Ads":
+            ads_work = ads_work[(ads_work["ads_inversion"].fillna(0) <= 0) & (ads_work["ads_ingresos"].fillna(0) <= 0) & (ads_work["ads_clics"].fillna(0) <= 0)]
+        ads_work = ads_work[ads_work["ads_inversion"].fillna(0) >= min_inv]
+        ads_work = ads_work[ads_work["ads_clics"].fillna(0) >= min_clicks]
+        if acos_view == "Sobre 5.09%":
+            ads_work = ads_work[ads_work["ads_acos"].fillna(-np.inf) > ADS_GLOBAL_ACOS_ALERT_PCT]
+        elif acos_view == "Sobre ACOS máximo":
+            ads_work = ads_work[ads_work["gap_acos_pct"].fillna(-np.inf) > 0]
+        elif acos_view == "Dentro de límite":
+            ads_work = ads_work[ads_work["gap_acos_pct"].fillna(np.inf) <= 0]
+        if ads_search:
+            q = ads_search.strip().lower()
+            ads_work = ads_work[
+                ads_work["sku"].astype(str).str.lower().str.contains(q, na=False) |
+                ads_work["descripcion"].astype(str).str.lower().str.contains(q, na=False) |
+                ads_work["mlc_principal"].astype(str).str.lower().str.contains(q, na=False)
+            ]
 
-            st.caption(f"Mostrando {len(show)} de {len(view)} líneas del lote.")
+        severity_rank = {"CRÍTICO": 5, "NO USAR ADS": 4, "ALERTA": 3, "OPORTUNIDAD": 2, "OK": 1, "SIN ADS": 0}
+        ads_work["_ads_rank"] = ads_work["estado_ads"].map(severity_rank).fillna(0)
+        sort_config = {
+            "Mayor criticidad": (["_ads_rank", "ads_inversion", "gap_acos_pct"], [False, False, False]),
+            "Mayor inversión": (["ads_inversion", "ads_ingresos"], [False, False]),
+            "Peor margen con Ads": (["margen_ml_con_ads", "ads_inversion"], [True, False]),
+            "Mayor gap ACOS": (["gap_acos_pct", "ads_inversion"], [False, False]),
+            "Mejor oportunidad": (["ads_score", "ads_roas"], [False, False]),
+        }
+        scols, sasc = sort_config[sort_mode]
+        ads_work = ads_work.sort_values(scols, ascending=sasc, na_position="last")
 
-            modo_vista = st.radio("Vista", ["Tarjetas operativas", "Tabla"], horizontal=True)
-            if modo_vista == "Tarjetas operativas":
-                for _, r in show.iterrows():
-                    ident = clean_text(r.get("identificacion", ""))
-                    vence = clean_text(r.get("vence", ""))
-                    proc = fmt_dt(r.get("procesado_at", "")) or "Sin procesar"
-                    badges_parts = [
-                        f"<span class='badge'>Unidades: {int(r['unidades'])}</span>",
-                        f"<span class='badge'>Acopiadas: {int(r['acopiadas'])}</span>",
-                        f"<span class='badge'>Pendiente: {int(r['pendiente'])}</span>",
-                    ]
-                    if ident:
-                        badges_parts.append(f"<span class='badge badge-alert'>Identificación: {esc(ident)}</span>")
-                    if vence:
-                        badges_parts.append(f"<span class='badge badge-alert'>Vence: {esc(vence)}</span>")
-                    badges_parts.append(f"<span class='badge'>Procesado: {esc(proc)}</span>")
-                    badges = "".join(badges_parts)
-                    st.markdown(
-                        f"""
-                        <div class='control-card'>
-                            <div class='control-title'>{esc(r['descripcion'])}</div>
-                            <div class='control-meta'><b>SKU:</b> {esc(r['sku'])} &nbsp; | &nbsp; <b>Código ML:</b> {esc(r['codigo_ml'])}</div>
-                            <div>{badges}</div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+        ads_tabs = st.tabs(["Resumen", "Alertas", "Oportunidades", "Detalle por SKU"])
+
+        with ads_tabs[0]:
+            top_summary = ads_work[[
+                "sku", "descripcion", "estado_ads", "motivo_ads", "accion_ads",
+                "ads_inversion", "ads_ingresos", "ads_acos", "ads_roas",
+                "margen_ads_base_pct", "margen_ml_con_ads", "acos_max_permitido_pct", "gap_acos_pct"
+            ]].copy()
+            top_summary.columns = [
+                "SKU", "Descripción", "Estado Ads", "Motivo", "Acción Ads",
+                "Inversión Ads", "Ingresos Ads", "ACOS real", "ROAS",
+                "Margen base Ads", "Margen con Ads", "ACOS máximo", "Gap ACOS"
+            ]
+            for c in ["Inversión Ads", "Ingresos Ads"]:
+                top_summary[c] = top_summary[c].map(fmt_money)
+            for c in ["ACOS real", "Margen base Ads", "Margen con Ads", "ACOS máximo", "Gap ACOS"]:
+                top_summary[c] = top_summary[c].map(fmt_pct)
+            top_summary["ROAS"] = top_summary["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+            st.dataframe(top_summary.head(200), use_container_width=True, hide_index=True, height=420)
+
+        with ads_tabs[1]:
+            alerts = ads_work[ads_work["estado_ads"].isin(["CRÍTICO", "ALERTA", "NO USAR ADS"])].copy()
+            if alerts.empty:
+                st.success("No hay SKUs en alerta con los filtros aplicados.")
             else:
-                out = show.copy()
-                out["Procesado"] = out["procesado_at"].map(fmt_dt)
-                out = out.rename(columns={
-                    "sku":"SKU", "codigo_ml":"Código ML", "codigo_universal":"EAN / Código universal",
-                    "descripcion":"Producto", "unidades":"Unidades", "acopiadas":"Acopiadas", "pendiente":"Pendiente",
-                    "identificacion":"Identificación", "vence":"Vence", "estado":"Estado"
-                })
-                cols = ["SKU", "Código ML", "EAN / Código universal", "Producto", "Unidades", "Acopiadas", "Pendiente", "Identificación", "Vence", "Procesado", "Estado"]
-                st.dataframe(out[cols], use_container_width=True, hide_index=True, height=620)
+                alert_view = alerts[[
+                    "sku", "descripcion", "mlc_principal", "estado_ads", "motivo_ads", "accion_ads",
+                    "ads_inversion", "ads_ingresos", "ads_clics", "ads_impresiones",
+                    "ads_acos", "ads_roas", "margen_ads_base_pct", "margen_ml_con_ads",
+                    "acos_max_permitido_pct", "gap_acos_pct", "precio_ml_actual", "monto_sim", "monto_sim_neto"
+                ]].copy()
+                alert_view.columns = [
+                    "SKU", "Descripción", "MLC", "Estado Ads", "Motivo", "Acción Ads",
+                    "Inversión Ads", "Ingresos Ads", "Clicks", "Impresiones",
+                    "ACOS real", "ROAS", "Margen base Ads", "Margen con Ads",
+                    "ACOS máximo", "Gap ACOS", "Precio real ML", "Monto simulación", "Monto sim neto"
+                ]
+                for c in ["Inversión Ads", "Ingresos Ads", "Precio real ML", "Monto simulación", "Monto sim neto"]:
+                    alert_view[c] = alert_view[c].map(fmt_money)
+                for c in ["ACOS real", "Margen base Ads", "Margen con Ads", "ACOS máximo", "Gap ACOS"]:
+                    alert_view[c] = alert_view[c].map(fmt_pct)
+                alert_view["ROAS"] = alert_view["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                alert_view["Clicks"] = alert_view["Clicks"].map(fmt_int)
+                alert_view["Impresiones"] = alert_view["Impresiones"].map(fmt_int)
+                st.dataframe(alert_view.head(300), use_container_width=True, hide_index=True, height=460)
 
-            st.download_button("Exportar control Excel", data=export_lote(active_lote), file_name="control_full_aurora.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            st.divider()
-            if st.button("Eliminar lote activo"):
-                delete_lote(active_lote); st.success("Lote eliminado."); st.rerun()
+        with ads_tabs[2]:
+            opp = ads_work[ads_work["estado_ads"].isin(["OPORTUNIDAD", "SIN ADS"])].copy()
+            opp = opp.sort_values(["estado_ads", "ads_score", "margen_ads_base_pct"], ascending=[True, False, False], na_position="last")
+            if opp.empty:
+                st.info("No encontré oportunidades con los filtros aplicados.")
+            else:
+                opp_view = opp[[
+                    "sku", "descripcion", "estado_ads", "motivo_ads", "accion_ads",
+                    "margen_ads_base_pct", "margen_ml_con_ads", "ads_acos", "ads_roas",
+                    "ads_inversion", "ads_ingresos", "precio_ml_actual", "monto_sim"
+                ]].copy()
+                opp_view.columns = [
+                    "SKU", "Descripción", "Estado Ads", "Motivo", "Acción Ads",
+                    "Margen base Ads", "Margen con Ads", "ACOS real", "ROAS",
+                    "Inversión Ads", "Ingresos Ads", "Precio real ML", "Monto simulación"
+                ]
+                for c in ["Inversión Ads", "Ingresos Ads", "Precio real ML", "Monto simulación"]:
+                    opp_view[c] = opp_view[c].map(fmt_money)
+                for c in ["Margen base Ads", "Margen con Ads", "ACOS real"]:
+                    opp_view[c] = opp_view[c].map(fmt_pct)
+                opp_view["ROAS"] = opp_view["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                st.dataframe(opp_view.head(300), use_container_width=True, hide_index=True, height=420)
+
+        with ads_tabs[3]:
+            sku_labels_ads = [f"{sku} — {model['sku_desc'].get(sku, '')}" for sku in ads_work["sku"].dropna().astype(str).tolist()]
+            if not sku_labels_ads:
+                st.info("No hay SKUs disponibles con los filtros actuales.")
+            else:
+                default_sku_ads = st.session_state.get("selected_sku", ads_work.iloc[0]["sku"])
+                default_label_ads = f"{default_sku_ads} — {model['sku_desc'].get(default_sku_ads, '')}"
+                index_ads = sku_labels_ads.index(default_label_ads) if default_label_ads in sku_labels_ads else 0
+                selected_label_ads = st.selectbox("SKU Ads", sku_labels_ads, index=index_ads, key="ads_detail_sku")
+                sku_ads = selected_label_ads.split(" — ")[0]
+                st.session_state.selected_sku = sku_ads
+
+                detail = ads_table[ads_table["sku"] == sku_ads].copy()
+                if detail.empty:
+                    st.info("No encontré detalle para ese SKU.")
+                else:
+                    drow = detail.iloc[0]
+                    d1, d2, d3, d4, d5, d6 = st.columns(6)
+                    d1.metric("Estado Ads", str(drow.get("estado_ads", "—")))
+                    d2.metric("Acción Ads", str(drow.get("accion_ads", "—")))
+                    d3.metric("Margen base Ads", fmt_pct(drow.get("margen_ads_base_pct")))
+                    d4.metric("Margen con Ads", fmt_pct(drow.get("margen_ml_con_ads")))
+                    d5.metric("ACOS real / máx", f"{fmt_pct(drow.get('ads_acos'))} / {fmt_pct(drow.get('acos_max_permitido_pct'))}")
+                    d6.metric("ROAS", "—" if pd.isna(safe_float(drow.get("ads_roas"), np.nan)) else f"{safe_float(drow.get('ads_roas')):.2f}")
+
+                    st.write(f"**Motivo:** {drow.get('motivo_ads', '—')}")
+                    st.write(f"**MLC principal:** {drow.get('mlc_principal', '—')}")
+                    st.write(f"**Precio real ML:** {fmt_money(drow.get('precio_ml_actual'))}")
+                    st.write(f"**Monto simulación:** {fmt_money(drow.get('monto_sim'))}")
+                    st.write(f"**Monto simulación neto:** {fmt_money(drow.get('monto_sim_neto'))}")
+                    st.write(f"**Margen real reportado ML:** {fmt_pct(drow.get('margen_ml_reportado'))}")
+
+                    report_detail = build_ads_report_detail_for_sku(sku_ads, model.get("product_ads"), model.get("pubs"))
+                    if report_detail.empty:
+                        st.info("No encontré campañas/anuncios Ads para este SKU en el reporte cargado.")
+                    else:
+                        show_detail = report_detail.copy()
+                        show_detail.columns = [
+                            "Campaña", "MLC", "Título", "Estado", "Inversión Ads", "Ingresos Ads", "ACOS", "ROAS", "Ventas Ads", "Impresiones", "Clicks"
+                        ]
+                        for c in ["Inversión Ads", "Ingresos Ads"]:
+                            show_detail[c] = show_detail[c].map(fmt_money)
+                        show_detail["ACOS"] = show_detail["ACOS"].map(fmt_pct)
+                        show_detail["ROAS"] = show_detail["ROAS"].map(lambda x: "—" if pd.isna(x) else f"{x:.2f}")
+                        show_detail["Ventas Ads"] = show_detail["Ventas Ads"].map(fmt_int)
+                        show_detail["Impresiones"] = show_detail["Impresiones"].map(fmt_int)
+                        show_detail["Clicks"] = show_detail["Clicks"].map(fmt_int)
+                        st.dataframe(show_detail, use_container_width=True, hide_index=True, height=320)
+
+# =========================================================
+# Tab 4 - Promotions
+# =========================================================
+if False:
+    st.subheader("Operador de promociones")
+    promos_all = ensure_promos_schema(model.get("promos", pd.DataFrame()))
+    if promos_all.empty:
+        st.info("No encontré promos en la maestra.")
+    else:
+        left, right = st.columns([1, 2])
+        with left:
+            status_options = [
+                "Vencidas",
+                "Vencen hoy",
+                "Vencen mañana",
+                "Vencen pasado mañana",
+                "Vencen en 7 días",
+                "Vencen en 15 días",
+                "Vencen en 1 mes",
+            ]
+            status_filter = st.multiselect(
+                "Estado",
+                status_options,
+                default=st.session_state.get("promo_status_filter_v3", ["Vencidas", "Vencen hoy"]),
+                key="promo_status_filter_v3",
+            )
+            text_filter = st.text_input("Buscar por SKU / descripción / MLC", key="promo_search_v3")
+            promos = promos_all.copy()
+            if status_filter:
+                promos = promos[promos["status"].isin(status_filter)]
+            else:
+                promos = promos.iloc[0:0]
+            if text_filter:
+                q = text_filter.lower().strip()
+                promos = promos[
+                    promos["sku"].astype(str).str.lower().str.contains(q, na=False) |
+                    promos["descripcion"].astype(str).str.lower().str.contains(q, na=False) |
+                    promos["mlc"].astype(str).str.lower().str.contains(q, na=False)
+                ]
+            st.caption(f"Mostrando {len(promos)} promo(s) filtradas")
+            mass_date = st.date_input("Cambio masivo de fecha", value=None, format="DD/MM/YYYY", key="promo_mass_date_v3")
+            if st.button("Aplicar fecha masiva a filtradas", key="promo_mass_apply_v3"):
+                if mass_date and not promos.empty:
+                    for _, p in promos.iterrows():
+                        update_single_promo(model, int(p["promo_index"]), int(p["slot"]), p["precio_b2c"], mass_date, p["comentario"])
+                    persist_current_master_workbook(model, "promociones actualizadas masivamente")
+                    st.success("Fecha actualizada y compartida en vivo.")
+                    st.rerun()
+
+        with right:
+            if promos.empty:
+                st.info("No hay promos para esos estados/filtros.")
+            else:
+                cols = st.columns(4)
+                for i, (_, p) in enumerate(promos.sort_values(["status_order", "sku", "slot"]).iterrows()):
+                    with cols[i % 4]:
+                        with st.container(border=True):
+                            st.markdown(f"**{p['sku']}**")
+                            st.caption(str(p["descripcion"])[:55])
+                            st.write(f"`{p['mlc'] or '—'}`")
+                            st.write(fmt_date(p["fecha_venci"]))
+                            st.write(p["status"])
+                            if st.button("Abrir", key=f"open_promo_{p['promo_index']}_{p['slot']}"):
+                                st.session_state.edit_target_v3 = (int(p["promo_index"]), int(p["slot"]))
+                                st.rerun()
+
+        if "edit_target_v3" in st.session_state:
+            promo_index, slot = st.session_state.edit_target_v3
+            current = model["promos"][
+                (model["promos"]["promo_index"] == promo_index) &
+                (model["promos"]["slot"] == slot)
+            ]
+            if not current.empty:
+                cp = current.iloc[0]
+                @st.dialog("Editar promoción")
+                def edit_promo_dialog():
+                    st.write(f"**SKU:** {cp['sku']}")
+                    st.write(f"**Descripción:** {cp['descripcion']}")
+                    st.write(f"**MLC:** {cp['mlc'] or '—'}")
+                    current_date = cp["fecha_venci"].date() if pd.notna(cp["fecha_venci"]) else None
+                    new_date = st.date_input("Fecha venci", value=current_date, format="DD/MM/YYYY", key="promo_edit_date_v3")
+                    with st.expander("Campos secundarios"):
+                        new_price = st.number_input("Precio B2C", min_value=0.0, value=float(safe_float(cp["precio_b2c"], 0.0)), step=100.0, key="promo_edit_price_v3")
+                        new_comment = st.text_input("Comentario", value=str(cp["comentario"]) if pd.notna(cp["comentario"]) else "", key="promo_edit_comment_v3")
+                    if st.button("Guardar cambios", key="promo_edit_save_v3"):
+                        update_single_promo(model, promo_index, slot, new_price, new_date, new_comment)
+                        persist_current_master_workbook(model, f"promo {cp['sku']} slot {slot} actualizada")
+                        del st.session_state["edit_target_v3"]
+                        st.success("Promoción actualizada y compartida en vivo.")
+                        st.rerun()
+                    if st.button("Cerrar", key="promo_edit_close_v3"):
+                        del st.session_state["edit_target_v3"]
+                        st.rerun()
+                edit_promo_dialog()
+
+with tabs[3]:
+    postventa_mod = model.get("postventa_mod", {}) or {}
+    pv = postventa_mod.get("enriched", pd.DataFrame())
+    resumen_pv = postventa_mod.get("resumen", {}) or {}
+
+    if pv is None or pv.empty:
+        st.info("Carga el archivo 'Ventas con problemas' para activar este módulo.")
+    else:
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Casos totales", fmt_int(resumen_pv.get("casos_totales")))
+        m2.metric("% reputación afectada", fmt_pct(resumen_pv.get("pct_reputacion"), 1))
+        m3.metric("Activación promedio", f"{resumen_pv.get('dias_activacion', float('nan')):.1f} días" if pd.notna(resumen_pv.get("dias_activacion", np.nan)) else "—")
+        m4.metric("% reincidencia", fmt_pct(resumen_pv.get("pct_reincidencia"), 1))
+        m5.metric("% evitabilidad alta", fmt_pct(resumen_pv.get("pct_evitabilidad_alta"), 1))
+        m6.metric("% match publicaciones", fmt_pct(resumen_pv.get("pct_match_publicaciones"), 1))
+
+        st.subheader("Radar de evitabilidad")
+        f1, f2, f3 = st.columns([1.1, 1.2, 1.7])
+        evit_filter = f1.multiselect("Evitabilidad", ["ALTA", "MEDIA", "BAJA"], default=["ALTA", "MEDIA", "BAJA"])
+        fam_filter = f2.multiselect("Familia de problema", sorted([x for x in pv["familia_problema"].dropna().unique().tolist() if str(x).strip()]), default=sorted([x for x in pv["familia_problema"].dropna().unique().tolist() if str(x).strip()]))
+        text_pv = f3.text_input("Buscar publicación / SKU / MLC / detalle", key="pv_search")
+
+        pv_work = pv.copy()
+        if evit_filter:
+            pv_work = pv_work[pv_work["evitabilidad"].isin(evit_filter)]
+        if fam_filter:
+            pv_work = pv_work[pv_work["familia_problema"].isin(fam_filter)]
+        if text_pv.strip():
+            q = text_pv.strip().upper()
+            mask = (
+                pv_work["titulo_publicacion"].astype(str).str.upper().str.contains(q, na=False)
+                | pv_work.get("sku", pd.Series(dtype=str)).astype(str).str.upper().str.contains(q, na=False)
+                | pv_work.get("mlc", pd.Series(dtype=str)).astype(str).str.upper().str.contains(q, na=False)
+                | pv_work["detalle_problema"].astype(str).str.upper().str.contains(q, na=False)
+            )
+            pv_work = pv_work[mask]
+
+        ev = postventa_mod.get("evitabilidad", pd.DataFrame()).copy()
+        if not ev.empty:
+            if evit_filter:
+                ev = ev[ev["evitabilidad"].isin(evit_filter)]
+            ev_show = ev.rename(columns={
+                "evitabilidad": "Evitabilidad",
+                "causa_probable": "Causa probable",
+                "accion_sugerida": "Acción sugerida",
+                "casos": "Casos",
+                "pct_reputacion": "% reputación",
+                "dias_activacion": "Días activación",
+            })
+            st.dataframe(ev_show, use_container_width=True, hide_index=True, height=240)
+
+        c1, c2 = st.columns([1, 1])
+        mix_tipo = postventa_mod.get("mix_tipo", pd.DataFrame()).copy()
+        if not mix_tipo.empty:
+            if fam_filter:
+                mix_tipo = mix_tipo[mix_tipo["familia_problema"].isin(fam_filter)]
+            c1.markdown("### Mix de problema")
+            c1.dataframe(mix_tipo.rename(columns={"familia_problema": "Familia", "tipo_problema": "Tipo", "casos": "Casos"}), use_container_width=True, hide_index=True, height=260)
+        mix_det = postventa_mod.get("mix_detalle", pd.DataFrame()).copy()
+        if not mix_det.empty:
+            if evit_filter:
+                mix_det = mix_det[mix_det["evitabilidad"].isin(evit_filter)]
+            c2.markdown("### Detalles más frecuentes")
+            c2.dataframe(mix_det.head(20).rename(columns={"evitabilidad": "Evitabilidad", "detalle_problema": "Detalle", "casos": "Casos"}), use_container_width=True, hide_index=True, height=260)
+
+        st.markdown("### Publicaciones con mayor foco de evitabilidad")
+        pubs_pv = postventa_mod.get("publicaciones", pd.DataFrame()).copy()
+        if not pubs_pv.empty:
+            if text_pv.strip():
+                q = text_pv.strip().upper()
+                pubs_pv = pubs_pv[
+                    pubs_pv["titulo_publicacion"].astype(str).str.upper().str.contains(q, na=False)
+                    | pubs_pv["sku"].astype(str).str.upper().str.contains(q, na=False)
+                    | pubs_pv["mlc"].astype(str).str.upper().str.contains(q, na=False)
+                ]
+            pubs_show = pubs_pv.rename(columns={
+                "mlc": "MLC", "sku": "SKU", "titulo_publicacion": "Publicación", "casos": "Casos",
+                "ventas_unicas": "Ventas únicas", "afectados": "Afectan reputación", "pct_reputacion": "% reputación",
+                "dias_activacion": "Días activación", "reincidentes": "Reincidencias", "evitabilidad_alta": "Casos evitables altos",
+                "indice_evitabilidad": "% evitabilidad alta", "status": "Status", "entrega": "Entrega", "full_stock": "Full", "categoria": "Categoría"
+            })
+            st.dataframe(pubs_show.head(200), use_container_width=True, hide_index=True, height=320)
+
+        st.markdown("### Reincidencias")
+        reinc = postventa_mod.get("reincidencias", pd.DataFrame()).copy()
+        if reinc.empty:
+            st.caption("No se detectaron ventas con más de un caso en el filtro actual.")
+        else:
+            st.dataframe(reinc.head(150).rename(columns={
+                "nro_venta": "Venta", "titulo_publicacion": "Publicación", "casos": "Casos",
+                "tipos": "Tipos", "detalles": "Detalles", "reputacion": "Afecta reputación",
+                "mlc": "MLC", "sku": "SKU"
+            }), use_container_width=True, hide_index=True, height=260)
+
+        st.markdown("### Casos detallados")
+        detail_cols = [c for c in [
+            "fecha_venta", "fecha_reclamo", "nro_venta", "nro_reclamo", "titulo_publicacion", "tipo_problema", "detalle_problema",
+            "familia_problema", "evitabilidad", "causa_probable", "accion_sugerida", "afecta_reputacion", "dias_activacion", "mlc", "sku", "status_pub", "entrega_pub", "full_pub"
+        ] if c in pv_work.columns]
+        detail = pv_work[detail_cols].copy()
+        sort_cols = [c for c in ["evitabilidad", "afecta_reputacion", "fecha_reclamo"] if c in detail.columns]
+        asc_map = {"evitabilidad": True, "afecta_reputacion": False, "fecha_reclamo": False}
+        if sort_cols:
+            detail = detail.sort_values(sort_cols, ascending=[asc_map[c] for c in sort_cols])
+        st.dataframe(detail.rename(columns={
+            "nro_venta": "Venta", "nro_reclamo": "Reclamo", "afecta_reputacion": "Afecta reputación",
+            "status_pub": "Status publicación", "entrega_pub": "Entrega", "full_pub": "Full"
+        }), use_container_width=True, hide_index=True, height=380)
+
+if False:
+    st.subheader("Historial / snapshots")
+    st.write("Los snapshots se guardan automáticamente cuando cambia la carga o cambia el estado consolidado del sistema.")
+    runs = list_runs()
+    if runs.empty:
+        st.info("Aún no hay snapshots guardados.")
+    else:
+        st.dataframe(runs, use_container_width=True, hide_index=True, height=240)
+        st.caption("La primera corrida se interpreta como brecha inicial entre maestra y realidad actual; las siguientes permiten trazabilidad y comparación.")
+
+    st.markdown("### Historial de archivos fuente")
+    source_events = list_source_file_events()
+    if source_events.empty:
+        st.info("Aún no hay reemplazos de archivos registrados.")
+    else:
+        show = source_events.copy()
+        rename_map = {
+            "created_at": "Fecha",
+            "file_key": "Tipo",
+            "active_filename": "Activo",
+            "archived_filename": "Archivado",
+            "original_filename": "Nombre original",
+            "file_sig": "Firma",
+            "file_size": "Tamaño",
+        }
+        show = show.rename(columns=rename_map)
+        show["Tipo"] = show["Tipo"].map(lambda x: FILE_SPECS.get(x, {}).get("label", x))
+        st.dataframe(show[["Fecha", "Tipo", "Activo", "Archivado", "Nombre original", "Tamaño"]], use_container_width=True, hide_index=True, height=260)
+
+if False:
+    st.subheader("Descargar maestra actualizada")
+    wb = model["wb"]
+    download_bytes = build_download_bytes(model["master"], model["rel"], model.get("control_df", pd.DataFrame()), wb["file_bytes"], wb["maestra_name"], wb["rel_name"], wb.get("control_name"))
+    st.download_button(
+        "Descargar workbook actualizado",
+        data=download_bytes,
+        file_name=f"maestra_actualizada_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    st.caption("Este archivo conserva las hojas originales y reemplaza la maestra / relámpago con el estado actual en memoria.")
+
