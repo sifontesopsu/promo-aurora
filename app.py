@@ -411,6 +411,15 @@ def fmt_pct(value, decimals=1) -> str:
         return "—"
     return f"{x:.{decimals}f}%"
 
+
+def safe_divide(numerator, denominator, multiplier=1.0, default=np.nan):
+    """Divide evitando ZeroDivisionError, inf y divisiones contra cero."""
+    num = pd.to_numeric(numerator, errors="coerce")
+    den = pd.to_numeric(denominator, errors="coerce")
+    result = np.where((den.notna()) & (den != 0), (num.fillna(0) / den) * multiplier, default)
+    return pd.Series(result, index=num.index if hasattr(num, "index") else None)
+
+
 def promo_status(dt):
     dt = to_date_only(dt)
     if pd.isna(dt):
@@ -1422,20 +1431,40 @@ def load_sales(file_bytes: bytes):
 
 @st.cache_data(show_spinner=False)
 def load_purchases(file_bytes: bytes):
+    """
+    Carga el reporte de compras solo si trae estructura real de compras.
+    Si por error se deja otro Excel en el slot de compras (por ejemplo una maestra),
+    devuelve una tabla vacía para no romper la app ni el merge histórico de costos.
+    """
+    empty_cols = ["sku", "fecha", "proveedor", "precio_unitario", "cantidad", "documento", "folio"]
     raw = pd.read_excel(io.BytesIO(file_bytes))
     raw = raw.copy()
+
+    # El reporte de compras debe traer fecha y precio unitario. Si no están,
+    # probablemente se cargó una maestra u otro archivo en lugar de compras.
+    required_cols = ["SKU", "Fecha", "Precio Un."]
+    if any(col not in raw.columns for col in required_cols):
+        return pd.DataFrame(columns=empty_cols)
+
     for col in ["SKU", "Fecha", "Razón Social", "Precio Un.", "Cantidad", "Documento", "Folio"]:
         if col not in raw.columns:
             raw[col] = np.nan
+
     raw["sku"] = raw["SKU"].map(norm_sku)
-    raw["fecha"] = pd.to_datetime(raw["Fecha"], errors="coerce", dayfirst=True).dt.normalize()
+    raw["fecha"] = pd.to_datetime(raw["Fecha"], errors="coerce", dayfirst=True)
+    raw["fecha"] = raw["fecha"].dt.tz_localize(None) if getattr(raw["fecha"].dt, "tz", None) is not None else raw["fecha"]
+    raw["fecha"] = raw["fecha"].dt.normalize()
     raw["proveedor"] = raw["Razón Social"].fillna("").astype(str)
     raw["precio_unitario"] = raw["Precio Un."].map(safe_float)
     raw["cantidad"] = raw["Cantidad"].map(safe_float)
     raw["documento"] = raw["Documento"].fillna("").astype(str)
     raw["folio"] = raw["Folio"].fillna("").astype(str)
-    raw = raw[raw["sku"] != ""].copy()
-    return raw
+
+    raw = raw[(raw["sku"] != "") & raw["fecha"].notna() & raw["precio_unitario"].notna()].copy()
+    if raw.empty:
+        return pd.DataFrame(columns=empty_cols)
+
+    return raw[empty_cols]
 
 
 @st.cache_data(show_spinner=False)
@@ -1880,31 +1909,61 @@ def attach_historical_purchase_cost_to_sales(ml_sales, purchases, master):
         return sales
 
     fallback_cost = master.set_index("sku")["costo_maestra"].to_dict()
-    if purchases is None or purchases.empty:
+    if purchases is None or not isinstance(purchases, pd.DataFrame) or purchases.empty:
+        sales["costo_unit_historico"] = sales["sku"].map(fallback_cost)
+        return sales
+
+    # Blindaje contra archivos de compras con fechas inválidas o columnas contaminadas.
+    # merge_asof exige que ambos lados tengan la misma dtype datetime64 y sin nulos.
+    sales["fecha"] = pd.to_datetime(sales["fecha"], errors="coerce")
+    purchases = purchases.copy()
+    purchases["fecha"] = pd.to_datetime(purchases.get("fecha"), errors="coerce")
+
+    sales = sales[sales["fecha"].notna()].copy()
+    purchases = purchases[purchases["fecha"].notna()].copy()
+
+    if sales.empty:
+        sales["costo_unit_historico"] = np.nan
+        return sales
+    if purchases.empty or "precio_unitario" not in purchases.columns:
+        sales["costo_unit_historico"] = sales["sku"].map(fallback_cost)
+        return sales
+
+    purchases["precio_unitario"] = purchases["precio_unitario"].map(safe_float)
+    purchases = purchases[purchases["precio_unitario"].notna()].copy()
+    if purchases.empty:
         sales["costo_unit_historico"] = sales["sku"].map(fallback_cost)
         return sales
 
     sales = sales.sort_values(["sku", "fecha"]).copy()
     purchases = purchases.sort_values(["sku", "fecha"]).copy()
+
     merged_parts = []
     for sku, sgrp in sales.groupby("sku", sort=False):
-        pgrp = purchases[purchases["sku"] == sku][["fecha", "precio_unitario"]].sort_values("fecha")
-        sgrp = sgrp.sort_values("fecha").copy()
+        pgrp = purchases[purchases["sku"] == sku][["fecha", "precio_unitario"]].dropna(subset=["fecha"]).sort_values("fecha")
+        sgrp = sgrp.dropna(subset=["fecha"]).sort_values("fecha").copy()
+
         if not pgrp.empty:
-            mg = pd.merge_asof(
-                sgrp,
-                pgrp,
-                on="fecha",
-                direction="backward",
-                suffixes=("", "_compra")
-            )
-            mg["costo_unit_historico"] = mg["precio_unitario_compra"].map(safe_float)
-            mg.drop(columns=[c for c in ["precio_unitario_compra"] if c in mg.columns], inplace=True)
+            try:
+                mg = pd.merge_asof(
+                    sgrp,
+                    pgrp,
+                    on="fecha",
+                    direction="backward",
+                    suffixes=("", "_compra")
+                )
+                mg["costo_unit_historico"] = mg["precio_unitario_compra"].map(safe_float)
+                mg.drop(columns=[c for c in ["precio_unitario_compra"] if c in mg.columns], inplace=True)
+            except Exception:
+                mg = sgrp.copy()
+                mg["costo_unit_historico"] = np.nan
         else:
             mg = sgrp.copy()
             mg["costo_unit_historico"] = np.nan
+
         mg["costo_unit_historico"] = mg["costo_unit_historico"].fillna(fallback_cost.get(sku, np.nan))
         merged_parts.append(mg)
+
     return pd.concat(merged_parts, ignore_index=True) if merged_parts else sales
 
 
@@ -2156,7 +2215,7 @@ def build_action_table(master, sales_windows, total_hist, purchase_summary, publ
 
     base["ads_share_ml_pct"] = np.where(
         base["ingresos_ml_30d"].fillna(0) > 0,
-        (base["ads_inversion"].fillna(0) / base["ingresos_ml_30d"].fillna(0)) * 100,
+        safe_divide(base["ads_inversion"], base["ingresos_ml_30d"], multiplier=100.0),
         0.0
     )
     base["monto_sim_neto"] = np.where(base["monto_sim"].notna(), base["monto_sim"] / 1.19, np.nan)
