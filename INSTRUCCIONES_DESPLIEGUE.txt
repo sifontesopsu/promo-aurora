@@ -1,0 +1,24 @@
+PROMO AURORA - DESPLIEGUE ESTABLE
+
+1. Reemplazar en GitHub:
+   - requirements.txt
+   - .python-version
+   - .streamlit/config.toml
+   - .devcontainer/devcontainer.json
+
+2. Mantener app.py, compras.xlsx y maestra.xlsx en la raíz.
+
+3. En Streamlit Community Cloud:
+   - Guardar el subdominio, repositorio, rama, archivo app.py y Secrets.
+   - Eliminar la implementación actual.
+   - Crear la app nuevamente.
+   - Abrir Advanced settings.
+   - Seleccionar Python 3.13.
+   - Volver a ingresar Secrets si existían.
+   - Desplegar.
+
+4. En los logs debe aparecer Python 3.13, no Python 3.14.
+
+5. No agregar dependencias antiguas que esta app no importa:
+   pdfplumber, python-barcode, Pillow, reportlab y duckduckgo-search.
+   Si en el futuro el código realmente las usa, agregarlas con versión fija.
